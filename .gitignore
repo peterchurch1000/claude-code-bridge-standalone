@@ -1,0 +1,92 @@
+# Runtime & Logs
+logs/
+*.log
+*.pid
+
+# Chrome & Browser Profiles
+.config/chromium-profile-standalone/
+.config/chrome-user-data/
+.cache/
+.playwright-mcp/
+
+# Node modules
+node_modules/
+package-lock.json
+yarn.lock
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+.env-*
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-*
+.project
+.classpath
+
+# OS & Temp Files
+*.tmp
+*.temp
+/tmp/
+/temp/
+Thumbs.db
+.directory
+
+# Build & Artifacts
+dist/
+build/
+*.tgz
+*.tar.gz
+*.zip
+
+# Docker (for future containerization)
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker/
+
+# Kubernetes (for future K8s deployment)
+kubernetes/
+*.yaml
+*.yml
+
+# Session & State Files
+.session
+.sessions/
+*.jsonl
+session-*.json
+
+# Screenshot & Media Cache
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+playwright-screenshots/
+screenshots/
+
+# Service & Config
+systemd/
+nginx/
+.systemd/
+
+# Development only
+*.local
+dev-*
+test-*
+.debug
+debug.log
+
+# Sensitive data
+credentials.json
+auth.json
+secrets.json
+.htpasswd*
+private-key*

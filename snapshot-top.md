@@ -1,0 +1,6 @@
+- generic [ref=e3]:
+  - banner
+  - main [ref=e4]:
+    - generic [ref=e6]:
+      - navigation "side bar" [ref=e8]
+      - generic [ref=e142]

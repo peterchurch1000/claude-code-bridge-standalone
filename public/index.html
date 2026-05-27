@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Code Bridge</title>
+  <script src="/config.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Left: Chat panel ── -->
+  <aside id="chat-panel">
+    <header id="chat-header">
+      <div id="header-title">
+        <span class="logo">⬡</span>
+        <span>Claude Code Bridge</span>
+        <span id="mode-badge">CLI mode</span>
+      </div>
+      <div id="header-controls">
+        <span id="status-dot" class="dot disconnected" title="Connection status"></span>
+        <button id="btn-reset" title="New session">↺</button>
+      </div>
+    </header>
+
+    <div id="status-bar"></div>
+
+    <!-- Connection status bar -->
+    <div id="conn-bar">
+      <div class="conn-item">
+        <span class="cdot cdot-connecting" id="cdot-ws" title="Chat / WebSocket"></span>
+        <span class="clabel">Chat</span>
+      </div>
+      <span class="cdivider">|</span>
+      <div class="conn-item">
+        <span class="cdot cdot-unknown" id="cdot-vnc" title="Browser / noVNC"></span>
+        <span class="clabel">Browser</span>
+        <button class="cbtn hidden" id="cbtn-vnc" title="Reconnect browser display">↻</button>
+      </div>
+      <span class="cdivider">|</span>
+      <div class="conn-item">
+        <span class="cdot cdot-unknown" id="cdot-mcp" title="Playwright MCP server"></span>
+        <span class="clabel">MCP</span>
+        <button class="cbtn hidden" id="cbtn-mcp" title="Reset MCP connection">↻</button>
+      </div>
+      <span id="conn-time" class="conn-time"></span>
+    </div>
+
+    <!-- 5-hour block usage bar -->
+    <div id="usage-bar">
+      <div id="usage-token-wrap">
+        <div id="usage-progress"><div id="usage-fill"></div></div>
+        <span id="usage-pct">–</span>
+      </div>
+      <span id="usage-detail">loading…</span>
+    </div>
+
+    <!-- Weekly usage bar -->
+    <div id="usage-bar-week">
+      <div id="usage-token-wrap-week">
+        <div id="usage-progress-week"><div id="usage-fill-week"></div></div>
+        <span id="usage-pct-week">–</span>
+      </div>
+      <span id="usage-detail-week">loading…</span>
+    </div>
+
+    <div id="messages"></div>
+
+    <div id="input-row">
+      <textarea
+        id="chat-input"
+        placeholder="Message Claude Code… (Enter to send, Shift+Enter for newline)"
+        rows="2"
+        autofocus
+      ></textarea>
+      <button id="btn-send" disabled>Send</button>
+    </div>
+  </aside>
+
+  <!-- ── Resizable divider ── -->
+  <div id="divider"></div>
+
+  <!-- ── Right: Browser panel ── -->
+  <main id="browser-panel">
+    <iframe id="vnc-frame" title="Live browser view" frameborder="0" allowfullscreen
+      allow="clipboard-read; clipboard-write"></iframe>
+  </main>
+
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

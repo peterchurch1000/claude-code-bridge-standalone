@@ -1,0 +1,13 @@
+- generic [ref=e3]:
+  - banner
+  - main [ref=e4]:
+    - generic [ref=e6]:
+      - navigation "side bar" [ref=e8]:
+        - generic [ref=e11]:
+          - button "Shrink navigation bar" [expanded] [ref=e13] [cursor=pointer]
+          - generic [ref=e16]
+      - generic [ref=e142]:
+        - navigation "top bar" [ref=e143]:
+          - list [ref=e144]
+        - main [ref=e170]:
+          - generic [ref=e173]
