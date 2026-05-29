@@ -2,6 +2,7 @@
 logs/
 *.log
 *.pid
+claude-rate-limits.json
 
 # Instance-specific MCP config (port differs per instance — keep locally)
 .mcp.json

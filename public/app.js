@@ -350,57 +350,83 @@
   }
   setInterval(pollMcp, 15000);
 
-  // ── Usage bar (token / cost) ───────────────────────────────────────────────
-  const usageFill       = $('usage-fill');
-  const usagePct        = $('usage-pct');
-  const usageDetail     = $('usage-detail');
-  const usageFillWeek   = $('usage-fill-week');
-  const usagePctWeek    = $('usage-pct-week');
-  const usageDetailWeek = $('usage-detail-week');
+  // ── Usage section (5h / 7d / ctx + meta) ─────────────────────────────────
+  const fill5h    = $('fill-5h');
+  const pct5h     = $('pct-5h');
+  const time5h    = $('time-5h');
+  const fill7d    = $('fill-7d');
+  const pct7d     = $('pct-7d');
+  const time7d    = $('time-7d');
+  const fillCtx   = $('fill-ctx');
+  const pctCtx    = $('pct-ctx');
+  const metaModel = $('meta-model');
+  const metaEmail = $('meta-email');
+  const metaSep   = $('meta-sep');
+
+  function usageColor(p) {
+    return p > 80 ? 'var(--red)' : p > 50 ? 'var(--orange)' : 'var(--green)';
+  }
+
+  function setBar(fill, pctEl, pct) {
+    const p = Math.min(100, Math.max(0, pct || 0));
+    fill.style.width = p + '%';
+    fill.style.background = usageColor(p);
+    pctEl.textContent = p.toFixed(0) + '%';
+  }
+
+  function formatResetTime(tsSec, includeDay) {
+    if (!tsSec) return '';
+    const remaining = tsSec * 1000 - Date.now();
+    if (remaining <= 0) return 'reset now';
+    const totalSecs = Math.floor(remaining / 1000);
+    let timeLeft;
+    if (includeDay) {
+      const days = Math.floor(totalSecs / 86400);
+      const hrs  = Math.floor((totalSecs % 86400) / 3600);
+      timeLeft = days > 0 ? `${days}d${String(hrs).padStart(2, '0')}h` : `${hrs}h`;
+    } else {
+      const h = Math.floor(totalSecs / 3600);
+      const m = Math.floor((totalSecs % 3600) / 60);
+      timeLeft = h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+    }
+    const d = new Date(tsSec * 1000);
+    const opts = includeDay
+      ? { weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true }
+      : { hour: 'numeric', minute: '2-digit', hour12: true };
+    const resetStr = d.toLocaleString('en', opts).toLowerCase().replace(',', '');
+    return `${timeLeft} (${resetStr})`;
+  }
 
   async function pollUsage() {
     try {
       const res  = await fetch('/usage', { cache: 'no-store' });
       const data = await res.json();
-      if (!data.ok) { usageDetail.textContent = 'unavailable'; return; }
+      if (!data.ok) return;
 
-      // ── 5-hour block bar ──
-      const b = data.block;
-      if (!b?.active) {
-        usagePct.textContent = '–';
-        usageDetail.textContent = `no active block · today $${(b?.todayCost||0).toFixed(2)}`;
-        usageFill.style.width = '0%';
-      } else {
-        const pct = Math.min(100, b.pct || 0);
-        usageFill.style.width = pct + '%';
-        usageFill.style.background = pct > 95 ? 'var(--red)' : pct > 90 ? 'var(--orange)' : 'var(--green)';
-        usagePct.textContent = pct.toFixed(1) + '%';
-        const mins = b.minsLeft;
-        const timeStr = mins != null ? `${Math.floor(mins/60)}h${String(mins%60).padStart(2,'0')}m left` : '';
-        const tokens = b.tokens >= 1e6 ? (b.tokens/1e6).toFixed(1)+'M' : (b.tokens/1e3).toFixed(0)+'K';
-        usageDetail.textContent =
-          `${tokens} · $${(b.blockCost||0).toFixed(2)} block · $${(b.todayCost||0).toFixed(2)} today · $${(b.burnRate||0).toFixed(1)}/hr · ${timeStr}`;
-      }
+      const rl = data.rateLimits || {};
+      const b  = data.block      || {};
+      const w  = data.week       || {};
 
-      // ── Weekly bar ──
-      const w = data.week;
-      if (!w) { usageDetailWeek.textContent = 'weekly data unavailable'; return; }
-      // Use real API 7-day % if available, otherwise estimate from cost
-      const wPct = w.pct != null ? Math.min(100, w.pct) : Math.min(100, (w.weekCost / Math.max(150, (w.prevCost || 0) * 1.2)) * 100);
-      usageFillWeek.style.width = wPct + '%';
-      usageFillWeek.style.background = wPct > 80 ? 'var(--red)' : wPct > 50 ? 'var(--orange)' : 'var(--purple)';
-      usagePctWeek.textContent = wPct.toFixed(0) + '%';
-      const wTokens = w.weekTokens >= 1e9 ? (w.weekTokens/1e9).toFixed(2)+'B'
-                    : w.weekTokens >= 1e6 ? (w.weekTokens/1e6).toFixed(0)+'M'
-                    : (w.weekTokens/1e3).toFixed(0)+'K';
-      const vsLast = w.prevCost > 0
-        ? ` · vs last wk $${w.prevCost.toFixed(2)}`
-        : '';
-      usageDetailWeek.textContent =
-        `week of ${w.weekStart} · ${wTokens} tokens · $${w.weekCost.toFixed(2)}${vsLast}`;
-    } catch {
-      usageDetail.textContent = 'unavailable';
-    }
+      // 5h bar
+      const fivePct = rl.five_hour_pct != null ? rl.five_hour_pct : (b.pct || 0);
+      setBar(fill5h, pct5h, fivePct);
+      const fiveReset = rl.five_hour_resets_at || (b.resetsAtMs ? b.resetsAtMs / 1000 : null);
+      if (time5h) time5h.textContent = formatResetTime(fiveReset, false);
+
+      // 7d bar
+      const sevenPct = rl.seven_day_pct != null ? rl.seven_day_pct : (w.pct || 0);
+      setBar(fill7d, pct7d, sevenPct);
+      if (time7d) time7d.textContent = formatResetTime(rl.seven_day_resets_at, true);
+
+      // ctx bar — from rateLimits file (updated each Claude Code turn)
+      if (rl.ctx_pct != null) setBar(fillCtx, pctCtx, rl.ctx_pct);
+
+      // Model + email
+      if (metaModel && rl.model) metaModel.textContent = rl.model;
+      if (metaEmail && rl.email) metaEmail.textContent = rl.email;
+      if (metaSep) metaSep.style.visibility = (rl.model && rl.email) ? 'visible' : 'hidden';
+
+    } catch { /* silent */ }
   }
 
   pollUsage();
@@ -515,11 +541,12 @@
         storedMsgData[lastAssistantDataIdx].text = currentAssistantText;
         saveToStorage();
       }
-      // Context warning at 40% of 200k window
+      // Update ctx bar from live usage
       const inputTokens = ev.usage?.input_tokens || 0;
       if (inputTokens > 0) {
-        const pct = (inputTokens / 200_000) * 100;
-        if (pct >= 40) showContextWarning(pct);
+        const ctxPct = (inputTokens / 200_000) * 100;
+        setBar(fillCtx, pctCtx, ctxPct);
+        if (ctxPct >= 40) showContextWarning(ctxPct);
         else hideContextWarning();
       }
       return;

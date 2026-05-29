@@ -47,24 +47,30 @@
       <span id="conn-time" class="conn-time"></span>
     </div>
 
-    <!-- 5-hour block usage bar -->
-    <div id="usage-bar">
-      <div id="usage-token-wrap">
-        <span class="usage-label">5h</span>
-        <div id="usage-progress"><div id="usage-fill"></div></div>
-        <span id="usage-pct">–</span>
+    <!-- Usage section: 5h / 7d / ctx bars + model/email -->
+    <div id="usage-section">
+      <div class="ubar-row">
+        <span class="ubar-label">5h</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-5h"></div></div>
+        <span class="ubar-pct" id="pct-5h">–</span>
+        <span class="ubar-time" id="time-5h"></span>
       </div>
-      <span id="usage-detail">loading…</span>
-    </div>
-
-    <!-- Weekly usage bar -->
-    <div id="usage-bar-week">
-      <div id="usage-token-wrap-week">
-        <span class="usage-label">7d</span>
-        <div id="usage-progress-week"><div id="usage-fill-week"></div></div>
-        <span id="usage-pct-week">–</span>
+      <div class="ubar-row">
+        <span class="ubar-label">7d</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-7d"></div></div>
+        <span class="ubar-pct" id="pct-7d">–</span>
+        <span class="ubar-time" id="time-7d"></span>
       </div>
-      <span id="usage-detail-week">loading…</span>
+      <div class="ubar-row">
+        <span class="ubar-label">ctx</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-ctx"></div></div>
+        <span class="ubar-pct" id="pct-ctx">–</span>
+      </div>
+      <div id="ubar-meta">
+        <span id="meta-model"></span>
+        <span id="meta-sep" class="ubar-sep">·</span>
+        <span id="meta-email"></span>
+      </div>
     </div>
 
     <div id="messages"></div>

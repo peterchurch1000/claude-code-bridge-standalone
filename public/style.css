@@ -90,51 +90,58 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 }
 #status-bar:empty { min-height: 0; border: none; }
 
-/* ── Usage bar ── */
-#usage-bar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 5px 12px;
+/* ── Usage section (5h / 7d / ctx + meta) ── */
+#usage-section {
   background: #080d18;
   border-bottom: 1px solid var(--border);
-  flex-shrink: 0; font-size: 11px;
+  flex-shrink: 0;
+  padding: 5px 12px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
-#usage-token-wrap { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
-.usage-label { font-size: 10px; color: var(--text-dim); font-weight: 600; min-width: 14px; letter-spacing: 0.3px; }
+.ubar-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+}
 
-#usage-progress {
-  width: 60px; height: 5px; background: #1e2535;
+.ubar-label {
+  font-size: 10px; color: var(--text-dim); font-weight: 600;
+  min-width: 18px; letter-spacing: 0.3px; flex-shrink: 0;
+}
+
+.ubar-track {
+  width: 52px; height: 5px; background: #1e2535;
   border-radius: 3px; overflow: hidden; flex-shrink: 0;
 }
 
-#usage-fill {
+.ubar-fill {
   height: 100%; width: 0%; border-radius: 3px;
   background: var(--green); transition: width 0.4s, background 0.4s;
 }
 
-#usage-pct { font-size: 10px; color: var(--text-dim); min-width: 28px; }
+.ubar-pct { font-size: 10px; color: var(--text-dim); min-width: 30px; flex-shrink: 0; }
 
-#usage-detail { font-size: 10px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ubar-time {
+  font-size: 10px; color: var(--text-dim);
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
-/* ── Weekly usage bar ── */
-#usage-bar-week {
-  display: flex; align-items: center; gap: 8px;
-  padding: 4px 12px;
-  background: #060b14;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0; font-size: 11px;
+#ubar-meta {
+  display: flex; align-items: center; gap: 5px;
+  padding-top: 1px; padding-bottom: 1px;
+  font-size: 10px; color: var(--text-dim);
+  overflow: hidden;
 }
-#usage-token-wrap-week { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
-#usage-progress-week {
-  width: 60px; height: 5px; background: #1e2535;
-  border-radius: 3px; overflow: hidden; flex-shrink: 0;
+
+.ubar-sep { opacity: 0.4; flex-shrink: 0; }
+
+#meta-model, #meta-email {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-#usage-fill-week {
-  height: 100%; width: 0%; border-radius: 3px;
-  background: var(--purple); transition: width 0.4s, background 0.4s;
-}
-#usage-pct-week { font-size: 10px; color: var(--text-dim); min-width: 28px; }
-#usage-detail-week { font-size: 10px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Connection status bar ── */
 #conn-bar {

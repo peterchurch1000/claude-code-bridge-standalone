@@ -27,9 +27,10 @@ app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Read real API rate limit data saved by claude-session-status statusline script
 const fs = require('fs');
+const RATE_LIMITS_PATH = path.join(__dirname, 'claude-rate-limits.json');
 function readRateLimits() {
   try {
-    const raw = fs.readFileSync('/tmp/claude-rate-limits.json', 'utf8');
+    const raw = fs.readFileSync(RATE_LIMITS_PATH, 'utf8');
     const d = JSON.parse(raw);
     const age = Date.now() - new Date(d.updated_at).getTime();
     if (age < 600_000) return d;
@@ -44,7 +45,7 @@ app.get('/usage', (req, res) => {
 
   function finish() {
     if (++done < 2) return;
-    res.json({ ok: true, block: blockResult, week: weekResult });
+    res.json({ ok: true, block: blockResult, week: weekResult, rateLimits });
   }
 
   // 5-hour block data
@@ -61,10 +62,11 @@ app.get('/usage', (req, res) => {
       const tokens = active.totalTokens || 0;
       const endTime = active.endTime ? new Date(active.endTime) : null;
       const minsLeft = endTime ? Math.max(0, Math.round((endTime - Date.now()) / 60000)) : null;
+      const resetsAtMs = endTime ? endTime.getTime() : null;
       const pct = rateLimits ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
       blockResult = {
         active: true, tokens,
-        pct, minsLeft, burnRate: active.burnRate?.costPerHour || 0,
+        pct, minsLeft, resetsAtMs, burnRate: active.burnRate?.costPerHour || 0,
         blockCost: active.costUSD || 0, todayCost,
       };
     } catch { blockResult = { active: false }; }
