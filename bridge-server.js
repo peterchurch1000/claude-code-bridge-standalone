@@ -4,13 +4,18 @@ const { spawn, execFile } = require('child_process');
 const path = require('path');
 const http = require('http');
 
-const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '3457');
-const NOVNC_URL   = process.env.NOVNC_URL  || 'https://claude-bridge.procyss-automation.com/vnc';
-const CLAUDE_CWD  = process.env.CLAUDE_CWD || __dirname;
-const MCP_PORT    = parseInt(process.env.MCP_PORT || '8931');
+  const BRIDGE_PORT  = parseInt(process.env.BRIDGE_PORT  || '3467');
+  const NOVNC_URL    = process.env.NOVNC_URL   ||
+  'https://claude-bridge.procyss-automation.com/vnc';
+  const NOVNC_WEB    = process.env.NOVNC_WEB   || '/usr/share/novnc';
+  const NOVNC_PORT   = parseInt(process.env.NOVNC_PORT   || '6093');
+  const CLAUDE_CWD   = process.env.CLAUDE_CWD  || __dirname;
+  const MCP_PORT     = parseInt(process.env.MCP_PORT || '8931');
 
 const app = express();
 app.use(express.json());
+  // Serve noVNC static files at /vnc so the iframe works without a separate proxy
+app.use('/vnc', express.static(NOVNC_WEB));
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/config.js', (req, res) => {
@@ -113,7 +118,7 @@ app.post('/type-text', (req, res) => {
     return res.status(400).json({ error: 'text required' });
   }
 
-  const env = { ...process.env, DISPLAY: process.env.DISPLAY_NUM || ':21' };
+  const env = { ...process.env, DISPLAY: process.env.DISPLAY_NUM || ':31' };
 
   function fallbackType() {
     // xclip unavailable — type character-by-character via xdotool
