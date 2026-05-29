@@ -4,9 +4,10 @@ const { spawn, execFile } = require('child_process');
 const path = require('path');
 const http = require('http');
 
-const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '3467');
+const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || '3457');
 const NOVNC_URL   = process.env.NOVNC_URL  || 'https://claude-bridge.procyss-automation.com/vnc';
 const CLAUDE_CWD  = process.env.CLAUDE_CWD || __dirname;
+const MCP_PORT    = parseInt(process.env.MCP_PORT || '8931');
 
 const app = express();
 app.use(express.json());
@@ -91,7 +92,7 @@ app.get('/usage', (req, res) => {
 
 // MCP health check — probes the Playwright MCP server
 app.get('/mcp-health', async (req, res) => {
-  const MCP_URL = 'http://localhost:8941/mcp';
+  const MCP_URL = `http://localhost:${MCP_PORT}/mcp`;
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 2000);
