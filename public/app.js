@@ -58,9 +58,11 @@
   let currentAssistantText = '';
   let lastToolEl = null;
   let hasConnectedBefore = false;
+  let contextBanner = null;
 
   // ── Chat persistence (localStorage) ───────────────────────────────────────
-  const STORAGE_KEY = 'bridge_chat_v1';
+  const STORAGE_KEY  = 'bridge_chat_v1';
+  const SESSION_KEY  = 'bridge_session_id';
   let storedMsgData        = [];
   let lastAssistantDataIdx = -1;
   let lastToolDataIdx      = -1;
@@ -93,6 +95,34 @@
     c.appendChild(t);
     requestAnimationFrame(() => t.classList.add('show'));
     setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 4000);
+  }
+
+  // ── Context warning banner ────────────────────────────────────────────────
+  function showContextWarning(pct) {
+    if (contextBanner) {
+      contextBanner.querySelector('.ctx-pct').textContent = pct.toFixed(0) + '%';
+      return;
+    }
+    contextBanner = document.createElement('div');
+    contextBanner.className = 'ctx-warning';
+    contextBanner.innerHTML =
+      `<span>⚠ Context at <strong class="ctx-pct">${pct.toFixed(0)}%</strong> — compact to free space?</span>` +
+      `<button class="ctx-btn-compact">Compact now</button>` +
+      `<button class="ctx-btn-dismiss">✕</button>`;
+    contextBanner.querySelector('.ctx-btn-compact').onclick = () => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'compact' }));
+        showToast('Compacting conversation…', 'info');
+        hideContextWarning();
+      }
+    };
+    contextBanner.querySelector('.ctx-btn-dismiss').onclick = hideContextWarning;
+    messagesEl.parentNode.insertBefore(contextBanner, messagesEl);
+  }
+
+  function hideContextWarning() {
+    contextBanner?.remove();
+    contextBanner = null;
   }
 
   // ── DOM helpers ────────────────────────────────────────────────────────────
@@ -263,6 +293,10 @@
         setStatus(`Message queued (${msg.queueLength} waiting)…`);
         break;
 
+      case 'session_id':
+        localStorage.setItem(SESSION_KEY, msg.id);
+        break;
+
       case 'error':
         removeThinking();
         setBusy(false);
@@ -351,11 +385,10 @@
       // ── Weekly bar ──
       const w = data.week;
       if (!w) { usageDetailWeek.textContent = 'weekly data unavailable'; return; }
-      // Fill bar relative to prev week's spend (or $150 floor); gives meaningful context
-      const ref = Math.max(150, (w.prevCost || 0) * 1.2);
-      const wPct = Math.min(100, (w.weekCost / ref) * 100);
+      // Use real API 7-day % if available, otherwise estimate from cost
+      const wPct = w.pct != null ? Math.min(100, w.pct) : Math.min(100, (w.weekCost / Math.max(150, (w.prevCost || 0) * 1.2)) * 100);
       usageFillWeek.style.width = wPct + '%';
-      usageFillWeek.style.background = wPct > 95 ? 'var(--red)' : wPct > 90 ? 'var(--orange)' : 'var(--purple)';
+      usageFillWeek.style.background = wPct > 80 ? 'var(--red)' : wPct > 50 ? 'var(--orange)' : 'var(--purple)';
       usagePctWeek.textContent = wPct.toFixed(0) + '%';
       const wTokens = w.weekTokens >= 1e9 ? (w.weekTokens/1e9).toFixed(2)+'B'
                     : w.weekTokens >= 1e6 ? (w.weekTokens/1e6).toFixed(0)+'M'
@@ -482,6 +515,13 @@
         storedMsgData[lastAssistantDataIdx].text = currentAssistantText;
         saveToStorage();
       }
+      // Context warning at 40% of 200k window
+      const inputTokens = ev.usage?.input_tokens || 0;
+      if (inputTokens > 0) {
+        const pct = (inputTokens / 200_000) * 100;
+        if (pct >= 40) showContextWarning(pct);
+        else hideContextWarning();
+      }
       return;
     }
   }
@@ -555,7 +595,13 @@
       startConnTime();
       btnSend.disabled = false;
       startKeepalive();
-      if (hasConnectedBefore) showToast('Reconnected', 'success');
+      const prevSessionId = localStorage.getItem(SESSION_KEY);
+      if (prevSessionId) {
+        ws.send(JSON.stringify({ type: 'resume_session', id: prevSessionId }));
+        if (hasConnectedBefore) showToast('Reconnected — restoring context…', 'success');
+      } else {
+        if (hasConnectedBefore) showToast('Reconnected', 'success');
+      }
       hasConnectedBefore = true;
     };
 
@@ -605,11 +651,13 @@
     currentAssistantText = '';
     lastToolEl = null;
     setBusy(false);
+    hideContextWarning();
     setMcpDot('unknown');
     storedMsgData        = [];
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
     saveToStorage();
+    localStorage.removeItem(SESSION_KEY);
     showToast('Session reset', 'info');
   };
 

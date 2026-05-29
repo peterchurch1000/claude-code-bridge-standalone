@@ -6,11 +6,12 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export DISPLAY_NUM="${DISPLAY_NUM:-:31}"
-export VNC_PORT="${VNC_PORT:-5931}"
-export NOVNC_PORT="${NOVNC_PORT:-6093}"
-export BRIDGE_PORT="${BRIDGE_PORT:-3467}"
+export DISPLAY_NUM="${DISPLAY_NUM:-:21}"
+export VNC_PORT="${VNC_PORT:-5921}"
+export NOVNC_PORT="${NOVNC_PORT:-6083}"
+export BRIDGE_PORT="${BRIDGE_PORT:-3457}"
 export NOVNC_URL="${NOVNC_URL:-https://claude-bridge.procyss-automation.com/vnc}"
+export CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/root/.config/chromium-bridge-profile}"
 export CLAUDE_CWD="${CLAUDE_CWD:-$SCRIPT_DIR}"
 export LOG_DIR="$SCRIPT_DIR/logs"
 

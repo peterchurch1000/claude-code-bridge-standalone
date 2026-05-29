@@ -3,11 +3,42 @@ logs/
 *.log
 *.pid
 
+# Instance-specific MCP config (port differs per instance — keep locally)
+.mcp.json
+
 # Chrome & Browser Profiles
-.config/chromium-profile-standalone/
-.config/chrome-user-data/
+.config/
 .cache/
 .playwright-mcp/
+
+# Working files — screenshots, data exports, research artefacts
+*.pdf
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.cls
+2025-charity-receipts/
+
+# Salesforce / automation working scripts
+fill_cuits*.js
+inject-*.js
+run-apex-*.js
+run-batch*.js
+run-soap-*.js
+
+# Snapshot / working notes
+snapshot-*.md
+lovable-*.json
+
+# Base64 / data dump text files
+*-b64.txt
+pdf_*.txt
+all_pdfs.txt
+castle_pdfs.txt
+cuits.txt
+nls_*.md
+login_page.md
 
 # Node modules
 node_modules/

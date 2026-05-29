@@ -8,13 +8,14 @@
 #   even when Claude CLI processes start and stop between messages.
 set -e
 
-DISPLAY_NUM="${DISPLAY_NUM:-:31}"
-VNC_PORT="${VNC_PORT:-5931}"
-NOVNC_PORT="${NOVNC_PORT:-6093}"
+DISPLAY_NUM="${DISPLAY_NUM:-:21}"
+VNC_PORT="${VNC_PORT:-5921}"
+NOVNC_PORT="${NOVNC_PORT:-6083}"
 NOVNC_WEB="${NOVNC_WEB:-/usr/share/novnc}"
-MCP_PORT="${MCP_PORT:-8941}"
-CDP_PORT="${CDP_PORT:-9231}"
-LOG_DIR="${LOG_DIR:-/root/claude-code-bridge/logs}"
+MCP_PORT="${MCP_PORT:-8931}"
+CDP_PORT="${CDP_PORT:-9221}"
+CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/root/.config/chromium-bridge-profile}"
+LOG_DIR="${LOG_DIR:-$(dirname "$0")/logs}"
 
 mkdir -p "$LOG_DIR"
 
@@ -24,7 +25,7 @@ pkill -f "x11vnc.*rfbport $VNC_PORT" 2>/dev/null || true
 pkill -f "websockify.*$NOVNC_PORT" 2>/dev/null || true
 fuser -k ${MCP_PORT}/tcp 2>/dev/null || true
 fuser -k ${CDP_PORT}/tcp 2>/dev/null || true
-pkill -f "chromium-bridge-profile" 2>/dev/null || true
+pkill -f "$CHROME_PROFILE_DIR" 2>/dev/null || true
 sleep 1
 
 echo "[browser] Starting Xvfb $DISPLAY_NUM ..."
@@ -32,6 +33,11 @@ Xvfb $DISPLAY_NUM -screen 0 1920x1080x24 -ac +extension GLX +render -noreset \
   > "$LOG_DIR/xvfb.log" 2>&1 &
 XVFB_PID=$!
 sleep 1.5
+
+echo "[browser] Starting window manager (xfwm4) ..."
+DISPLAY=$DISPLAY_NUM xfwm4 > "$LOG_DIR/xfwm4.log" 2>&1 &
+XFWM_PID=$!
+sleep 0.5
 
 echo "[browser] Starting x11vnc on port $VNC_PORT ..."
 x11vnc -display $DISPLAY_NUM -nopw -forever -shared -rfbport $VNC_PORT \
@@ -63,7 +69,8 @@ DISPLAY=$DISPLAY_NUM /opt/google/chrome/chrome \
   --enable-unsafe-swiftshader \
   --use-gl=swiftshader \
   --remote-debugging-port=$CDP_PORT \
-  --user-data-dir=/var/www/html/claude-code-bridge-standalone/.config/chromium-profile-standalone \
+  --user-data-dir="$CHROME_PROFILE_DIR" \
+  --profile-directory=Default \
   --window-size=1920,1080 \
   --window-position=0,0 \
   about:blank \
@@ -91,13 +98,13 @@ echo "   Display:   $DISPLAY_NUM"
 echo "   Chrome:    CDP port $CDP_PORT (PID $CHROME_PID)"
 echo "   MCP SSE:   http://localhost:$MCP_PORT/sse"
 echo "   noVNC:     http://localhost:$NOVNC_PORT/vnc_auto.html"
-echo "   PIDs:      Xvfb=$XVFB_PID x11vnc=$X11VNC_PID websockify=$NOVNC_PID MCP=$MCP_PID Chrome=$CHROME_PID"
+echo "   PIDs:      Xvfb=$XVFB_PID xfwm4=$XFWM_PID x11vnc=$X11VNC_PID websockify=$NOVNC_PID MCP=$MCP_PID Chrome=$CHROME_PID"
 echo ""
 
 # Trap cleanup
 cleanup() {
   echo "[browser] Shutting down..."
-  kill $XVFB_PID $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID 2>/dev/null || true
+  kill $XVFB_PID $XFWM_PID $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID 2>/dev/null || true
 }
 trap cleanup EXIT SIGTERM SIGINT
 

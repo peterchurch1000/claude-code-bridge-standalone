@@ -19,9 +19,22 @@ app.get('/config.js', (req, res) => {
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Read real API rate limit data saved by claude-session-status statusline script
+const fs = require('fs');
+function readRateLimits() {
+  try {
+    const raw = fs.readFileSync('/tmp/claude-rate-limits.json', 'utf8');
+    const d = JSON.parse(raw);
+    const age = Date.now() - new Date(d.updated_at).getTime();
+    if (age < 600_000) return d;
+  } catch {}
+  return null;
+}
+
 // Claude token/cost usage — 5-hour block + weekly, parallel fetch
 app.get('/usage', (req, res) => {
   let blockResult = null, weekResult = null, done = 0;
+  const rateLimits = readRateLimits();
 
   function finish() {
     if (++done < 2) return;
@@ -31,7 +44,6 @@ app.get('/usage', (req, res) => {
   // 5-hour block data
   execFile('ccusage', ['blocks', '--json'], { timeout: 8000 }, (err, stdout) => {
     try {
-      const TOKEN_LIMIT = 72_117_641;
       const data = JSON.parse(stdout);
       const blocks = (data.blocks || []).filter(b => !b.isGap);
       const active = blocks.find(b => b.isActive);
@@ -43,10 +55,10 @@ app.get('/usage', (req, res) => {
       const tokens = active.totalTokens || 0;
       const endTime = active.endTime ? new Date(active.endTime) : null;
       const minsLeft = endTime ? Math.max(0, Math.round((endTime - Date.now()) / 60000)) : null;
+      const pct = rateLimits ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
       blockResult = {
         active: true, tokens,
-        pct: (tokens / TOKEN_LIMIT) * 100,
-        minsLeft, burnRate: active.burnRate?.costPerHour || 0,
+        pct, minsLeft, burnRate: active.burnRate?.costPerHour || 0,
         blockCost: active.costUSD || 0, todayCost,
       };
     } catch { blockResult = { active: false }; }
@@ -58,9 +70,8 @@ app.get('/usage', (req, res) => {
     try {
       const data = JSON.parse(stdout);
       const weeks = data.weekly || [];
-      // Current week: Sunday-anchored, find the week whose start <= today
       const today = new Date();
-      const dayOfWeek = today.getDay(); // 0=Sun
+      const dayOfWeek = today.getDay();
       const weekStart = new Date(today);
       weekStart.setDate(today.getDate() - dayOfWeek);
       const weekKey = weekStart.toISOString().slice(0, 10);
@@ -71,6 +82,7 @@ app.get('/usage', (req, res) => {
         weekTokens: current?.totalTokens || 0,
         prevCost:   prev?.totalCost      || 0,
         weekStart:  current?.week        || weekKey,
+        pct: rateLimits ? rateLimits.seven_day_pct : null,
       };
     } catch { weekResult = null; }
     finish();
@@ -100,7 +112,7 @@ app.post('/type-text', (req, res) => {
     return res.status(400).json({ error: 'text required' });
   }
 
-  const env = { ...process.env, DISPLAY: ':21' };
+  const env = { ...process.env, DISPLAY: process.env.DISPLAY_NUM || ':21' };
 
   function fallbackType() {
     // xclip unavailable — type character-by-character via xdotool
@@ -188,6 +200,7 @@ wss.on('connection', (ws) => {
           if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
             sessionId = ev.session_id;
             console.log('[Bridge] Session ID:', sessionId);
+            send({ type: 'session_id', id: sessionId });
           }
 
           send({ type: 'stream', data: ev });
@@ -227,6 +240,15 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'chat') {
       if (!msg.text?.trim()) return;
       runClaude(msg.text.trim());
+    } else if (msg.type === 'resume_session') {
+      if (msg.id && !sessionId) {
+        sessionId = msg.id;
+        console.log('[Bridge] Resumed session:', sessionId);
+        send({ type: 'status', text: 'Context restored — previous session resumed.' });
+      }
+    } else if (msg.type === 'compact') {
+      console.log('[Bridge] Compacting session:', sessionId);
+      runClaude('/compact');
     } else if (msg.type === 'reset') {
       sessionId  = null;
       processing = false;
