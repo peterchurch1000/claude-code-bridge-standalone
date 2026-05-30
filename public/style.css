@@ -243,13 +243,13 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 }
 .tool-header {
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 12px; min-height: 32px; cursor: pointer;
+  padding: 3px 6px; min-height: 32px; cursor: pointer;
 }
 .tool-header:hover { background: rgba(155,122,240,0.1); }
 .tool-icon       { color: #9b7af0; flex-shrink: 0; }
 .tool-name-text  { color: #c8aaff; font-weight: 600; font-size: 12px; font-family: monospace; flex: 1; }
 .tool-caret      { color: #8090a8; font-size: 15px; flex-shrink: 0; transition: transform 0.2s; display: inline-block; }
-.tool-body       { display: none; border-top: 1px solid #2e3f5c; padding: 6px 10px; }
+.tool-body       { display: none; border-top: 1px solid #2e3f5c; padding: 3px 5px; }
 .tool-args       { color: #7a8099; font-size: 11px; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
 .tool-result     { color: #70d070; font-size: 11px; margin-top: 6px; white-space: pre-wrap; word-break: break-all; font-family: monospace; max-height: 120px; overflow-y: auto; }
 .tool-result.pending { color: var(--text-dim); font-style: italic; }
