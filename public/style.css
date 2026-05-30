@@ -24,8 +24,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 /* ── Chat panel ── */
 #chat-panel {
   width: 18vw;
-  min-width: 200px;
-  max-width: 50vw;
+  min-width: 250px;
+  max-width: 350px;
   background: var(--bg-panel);
   border-right: 1px solid var(--border);
   display: flex;
