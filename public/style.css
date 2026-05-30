@@ -17,7 +17,7 @@
   --panel-w:   360px;
 }
 
-html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
+html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; }
 
 #app { display: flex; height: 100vh; }
 
