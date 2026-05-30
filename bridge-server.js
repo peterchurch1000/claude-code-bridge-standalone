@@ -142,7 +142,40 @@ app.post('/type-text', (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws' });
+
+// Use noServer so two WebSocket paths can share one HTTP server without conflicts
+const wss      = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wssProxy = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = (req.url || '').split('?')[0];
+  if (pathname === '/ws') {
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  } else if (pathname === '/websockify') {
+    wssProxy.handleUpgrade(req, socket, head, ws => wssProxy.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+// Proxy /websockify → local websockify (noVNC ↔ VNC)
+wssProxy.on('connection', (clientWs) => {
+  const target = new WebSocket(`ws://localhost:${NOVNC_PORT}`, { perMessageDeflate: false });
+  const queue = [];
+  target.on('open', () => { queue.forEach(m => target.send(m.data, { binary: m.binary })); queue.length = 0; });
+  clientWs.on('message', (data, isBinary) => {
+    if (target.readyState === WebSocket.OPEN) target.send(data, { binary: isBinary });
+    else if (target.readyState === WebSocket.CONNECTING) queue.push({ data, binary: isBinary });
+  });
+  target.on('message', (data, isBinary) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
+  });
+  const close = () => { try { clientWs.close(); } catch {} try { target.close(); } catch {} };
+  clientWs.on('close', close);
+  target.on('close', close);
+  clientWs.on('error', close);
+  target.on('error', close);
+});
 
 const PING_INTERVAL = 30_000;
 const heartbeat = setInterval(() => {
@@ -159,18 +192,31 @@ wss.on('close', () => clearInterval(heartbeat));
 // persists. The Playwright MCP browser persists independently as a standalone
 // SSE server (started in start-browser.sh), so the browser stays open between
 // Claude invocations.
+const CLAUDE_TIMEOUT_MS      = 10 * 60 * 1000; // 10 min — max silence once running
+const CLAUDE_STARTUP_TIMEOUT = 2  * 60 * 1000; // 2 min  — must produce first output
+
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
   console.log('[Bridge] Client connected');
 
-  let sessionId   = null;
-  let processing  = false;
-  const msgQueue  = [];
+  let sessionId    = null;
+  let processing   = false;
+  let currentProc  = null;
+  let watchdogTimer = null;
+  const msgQueue   = [];
 
   function send(data) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+  }
+
+  function killCurrentProc(reason) {
+    if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+    if (currentProc)   { try { currentProc.kill('SIGKILL'); } catch {} currentProc = null; }
+    if (processing)    { processing = false; send({ type: 'done', code: -1 }); }
+    msgQueue.length = 0;
+    if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   }
 
   function runClaude(text) {
@@ -190,12 +236,29 @@ wss.on('connection', (ws) => {
       env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    currentProc = proc;
+
+    // Startup watchdog: must produce first output within 2 minutes (catches MCP init hangs)
+    let firstOutput = false;
+    watchdogTimer = setTimeout(() => {
+      console.log('[Bridge] Startup watchdog fired — no output within 2 min');
+      send({ type: 'error', text: '⏱ Claude failed to start (MCP/init timeout) — session reset.' });
+      killCurrentProc('startup timeout');
+    }, CLAUDE_STARTUP_TIMEOUT);
 
     proc.stdin.write(text + '\n');
     proc.stdin.end();
 
     let buf = '';
     proc.stdout.on('data', chunk => {
+      // Switch from startup watchdog to running watchdog on first output
+      if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+      if (!firstOutput) { firstOutput = true; }
+      watchdogTimer = setTimeout(() => {
+        send({ type: 'error', text: '⏱ Claude stopped responding (10 min timeout) — session reset.' });
+        killCurrentProc('watchdog timeout after output');
+      }, CLAUDE_TIMEOUT_MS);
+
       buf += chunk.toString();
       const lines = buf.split('\n');
       buf = lines.pop();
@@ -224,18 +287,26 @@ wss.on('connection', (ws) => {
     });
 
     proc.on('close', code => {
-      processing = false;
-      send({ type: 'done', code });
-      if (msgQueue.length > 0) {
-        const next = msgQueue.shift();
-        setTimeout(() => runClaude(next), 150);
+      if (currentProc === proc) {
+        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+        currentProc = null;
+        processing  = false;
+        send({ type: 'done', code });
+        if (msgQueue.length > 0) {
+          const next = msgQueue.shift();
+          setTimeout(() => runClaude(next), 150);
+        }
       }
     });
 
     proc.on('error', err => {
-      processing = false;
-      console.error('[Bridge] spawn error:', err.message);
-      send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
+      if (currentProc === proc) {
+        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
+        currentProc = null;
+        processing  = false;
+        console.error('[Bridge] spawn error:', err.message);
+        send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
+      }
     });
   }
 
@@ -257,15 +328,20 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'compact') {
       console.log('[Bridge] Compacting session:', sessionId);
       runClaude('/compact');
+    } else if (msg.type === 'cancel') {
+      killCurrentProc('user cancel');
+      send({ type: 'status', text: 'Cancelled.' });
     } else if (msg.type === 'reset') {
-      sessionId  = null;
-      processing = false;
-      msgQueue.length = 0;
+      killCurrentProc('user reset');
+      sessionId = null;
       send({ type: 'status', text: 'Session reset — next message starts a fresh Claude session.' });
     }
   });
 
-  ws.on('close', () => console.log('[Bridge] Client disconnected'));
+  ws.on('close', () => {
+    killCurrentProc('client disconnected');
+    console.log('[Bridge] Client disconnected');
+  });
   ws.on('error', err => console.error('[Bridge] WS error:', err.message));
 
   send({ type: 'status', text: 'Connected to Claude Code bridge. Ready.' });

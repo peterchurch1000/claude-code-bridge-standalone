@@ -21,6 +21,8 @@ mkdir -p "$LOG_DIR"
 
 # Kill any leftover processes from a previous run
 pkill -f "Xvfb $DISPLAY_NUM " 2>/dev/null || true
+DISPLAY_NUM_CLEAN="${DISPLAY_NUM#:}"
+rm -f "/tmp/.X${DISPLAY_NUM_CLEAN}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM_CLEAN}" 2>/dev/null || true
 pkill -f "x11vnc.*rfbport $VNC_PORT" 2>/dev/null || true
 pkill -f "websockify.*$NOVNC_PORT" 2>/dev/null || true
 fuser -k ${MCP_PORT}/tcp 2>/dev/null || true
@@ -87,6 +89,7 @@ echo "[browser] Starting Playwright MCP SSE server on port $MCP_PORT ..."
 DISPLAY=$DISPLAY_NUM npx @playwright/mcp@latest \
   --cdp-endpoint http://localhost:$CDP_PORT \
   --shared-browser-context \
+  --host 0.0.0.0 \
   --port $MCP_PORT \
   > "$LOG_DIR/playwright-mcp.log" 2>&1 &
 MCP_PID=$!
