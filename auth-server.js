@@ -626,7 +626,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.listen(authPort, () => {
+app.listen(authPort, '0.0.0.0', () => {
   console.log(`✓ Auth server listening on port ${authPort}`);
   console.log(`  Bridge: ${bridgeName}`);
   console.log(`  Database: ${dbPath}`);
