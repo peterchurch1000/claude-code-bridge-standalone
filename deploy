@@ -123,7 +123,7 @@ echo ""
 echo "🚀 Starting deployment..."
 export INSTANCE_NAME="$INSTANCE_NAME"
 
-if "$SCRIPT_DIR/scripts/deploy.sh" > /tmp/deploy_result.json 2>&1; then
+if "$SCRIPT_DIR/deploy.sh" > /tmp/deploy_result.json 2>&1; then
   DEPLOY_RESULT=$(cat /tmp/deploy_result.json)
 
   # Parse and display results
