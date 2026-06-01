@@ -123,3 +123,4 @@ secrets.json
 .htpasswd*
 private-key*
 auth.db
+# Test deployment Mon Jun  1 13:44:59 UTC 2026

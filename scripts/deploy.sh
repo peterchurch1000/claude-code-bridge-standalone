@@ -30,38 +30,38 @@ cat > "$OUTPUT_FILE" << 'EOF'
 EOF
 
 log() {
-  echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+  echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
 json_update() {
   local key="$1"
   local value="$2"
-  python3 -c "
+  python3 << PYSCRIPT
 import json
 with open('$OUTPUT_FILE', 'r') as f:
   data = json.load(f)
-data['$key'] = $value
+data[$key] = $value
 with open('$OUTPUT_FILE', 'w') as f:
   json.dump(data, f, indent=2)
-" 2>/dev/null || true
+PYSCRIPT
 }
 
 json_append_error() {
-  python3 -c "
+  python3 << PYSCRIPT
 import json
 with open('$OUTPUT_FILE', 'r') as f:
   data = json.load(f)
 data['errors'].append('$1')
 with open('$OUTPUT_FILE', 'w') as f:
   json.dump(data, f, indent=2)
-" 2>/dev/null || true
+PYSCRIPT
 }
 
 cd "$REPO_ROOT" || { echo "Failed to cd to $REPO_ROOT"; exit 1; }
 
 log "Starting deployment from $INSTANCE_NAME"
-json_update '"instance"' '"'"$INSTANCE_NAME"'"'
-json_update '"timestamp"' '"'"$(date -u +'%Y-%m-%dT%H:%M:%SZ')"'"'
+json_update '"instance"' "\"$INSTANCE_NAME\""
+json_update '"timestamp"' "\"$(date -u +'%Y-%m-%dT%H:%M:%SZ')\""
 
 # ===== Step 1: Handle uncommitted changes =====
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -94,7 +94,7 @@ if echo "$CHANGED_FILES" | grep -qE "(package\.json|\.env|config/|database/migra
 fi
 
 json_update '"services_need_restart"' "$([ "$NEEDS_RESTART" = true ] && echo 'true' || echo 'false')"
-json_update '"restart_reason"' '"'"$RESTART_REASON"'"'
+json_update '"restart_reason"' "\"$RESTART_REASON\""
 
 # ===== Step 3: Count files changed =====
 FILES_CHANGED=$(git log -1 --name-status --pretty=format: | wc -l)
