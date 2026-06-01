@@ -27,14 +27,22 @@ app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // Read real API rate limit data saved by claude-session-status statusline script
 const fs = require('fs');
-const RATE_LIMITS_PATH = path.join(__dirname, 'claude-rate-limits.json');
+const os = require('os');
+// Try multiple locations: user's home cache, then /tmp (for cross-instance access)
+const RATE_LIMITS_PATHS = [
+  path.join(os.homedir(), '.cache', 'claude', 'rate-limits.json'),
+  '/tmp/claude-rate-limits.json',
+  path.join(__dirname, 'claude-rate-limits.json')
+];
 function readRateLimits() {
-  try {
-    const raw = fs.readFileSync(RATE_LIMITS_PATH, 'utf8');
-    const d = JSON.parse(raw);
-    const age = Date.now() - new Date(d.updated_at).getTime();
-    if (age < 600_000) return d;
-  } catch {}
+  for (const rateLimitsPath of RATE_LIMITS_PATHS) {
+    try {
+      const raw = fs.readFileSync(rateLimitsPath, 'utf8');
+      const d = JSON.parse(raw);
+      const age = Date.now() - new Date(d.updated_at).getTime();
+      if (age < 600_000) return d;
+    } catch {}
+  }
   return null;
 }
 
