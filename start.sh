@@ -38,14 +38,25 @@ node bridge-server.js > "$LOG_DIR/bridge.log" 2>&1 &
 BRIDGE_PID=$!
 echo "[start] Bridge server started (PID $BRIDGE_PID)"
 
+# ── Start auth server ──
+# Auto-detect port based on which instance we're running on
+if [[ "$SCRIPT_DIR" == "/root/claude-code-bridge" ]]; then
+  export AUTH_PORT="${AUTH_PORT:-3458}"
+else
+  export AUTH_PORT="${AUTH_PORT:-3468}"
+fi
+node auth-server.js > "$LOG_DIR/auth.log" 2>&1 &
+AUTH_PID=$!
+echo "[start] Auth server started (PID $AUTH_PID) on port $AUTH_PORT"
+
 echo ""
 echo "🚀 All services running. Logs in $LOG_DIR/"
 echo "   Press Ctrl+C to stop everything."
 
 cleanup() {
   echo "[start] Shutting down..."
-  kill $BROWSER_PID $BRIDGE_PID 2>/dev/null || true
+  kill $BROWSER_PID $BRIDGE_PID $AUTH_PID 2>/dev/null || true
 }
 trap cleanup EXIT SIGTERM SIGINT
 
-wait $BRIDGE_PID
+wait $BRIDGE_PID $AUTH_PID
