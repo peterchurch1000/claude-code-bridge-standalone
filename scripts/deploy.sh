@@ -93,7 +93,7 @@ if echo "$CHANGED_FILES" | grep -qE "(package\.json|\.env|config/|database/migra
   fi
 fi
 
-json_update '"services_need_restart"' "$([ "$NEEDS_RESTART" = true ] && echo 'true' || echo 'false')"
+json_update '"services_need_restart"' "$([ "$NEEDS_RESTART" = true ] && echo 'True' || echo 'False')"
 json_update '"restart_reason"' "\"$RESTART_REASON\""
 
 # ===== Step 3: Count files changed =====
@@ -110,7 +110,7 @@ if [ -d "$REPO_ROOT/database/migrations" ]; then
       npm run migrate 2>&1 | tee -a "$LOG_FILE" || {
         json_append_error "Migration failed"
       }
-      json_update '"migrations_run"' 'true'
+      json_update '"migrations_run"' 'True'
       log "Migrations completed"
     fi
   fi
