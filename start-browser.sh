@@ -8,12 +8,12 @@
 #   even when Claude CLI processes start and stop between messages.
 set -e
 
-DISPLAY_NUM="${DISPLAY_NUM:-:21}"
-VNC_PORT="${VNC_PORT:-5921}"
-NOVNC_PORT="${NOVNC_PORT:-6083}"
+DISPLAY_NUM="${DISPLAY_NUM:-:31}"
+VNC_PORT="${VNC_PORT:-5931}"
+NOVNC_PORT="${NOVNC_PORT:-6093}"
 NOVNC_WEB="${NOVNC_WEB:-/usr/share/novnc}"
-MCP_PORT="${MCP_PORT:-8931}"
-CDP_PORT="${CDP_PORT:-9221}"
+MCP_PORT="${MCP_PORT:-8941}"
+CDP_PORT="${CDP_PORT:-9231}"
 CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/root/.config/chromium-bridge-profile}"
 LOG_DIR="${LOG_DIR:-$(dirname "$0")/logs}"
 
@@ -36,10 +36,15 @@ Xvfb $DISPLAY_NUM -screen 0 1920x1080x24 -ac +extension GLX +render -noreset \
 XVFB_PID=$!
 sleep 1.5
 
-echo "[browser] Starting window manager (xfwm4) ..."
-DISPLAY=$DISPLAY_NUM xfwm4 > "$LOG_DIR/xfwm4.log" 2>&1 &
-XFWM_PID=$!
-sleep 0.5
+if command -v xfwm4 &>/dev/null; then
+  echo "[browser] Starting window manager (xfwm4) ..."
+  DISPLAY=$DISPLAY_NUM xfwm4 > "$LOG_DIR/xfwm4.log" 2>&1 &
+  XFWM_PID=$!
+  sleep 0.5
+else
+  echo "[browser] xfwm4 not installed, skipping window manager (Chrome works without it)"
+  XFWM_PID=""
+fi
 
 echo "[browser] Starting x11vnc on port $VNC_PORT ..."
 x11vnc -display $DISPLAY_NUM -nopw -forever -shared -rfbport $VNC_PORT \
@@ -101,14 +106,23 @@ echo "   Display:   $DISPLAY_NUM"
 echo "   Chrome:    CDP port $CDP_PORT (PID $CHROME_PID)"
 echo "   MCP SSE:   http://localhost:$MCP_PORT/sse"
 echo "   noVNC:     http://localhost:$NOVNC_PORT/vnc_auto.html"
-echo "   PIDs:      Xvfb=$XVFB_PID xfwm4=$XFWM_PID x11vnc=$X11VNC_PID websockify=$NOVNC_PID MCP=$MCP_PID Chrome=$CHROME_PID"
+echo "   PIDs:      Xvfb=$XVFB_PID xfwm4=${XFWM_PID:-n/a} x11vnc=$X11VNC_PID websockify=$NOVNC_PID MCP=$MCP_PID Chrome=$CHROME_PID"
 echo ""
 
 # Trap cleanup
 cleanup() {
   echo "[browser] Shutting down..."
-  kill $XVFB_PID $XFWM_PID $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID 2>/dev/null || true
+  kill $XVFB_PID ${XFWM_PID:-} $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID 2>/dev/null || true
 }
 trap cleanup EXIT SIGTERM SIGINT
 
-wait $XVFB_PID
+# Monitor critical processes; exit (triggering watchdog restart) if any die
+while true; do
+  sleep 10
+  for pid in $XVFB_PID $CHROME_PID $MCP_PID; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[browser] Process $pid died, triggering restart..."
+      exit 1
+    fi
+  done
+done

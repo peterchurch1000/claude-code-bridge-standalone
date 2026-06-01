@@ -6,13 +6,16 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export DISPLAY_NUM="${DISPLAY_NUM:-:21}"
-export VNC_PORT="${VNC_PORT:-5921}"
-export NOVNC_PORT="${NOVNC_PORT:-6083}"
-export BRIDGE_PORT="${BRIDGE_PORT:-3457}"
-export NOVNC_URL="${NOVNC_URL:-https://claude-bridge.procyss-automation.com/vnc}"
+export DISPLAY_NUM="${DISPLAY_NUM:-:31}"
+export VNC_PORT="${VNC_PORT:-5931}"
+export NOVNC_PORT="${NOVNC_PORT:-6093}"
+export MCP_PORT="${MCP_PORT:-8941}"
+export CDP_PORT="${CDP_PORT:-9231}"
+export BRIDGE_PORT="${BRIDGE_PORT:-3467}"
+export AUTH_PORT="${AUTH_PORT:-3469}"
+export NOVNC_URL="${NOVNC_URL:-https://claude-bridge.castle-global.com/vnc}"
 export CHROME_PROFILE_DIR="${CHROME_PROFILE_DIR:-/root/.config/chromium-bridge-profile}"
-export CLAUDE_CWD="${CLAUDE_CWD:-$SCRIPT_DIR}"
+export CLAUDE_CWD="${CLAUDE_CWD:-/var/www/castle-sistema}"
 export LOG_DIR="$SCRIPT_DIR/logs"
 
 mkdir -p "$LOG_DIR"
@@ -26,11 +29,17 @@ echo "  noVNC URL:     $NOVNC_URL"
 echo "  Display:       $DISPLAY_NUM"
 echo ""
 
-# ── Start browser environment ──
-bash "$SCRIPT_DIR/start-browser.sh" > "$LOG_DIR/browser.log" 2>&1 &
+# ── Start browser environment (with watchdog restart) ──
+(
+  while true; do
+    bash "$SCRIPT_DIR/start-browser.sh" > "$LOG_DIR/browser.log" 2>&1
+    echo "[watchdog] Browser stack exited, restarting in 5s..." >> "$LOG_DIR/browser.log"
+    sleep 5
+  done
+) &
 BROWSER_PID=$!
-echo "[start] Browser stack started (PID $BROWSER_PID), waiting 4s..."
-sleep 4
+echo "[start] Browser watchdog started (PID $BROWSER_PID), waiting 12s..."
+sleep 12
 
 # ── Start bridge server ──
 cd "$SCRIPT_DIR"
@@ -39,12 +48,6 @@ BRIDGE_PID=$!
 echo "[start] Bridge server started (PID $BRIDGE_PID)"
 
 # ── Start auth server ──
-# Auto-detect port based on which instance we're running on
-if [[ "$SCRIPT_DIR" == "/root/claude-code-bridge" ]]; then
-  export AUTH_PORT="${AUTH_PORT:-3458}"
-else
-  export AUTH_PORT="${AUTH_PORT:-3468}"
-fi
 node auth-server.js > "$LOG_DIR/auth.log" 2>&1 &
 AUTH_PID=$!
 echo "[start] Auth server started (PID $AUTH_PID) on port $AUTH_PORT"
