@@ -1,0 +1,189 @@
+#!/bin/bash
+
+# Master Deploy Wrapper for Claude Code
+# Usage: ./deploy [options]
+# Options:
+#   --message "Message text"  - Provide commit message directly (skip interactive prompt)
+#   --skip-other-instances    - Only deploy this instance, don't update others
+#   --restart-always          - Always restart services after deploy
+#   --help                    - Show this help
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+source "$SCRIPT_DIR/scripts/detect-instance.sh" > /tmp/instance_info.txt 2>&1
+INSTANCE_NAME=$(head -1 /tmp/instance_info.txt)
+INSTANCE_PATH=$(sed -n '2p' /tmp/instance_info.txt)
+INSTANCE_PORT=$(sed -n '3p' /tmp/instance_info.txt)
+
+# Parse arguments
+COMMIT_MSG=""
+SKIP_OTHERS=false
+RESTART_ALWAYS=false
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --message)
+      COMMIT_MSG="$2"
+      shift 2
+      ;;
+    --skip-other-instances)
+      SKIP_OTHERS=true
+      shift
+      ;;
+    --restart-always)
+      RESTART_ALWAYS=true
+      shift
+      ;;
+    --help)
+      echo "Claude Bridge Deploy Wrapper"
+      echo ""
+      echo "Usage: ./deploy [options]"
+      echo ""
+      echo "Options:"
+      echo "  --message \"text\"        Provide commit message directly"
+      echo "  --skip-other-instances   Only deploy this instance"
+      echo "  --restart-always         Always restart services"
+      echo "  --help                   Show this help"
+      echo ""
+      echo "Current instance: $INSTANCE_NAME"
+      echo "Path: $INSTANCE_PATH"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+cd "$REPO_ROOT" || exit 1
+
+echo ""
+echo "╔════════════════════════════════════════════════════════╗"
+echo "║        Claude Bridge Deployment System               ║"
+echo "╚════════════════════════════════════════════════════════╝"
+echo ""
+echo "Instance: $INSTANCE_NAME"
+echo "Location: $REPO_ROOT"
+echo ""
+
+# Check for uncommitted changes
+if git diff --quiet && git diff --cached --quiet; then
+  echo "⚠️  No changes detected. Nothing to commit."
+  echo ""
+  exit 0
+fi
+
+echo "📊 Changes detected:"
+git diff --stat HEAD || git diff --stat --cached || true
+echo ""
+
+# Step 1: Suggest commit message
+if [ -z "$COMMIT_MSG" ]; then
+  echo "📝 Analyzing changes for commit message..."
+  echo ""
+
+  # Show diff preview
+  echo "--- Diff Preview (first 30 lines) ---"
+  (git diff HEAD || git diff --cached) | head -30
+  echo "---"
+  echo ""
+
+  echo "Suggested commit message (max 10 words):"
+  echo "  'Update source code with recent changes'"
+  echo ""
+  read -p "Enter commit message (or press Enter for suggestion): " COMMIT_MSG
+
+  if [ -z "$COMMIT_MSG" ]; then
+    COMMIT_MSG="Update source code with recent changes"
+  fi
+fi
+
+echo ""
+echo "✅ Commit message: '$COMMIT_MSG'"
+echo ""
+
+# Step 2: Stage and commit
+echo "📦 Staging changes..."
+git add -A
+
+echo "💾 Committing..."
+if git commit -m "$COMMIT_MSG"; then
+  COMMIT_HASH=$(git rev-parse --short HEAD)
+  echo "   ✓ Committed as $COMMIT_HASH"
+else
+  echo "❌ Commit failed"
+  exit 1
+fi
+
+echo ""
+
+# Step 3: Run deployment
+echo "🚀 Starting deployment..."
+export INSTANCE_NAME="$INSTANCE_NAME"
+
+if "$SCRIPT_DIR/scripts/deploy.sh" > /tmp/deploy_result.json 2>&1; then
+  DEPLOY_RESULT=$(cat /tmp/deploy_result.json)
+
+  # Parse and display results
+  if command -v python3 &> /dev/null; then
+    STATUS=$(echo "$DEPLOY_RESULT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('status', 'unknown'))" 2>/dev/null)
+    FILES_CHANGED=$(echo "$DEPLOY_RESULT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('files_changed', 0))" 2>/dev/null)
+    INSTANCES=$(echo "$DEPLOY_RESULT" | python3 -c "import sys, json; print(', '.join(json.load(sys.stdin).get('other_instances_updated', [])))" 2>/dev/null)
+    NEEDS_RESTART=$(echo "$DEPLOY_RESULT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('services_need_restart', False))" 2>/dev/null)
+    RESTART_REASON=$(echo "$DEPLOY_RESULT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('restart_reason', ''))" 2>/dev/null)
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════╗"
+    echo "║                   DEPLOYMENT RESULTS                  ║"
+    echo "╚════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Status: $STATUS"
+    echo "Files changed: $FILES_CHANGED"
+    echo "Instances updated: $INSTANCES"
+    echo ""
+
+    if [ "$NEEDS_RESTART" = "True" ] || [ "$RESTART_ALWAYS" = "true" ]; then
+      echo "⚠️  SERVICE RESTART NEEDED: $RESTART_REASON"
+      echo ""
+      read -t 10 -p "Restart services? (y/n): " RESTART_RESP || RESTART_RESP="n"
+
+      if [[ "$RESTART_RESP" =~ ^[Yy] ]]; then
+        echo "🔄 Restarting..."
+        case "$INSTANCE_NAME" in
+          "instance2-claude-bridge")
+            cd /root/claude-code-bridge && bash start.sh > /dev/null 2>&1 &
+            echo "   ✓ Instance 2 restart initiated"
+            ;;
+          "instance3-claude-bridge-standalone")
+            cd /var/www/html/claude-code-bridge-standalone && bash start.sh > /dev/null 2>&1 &
+            echo "   ✓ Instance 3 restart initiated"
+            ;;
+          "instance6-castle-data")
+            ssh -i ~/.ssh/id_rsa_PBC root@64.23.255.113 \
+              "docker restart castle-app" > /dev/null 2>&1 && \
+              echo "   ✓ Castle-data restarted" || \
+              echo "   ⚠️  Castle-data restart pending"
+            ;;
+        esac
+      fi
+    else
+      echo "✓ No service restart needed"
+    fi
+
+    echo ""
+    echo "╔════════════════════════════════════════════════════════╗"
+    echo "║              ✅ DEPLOYMENT COMPLETE                   ║"
+    echo "╚════════════════════════════════════════════════════════╝"
+    echo ""
+
+  else
+    echo "Deployment completed. Full output:"
+    echo "$DEPLOY_RESULT"
+  fi
+else
+  echo "❌ Deployment failed. Check logs:"
+  cat /tmp/deploy_result.json
+  exit 1
+fi

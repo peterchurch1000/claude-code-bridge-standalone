@@ -122,3 +122,4 @@ auth.json
 secrets.json
 .htpasswd*
 private-key*
+auth.db
