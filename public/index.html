@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Claude Code Bridge</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <script src="/config.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -16,11 +17,14 @@
       <div id="header-title">
         <span class="logo">⬡</span>
         <span>Claude Code Bridge</span>
-        <span id="mode-badge">CLI mode</span>
       </div>
       <div id="header-controls">
-        <span id="status-dot" class="dot disconnected" title="Connection status"></span>
-        <button id="btn-reset" title="New session">↺</button>
+        <div id="menu-wrap">
+          <button id="btn-menu" title="Sessions">☰</button>
+          <div id="session-dropdown" class="hidden">
+            <div id="session-list"></div>
+          </div>
+        </div>
       </div>
     </header>
 

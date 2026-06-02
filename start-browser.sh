@@ -38,11 +38,27 @@ sleep 1.5
 
 if command -v xfwm4 &>/dev/null; then
   echo "[browser] Starting window manager (xfwm4) ..."
-  DISPLAY=$DISPLAY_NUM xfwm4 > "$LOG_DIR/xfwm4.log" 2>&1 &
+  # xfwm4 requires D-Bus and xfconfd; start them first
+  DBUS_ADDR=$(dbus-daemon --session --fork --print-address 2>/dev/null || true)
+  if [ -n "$DBUS_ADDR" ]; then
+    export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
+    XFCONFD=/usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd
+    if [ -x "$XFCONFD" ]; then
+      DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" "$XFCONFD" &>/dev/null &
+      sleep 0.3
+    fi
+  fi
+  DISPLAY=$DISPLAY_NUM DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+    xfwm4 > "$LOG_DIR/xfwm4.log" 2>&1 &
+  XFWM_PID=$!
+  sleep 0.8
+elif command -v openbox &>/dev/null; then
+  echo "[browser] Starting window manager (openbox) ..."
+  DISPLAY=$DISPLAY_NUM openbox > "$LOG_DIR/openbox.log" 2>&1 &
   XFWM_PID=$!
   sleep 0.5
 else
-  echo "[browser] xfwm4 not installed, skipping window manager (Chrome works without it)"
+  echo "[browser] No window manager found, skipping (Chrome works without it)"
   XFWM_PID=""
 fi
 

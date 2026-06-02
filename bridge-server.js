@@ -38,6 +38,7 @@ const stmtHistGet    = chatDb.prepare('SELECT messages FROM chat_history WHERE s
 const stmtHistUpsert = chatDb.prepare(`INSERT INTO chat_history (session_id, messages, updated_at) VALUES (?, ?, ?)
   ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at`);
 const stmtHistDelete = chatDb.prepare('DELETE FROM chat_history WHERE session_id = ?');
+const stmtHistList   = chatDb.prepare('SELECT session_id, messages, updated_at FROM chat_history ORDER BY updated_at DESC LIMIT 50');
 
 app.get('/history/:sessionId', (req, res) => {
   try {
@@ -56,6 +57,22 @@ app.post('/history/:sessionId', (req, res) => {
 app.delete('/history/:sessionId', (req, res) => {
   try { stmtHistDelete.run(req.params.sessionId); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/sessions', (req, res) => {
+  try {
+    const rows = stmtHistList.all();
+    const sessions = rows.map(row => {
+      let preview = '';
+      try {
+        const msgs = JSON.parse(row.messages);
+        const first = msgs.find(m => m.type === 'user');
+        preview = first ? String(first.text || '').slice(0, 80) : '';
+      } catch {}
+      return { id: row.session_id, updatedAt: row.updated_at, preview };
+    });
+    res.json({ sessions });
+  } catch (e) { res.json({ sessions: [] }); }
 });
 
 // Read real API rate limit data saved by claude-session-status statusline script
@@ -376,6 +393,19 @@ wss.on('connection', (ws) => {
       killCurrentProc('user reset');
       sessionId = null;
       send({ type: 'status', text: 'Session reset — next message starts a fresh Claude session.' });
+    } else if (msg.type === 'switch_session') {
+      killCurrentProc('session switch');
+      sessionId = msg.id || null;
+      console.log('[Bridge] Switched to session:', sessionId);
+      send({ type: 'status', text: 'Session switched — resuming previous context.' });
+    } else if (msg.type === 'save_history') {
+      if (msg.sessionId && Array.isArray(msg.messages)) {
+        try {
+          stmtHistUpsert.run(msg.sessionId, JSON.stringify(msg.messages), Date.now());
+        } catch (e) {
+          console.error('[Bridge] History save error:', e.message);
+        }
+      }
     }
   });
 

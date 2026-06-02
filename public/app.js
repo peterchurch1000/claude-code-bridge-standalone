@@ -4,13 +4,14 @@
 
   const $ = id => document.getElementById(id);
 
-  const messagesEl = $('messages');
-  const inputEl    = $('chat-input');
-  const btnSend    = $('btn-send');
-  const btnReset   = $('btn-reset');
-  const statusBar  = $('status-bar');
-  const statusDot  = $('status-dot');
-  const vncFrame   = $('vnc-frame');
+  const messagesEl      = $('messages');
+  const inputEl         = $('chat-input');
+  const btnSend         = $('btn-send');
+  const btnMenu         = $('btn-menu');
+  const sessionDropdown = $('session-dropdown');
+  const sessionList     = $('session-list');
+  const statusBar       = $('status-bar');
+  const vncFrame        = $('vnc-frame');
   const cdotWs     = $('cdot-ws');
   const cdotVnc    = $('cdot-vnc');
   const cdotMcp    = $('cdot-mcp');
@@ -68,13 +69,15 @@
   let lastToolDataIdx      = -1;
   let _restoring           = false;
 
+  let _saveTimer = null;
   function saveToStorage() {
     if (_restoring || !currentSessionId) return;
-    fetch(`/history/${currentSessionId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: storedMsgData })
-    }).catch(() => {});
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'save_history', sessionId: currentSessionId, messages: storedMsgData }));
+      }
+    }, 400);
   }
   async function fetchAndRestoreHistory(sessionId) {
     try {
@@ -611,7 +614,6 @@
   function scheduleReconnect() {
     const delay = Math.min(2000 * Math.pow(2, wsReconnectAttempt), 30_000);
     wsReconnectAttempt++;
-    statusDot.className = 'dot connecting';
     setWsDot('reconnecting');
     setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s…`);
     wsReconnectTimer = setTimeout(connect, delay);
@@ -619,14 +621,12 @@
 
   function connect() {
     clearTimeout(wsReconnectTimer);
-    statusDot.className = 'dot connecting';
     setWsDot('connecting');
     setStatus('Connecting…');
     ws = new WebSocket(wsUrl());
 
     ws.onopen = () => {
       wsReconnectAttempt = 0;
-      statusDot.className = 'dot connected';
       setWsDot('connected');
       startConnTime();
       btnSend.disabled = false;
@@ -646,13 +646,12 @@
     ws.onclose = () => {
       stopKeepalive();
       setBusy(false);
-      statusDot.className = 'dot disconnected';
       setWsDot('disconnected');
       if (hasConnectedBefore) showToast('Disconnected — reconnecting…', 'warning');
       scheduleReconnect();
     };
 
-    ws.onerror = () => { statusDot.className = 'dot error'; setWsDot('error'); };
+    ws.onerror = () => { setWsDot('error'); };
 
     ws.onmessage = ev => {
       let msg;
@@ -682,7 +681,18 @@
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
   });
 
-  btnReset.onclick = () => {
+  // ── Session management ────────────────────────────────────────────────────
+  function fmtSessionDate(ts) {
+    const d   = new Date(ts);
+    const now = new Date();
+    const time = d.toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit', hour12: true });
+    if (d.toDateString() === now.toDateString()) return 'Today ' + time;
+    const yest = new Date(now - 86400000);
+    if (d.toDateString() === yest.toDateString()) return 'Yesterday ' + time;
+    return d.toLocaleDateString('en', { month: 'short', day: 'numeric' }) + ' ' + time;
+  }
+
+  function newSession() {
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
     messagesEl.innerHTML = '';
     currentAssistantEl   = null;
@@ -697,8 +707,84 @@
     if (currentSessionId) fetch(`/history/${currentSessionId}`, { method: 'DELETE' }).catch(() => {});
     currentSessionId = null;
     localStorage.removeItem(SESSION_KEY);
-    showToast('Session reset', 'info');
-  };
+    showToast('New session started', 'info');
+  }
+
+  async function switchToSession(id) {
+    sessionDropdown.classList.add('hidden');
+    messagesEl.innerHTML = '';
+    currentAssistantEl   = null;
+    currentAssistantText = '';
+    lastToolEl = null;
+    setBusy(false);
+    hideContextWarning();
+    storedMsgData        = [];
+    lastAssistantDataIdx = -1;
+    lastToolDataIdx      = -1;
+    currentSessionId = id;
+    localStorage.setItem(SESSION_KEY, id);
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'switch_session', id }));
+    }
+    await fetchAndRestoreHistory(id);
+    showToast('Session loaded', 'success');
+  }
+
+  async function loadSessions() {
+    sessionList.innerHTML = '';
+    const newBtn = document.createElement('button');
+    newBtn.className = 'sess-new';
+    newBtn.textContent = '+ New session';
+    newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newSession(); };
+    sessionList.appendChild(newBtn);
+    try {
+      const res = await fetch('/sessions', { cache: 'no-store' });
+      const data = await res.json();
+      if (!data.sessions || data.sessions.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'sess-empty';
+        empty.textContent = 'No previous sessions';
+        sessionList.appendChild(empty);
+        return;
+      }
+      for (const s of data.sessions) {
+        const btn = document.createElement('button');
+        btn.className = 'sess-item';
+        const time = document.createElement('span');
+        time.className = 'sess-time';
+        time.textContent = fmtSessionDate(s.updatedAt);
+        const preview = document.createElement('span');
+        preview.className = 'sess-preview';
+        preview.textContent = s.preview || '(empty)';
+        btn.appendChild(time);
+        btn.appendChild(preview);
+        btn.onclick = () => switchToSession(s.id);
+        sessionList.appendChild(btn);
+      }
+    } catch {
+      const empty = document.createElement('div');
+      empty.className = 'sess-empty';
+      empty.textContent = 'Failed to load sessions';
+      sessionList.appendChild(empty);
+    }
+  }
+
+  btnMenu.addEventListener('click', e => {
+    e.stopPropagation();
+    if (sessionDropdown.classList.contains('hidden')) {
+      const rect = btnMenu.getBoundingClientRect();
+      sessionDropdown.style.top  = (rect.bottom + 6) + 'px';
+      sessionDropdown.style.left = Math.max(4, rect.right - 240) + 'px';
+      loadSessions();
+      sessionDropdown.classList.remove('hidden');
+    } else {
+      sessionDropdown.classList.add('hidden');
+    }
+  });
+
+  document.addEventListener('click', () => {
+    sessionDropdown.classList.add('hidden');
+  });
 
   // ── Resizable divider ─────────────────────────────────────────────────────
   const divider   = $('divider');

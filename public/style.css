@@ -55,33 +55,54 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
 .logo { font-size: 18px; }
 
-#mode-badge {
-  font-size: 10px;
-  font-weight: 400;
-  background: rgba(74,158,255,0.15);
-  border: 1px solid rgba(74,158,255,0.3);
-  border-radius: 10px;
-  padding: 1px 7px;
-  color: var(--accent);
-  letter-spacing: 0.3px;
-}
-
 #header-controls { display: flex; align-items: center; gap: 10px; }
-
-.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; transition: background 0.3s; }
-.dot.disconnected { background: var(--text-dim); }
-.dot.connecting   { background: var(--orange); animation: pulse 1s infinite; }
-.dot.connected    { background: var(--green); }
-.dot.error        { background: var(--red); }
 
 @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
-#btn-reset {
+/* ── Hamburger menu ── */
+#menu-wrap { position: relative; }
+
+#btn-menu {
   background: none; border: 1px solid var(--border); color: var(--text-dim);
-  border-radius: 4px; padding: 3px 7px; cursor: pointer; font-size: 15px; line-height: 1;
+  border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 15px; line-height: 1;
   transition: color 0.2s, border-color 0.2s;
 }
-#btn-reset:hover { color: var(--text); border-color: var(--accent); }
+#btn-menu:hover { color: var(--text); border-color: var(--accent); }
+
+#session-dropdown {
+  position: fixed;
+  background: #0d1220; border: 1px solid var(--border);
+  border-radius: 6px; min-width: 230px; max-height: 320px;
+  overflow-y: auto; z-index: 9999;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+}
+#session-dropdown.hidden { display: none; }
+#session-dropdown::-webkit-scrollbar { width: 4px; }
+#session-dropdown::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.sess-new {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  color: var(--accent); padding: 9px 12px; font-size: 12px;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s;
+}
+.sess-new:hover { background: rgba(74,158,255,0.1); }
+
+.sess-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  color: var(--text); padding: 8px 12px; font-size: 11px;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s;
+}
+.sess-item:last-child { border-bottom: none; }
+.sess-item:hover { background: rgba(74,158,255,0.08); }
+
+.sess-time { display: block; font-size: 10px; color: var(--text-dim); margin-bottom: 2px; }
+.sess-preview { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.sess-empty { padding: 10px 12px; color: var(--text-dim); font-size: 11px; font-style: italic; }
 
 #status-bar {
   padding: 5px 12px; font-size: 11px; color: var(--text-dim);
