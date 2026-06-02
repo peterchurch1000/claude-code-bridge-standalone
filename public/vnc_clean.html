@@ -6,11 +6,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <link rel="stylesheet" href="/vnc/app/styles/lite.css">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    * { margin: 0; padding: 0; box-sizing: border-box; border-radius: 0 !important; }
     html, body { width: 100%; height: 100%; background: #1a1a1a; overflow: hidden; }
     #noVNC_status_bar { display: none; }
     #vnc-status { display: none; }
-    canvas { display: block; }
+    canvas { display: block; border-radius: 0 !important; }
   </style>
   <script src="/vnc/vendor/promise.js"></script>
   <script type="module">
@@ -41,7 +41,6 @@
 
     var rfb = new RFB(document.body, url, { shared: true });
     rfb.scaleViewport = true;
-    rfb.resizeSession = true;
 
     rfb.addEventListener('connect', function() { setStatus('connected'); });
     rfb.addEventListener('disconnect', function(e) {
