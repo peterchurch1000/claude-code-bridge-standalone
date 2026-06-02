@@ -46,6 +46,31 @@
     rfb.addEventListener('disconnect', function(e) {
       setStatus(e.detail.clean ? 'disconnected' : 'error');
     });
+
+    // ── Clipboard sync ────────────────────────────────────────────────────────
+
+    // Remote → Windows: when VNC server reports a clipboard change, push to OS
+    rfb.addEventListener('clipboard', function(e) {
+      if (!e.detail.text) return;
+      navigator.clipboard.writeText(e.detail.text).catch(function() {});
+    });
+
+    // Windows → Remote: intercept Ctrl+V before noVNC sees it,
+    // sync the Windows clipboard to the remote then send the keystroke
+    document.addEventListener('keydown', function(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+        e.stopPropagation();
+        e.preventDefault();
+        navigator.clipboard.readText().then(function(text) {
+          rfb.clipboardPasteFrom(text);
+          // Send Ctrl+V to the remote session
+          rfb.sendKey(0xFFE3, 'ControlLeft', true);
+          rfb.sendKey(0x0076, 'KeyV',        true);
+          rfb.sendKey(0x0076, 'KeyV',        false);
+          rfb.sendKey(0xFFE3, 'ControlLeft', false);
+        }).catch(function() {});
+      }
+    }, { capture: true });
   </script>
 </head>
 <body>
