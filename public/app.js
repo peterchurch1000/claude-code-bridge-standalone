@@ -60,20 +60,28 @@
   let hasConnectedBefore = false;
   let contextBanner = null;
 
-  // ── Chat persistence (localStorage) ───────────────────────────────────────
-  const STORAGE_KEY  = 'bridge_chat_v1';
+  // ── Chat persistence (server-side SQLite) ─────────────────────────────────
   const SESSION_KEY  = 'bridge_session_id';
+  let currentSessionId     = localStorage.getItem(SESSION_KEY) || null;
   let storedMsgData        = [];
   let lastAssistantDataIdx = -1;
   let lastToolDataIdx      = -1;
   let _restoring           = false;
 
   function saveToStorage() {
-    if (_restoring) return;
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(storedMsgData)); } catch {}
+    if (_restoring || !currentSessionId) return;
+    fetch(`/history/${currentSessionId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: storedMsgData })
+    }).catch(() => {});
   }
-  function loadFromStorage() {
-    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+  async function fetchAndRestoreHistory(sessionId) {
+    try {
+      const res = await fetch(`/history/${sessionId}`, { cache: 'no-store' });
+      const data = await res.json();
+      if (data.messages && data.messages.length > 0) renderStoredDisplay(data.messages);
+    } catch {}
   }
 
   // ── Markdown helper ────────────────────────────────────────────────────────
@@ -294,6 +302,7 @@
         break;
 
       case 'session_id':
+        currentSessionId = msg.id;
         localStorage.setItem(SESSION_KEY, msg.id);
         break;
 
@@ -624,7 +633,9 @@
       startKeepalive();
       const prevSessionId = localStorage.getItem(SESSION_KEY);
       if (prevSessionId) {
+        currentSessionId = prevSessionId;
         ws.send(JSON.stringify({ type: 'resume_session', id: prevSessionId }));
+        if (!hasConnectedBefore) fetchAndRestoreHistory(prevSessionId);
         if (hasConnectedBefore) showToast('Reconnected — restoring context…', 'success');
       } else {
         if (hasConnectedBefore) showToast('Reconnected', 'success');
@@ -683,7 +694,8 @@
     storedMsgData        = [];
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
-    saveToStorage();
+    if (currentSessionId) fetch(`/history/${currentSessionId}`, { method: 'DELETE' }).catch(() => {});
+    currentSessionId = null;
     localStorage.removeItem(SESSION_KEY);
     showToast('Session reset', 'info');
   };
@@ -702,8 +714,6 @@
   window.addEventListener('mouseup', () => { dragging = false; divider.classList.remove('dragging'); });
 
   // ── Init ──────────────────────────────────────────────────────────────────
-  const savedMsgs = loadFromStorage();
-  if (savedMsgs.length > 0) renderStoredDisplay(savedMsgs);
-
+  // History is restored from server via fetchAndRestoreHistory() on first WS connect
   connect();
 })();

@@ -25,6 +25,38 @@ app.get('/config.js', (req, res) => {
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// ── Chat history persistence ──────────────────────────────────────────────────
+const Database = require('better-sqlite3');
+const chatDb = new Database(path.join(__dirname, 'chat.db'));
+chatDb.exec(`CREATE TABLE IF NOT EXISTS chat_history (
+  session_id TEXT PRIMARY KEY,
+  messages   TEXT NOT NULL DEFAULT '[]',
+  updated_at INTEGER NOT NULL DEFAULT 0
+)`);
+const stmtHistGet    = chatDb.prepare('SELECT messages FROM chat_history WHERE session_id = ?');
+const stmtHistUpsert = chatDb.prepare(`INSERT INTO chat_history (session_id, messages, updated_at) VALUES (?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at`);
+const stmtHistDelete = chatDb.prepare('DELETE FROM chat_history WHERE session_id = ?');
+
+app.get('/history/:sessionId', (req, res) => {
+  try {
+    const row = stmtHistGet.get(req.params.sessionId);
+    res.json({ messages: row ? JSON.parse(row.messages) : [] });
+  } catch { res.json({ messages: [] }); }
+});
+app.post('/history/:sessionId', (req, res) => {
+  try {
+    const msgs = req.body?.messages;
+    if (!Array.isArray(msgs)) return res.status(400).json({ error: 'messages array required' });
+    stmtHistUpsert.run(req.params.sessionId, JSON.stringify(msgs), Date.now());
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/history/:sessionId', (req, res) => {
+  try { stmtHistDelete.run(req.params.sessionId); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // Read real API rate limit data saved by claude-session-status statusline script
 const fs = require('fs');
 const os = require('os');
