@@ -46,7 +46,7 @@
 
   // ── Set noVNC iframe src from server config ────────────────────────────────
   const novncBase = (window.BRIDGE_CONFIG?.novncUrl || '').replace(/\/$/, '');
-  vncFrame.src = '/vnc_clean.html';
+  vncFrame.src = '/vnc_clean.html?v=2';
 
   // ── State ──────────────────────────────────────────────────────────────────
   let ws = null;
