@@ -11,6 +11,7 @@ const http = require('http');
   const NOVNC_PORT   = parseInt(process.env.NOVNC_PORT   || '6093');
   const CLAUDE_CWD   = process.env.CLAUDE_CWD  || __dirname;
   const MCP_PORT     = parseInt(process.env.MCP_PORT || '8931');
+  const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
 
 const app = express();
 app.use(express.json());
@@ -268,7 +269,7 @@ wss.on('connection', (ws) => {
     processing = true;
     send({ type: 'thinking' });
 
-    const args = ['--output-format', 'stream-json', '--verbose'];
+    const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL];
     if (sessionId) args.push('--resume', sessionId);
 
     const proc = spawn('claude', args, {
