@@ -106,10 +106,28 @@ function readRateLimits() {
   return null;
 }
 
+// Model + account email are always known (env + OAuth login), independent of the
+// interactive-only rate-limit data. Surface them so the UI shows the model/email
+// even when the statusline rate-limits file is absent (headless bridge spawns).
+function modelDisplayName(id) {
+  if (!id) return '';
+  const m = id.match(/claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (m) return `Claude ${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}`;
+  return id;
+}
+function readAccountEmail() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
+    return d.oauthAccount?.emailAddress || '';
+  } catch { return ''; }
+}
+
 // Claude token/cost usage — 5-hour block + weekly, parallel fetch
 app.get('/usage', (req, res) => {
   let blockResult = null, weekResult = null, done = 0;
-  const rateLimits = readRateLimits();
+  const rateLimits = readRateLimits() || {};
+  if (!rateLimits.model) rateLimits.model = modelDisplayName(CLAUDE_MODEL);
+  if (!rateLimits.email) rateLimits.email = readAccountEmail();
 
   function finish() {
     if (++done < 2) return;
@@ -296,7 +314,22 @@ wss.on('connection', (ws) => {
     processing = true;
     send({ type: 'thinking' });
 
-    const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL];
+    const GENERAL_ASSISTANT_PROMPT =
+      'You are a helpful general-purpose assistant accessed through a web chat. ' +
+      'Help the user with ANY question or task they bring you — general knowledge, ' +
+      'research, writing, planning, personal and business tasks — not only software ' +
+      'engineering or this codebase. Do not refuse or redirect a request just because ' +
+      'it is unrelated to code.\n\n' +
+      'Your primary capability is browser interaction via the Playwright MCP tools, ' +
+      'shown live in the noVNC pane beside this chat. The workflow is semi-automated: ' +
+      'the user logs into websites themselves in that browser (so no credentials are ' +
+      'ever stored on the server), and once they are logged in you carry out the ' +
+      'automated steps directly with Playwright. Use this to help set up integrations ' +
+      'and systems, research projects, and perform any task that can be done through ' +
+      'the web. When a task needs a site the user is not yet logged into, ask them to ' +
+      'log in via the browser pane first, then proceed.';
+    const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL,
+      '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
     if (sessionId) args.push('--resume', sessionId);
 
     const proc = spawn('claude', args, {
