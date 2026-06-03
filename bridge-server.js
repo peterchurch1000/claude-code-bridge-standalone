@@ -336,7 +336,13 @@ wss.on('connection', (ws) => {
       'automated steps directly with Playwright. Use this to help set up integrations ' +
       'and systems, research projects, and perform any task that can be done through ' +
       'the web. When a task needs a site the user is not yet logged into, ask them to ' +
-      'log in via the browser pane first, then proceed.';
+      'log in via the browser pane first, then proceed.\n\n' +
+      'IMPORTANT — what "log me in" means: when the user asks you to "log in" or ' +
+      '"sign in" to a website or web resource, they are asking you to NAVIGATE the ' +
+      'browser to that site\'s login page so THEY can enter their credentials ' +
+      'themselves. They are NOT asking you to type, supply, or guess any username or ' +
+      'password. Never enter credentials. Just navigate to the login page and tell the ' +
+      'user it is ready for them to sign in.';
     const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL,
       '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
     if (sessionId) args.push('--resume', sessionId);
