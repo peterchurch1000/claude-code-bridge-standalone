@@ -291,7 +291,7 @@ wss.on('connection', (ws) => {
     if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   }
 
-  function runClaude(text) {
+  function runClaude(text, isRetry = false) {
     if (processing) {
       msgQueue.push(text);
       send({ type: 'queued', queueLength: msgQueue.length });
@@ -299,6 +299,11 @@ wss.on('connection', (ws) => {
     }
     processing = true;
     send({ type: 'thinking' });
+
+    // Track whether this invocation attempted to resume an existing session, so
+    // that a "No conversation found" failure can be detected and self-healed.
+    const triedResume = !!sessionId;
+    let resumeMissing = false;
 
     const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL];
     if (sessionId) args.push('--resume', sessionId);
@@ -362,6 +367,7 @@ wss.on('connection', (ws) => {
     proc.stderr.on('data', chunk => {
       const txt = chunk.toString().trim();
       if (txt) console.log('[claude stderr]', txt.slice(0, 300));
+      if (/No conversation found with session ID/i.test(txt)) resumeMissing = true;
     });
 
     proc.on('close', code => {
@@ -369,6 +375,19 @@ wss.on('connection', (ws) => {
         if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
         currentProc = null;
         processing  = false;
+
+        // Self-heal stale sessions: if --resume failed because the conversation no
+        // longer exists (e.g. after a subscription-account swap orphaned the old
+        // session IDs), drop the dead session ID and silently retry the same
+        // message as a fresh session — once.
+        if (resumeMissing && triedResume && !isRetry) {
+          console.log('[Bridge] Stale session', sessionId, '— starting fresh and retrying');
+          sessionId = null;
+          send({ type: 'status', text: 'Previous session expired — starting a fresh conversation.' });
+          setTimeout(() => runClaude(text, true), 150);
+          return;
+        }
+
         send({ type: 'done', code });
         if (msgQueue.length > 0) {
           const next = msgQueue.shift();
