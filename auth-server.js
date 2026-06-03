@@ -51,6 +51,13 @@ db.exec(`
   );
 `);
 
+// Migration: add home_path column if it doesn't exist
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN home_path TEXT NOT NULL DEFAULT '/peter'`);
+} catch (e) {
+  // column already exists, ignore
+}
+
 // Utility functions
 function verifySessionToken(token) {
   try {
@@ -519,7 +526,7 @@ app.post('/auth/login', (req, res) => {
     maxAge: 7 * 24 * 60 * 60 * 1000
   });
 
-  res.redirect('/');
+  res.redirect(user.home_path || '/');
 });
 
 app.get('/auth/logout', (req, res) => {
@@ -612,13 +619,24 @@ app.post('/auth/reset-password', (req, res) => {
 // Verify endpoint (used by nginx)
 app.get('/auth/verify', (req, res) => {
   const token = req.cookies.bridge_session;
-  const user = verifySessionToken(token);
+  const decoded = verifySessionToken(token);
 
-  if (user) {
-    res.status(200).json({ valid: true });
-  } else {
-    res.status(401).json({ valid: false });
+  if (!decoded) {
+    return res.status(401).json({ valid: false });
   }
+
+  // Cross-user path isolation check
+  const originalUri = req.headers['x-original-uri'] || '';
+  const user = db.prepare('SELECT home_path FROM users WHERE id = ?').get(decoded.userId);
+
+  if (user && user.home_path) {
+    // Exempt /auth/ paths from path check (login/logout/reset)
+    if (!originalUri.startsWith('/auth/') && !originalUri.startsWith(user.home_path)) {
+      return res.status(403).json({ valid: false, reason: 'path_mismatch' });
+    }
+  }
+
+  res.status(200).json({ valid: true });
 });
 
 // Health check

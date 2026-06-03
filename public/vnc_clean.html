@@ -4,7 +4,7 @@
   <title>VNC</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <link rel="stylesheet" href="/vnc/app/styles/lite.css">
+  <link rel="stylesheet" href="./vnc/app/styles/lite.css">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; border-radius: 0 !important; }
     html, body { width: 100%; height: 100%; background: #1a1a1a; overflow: hidden; }
@@ -12,7 +12,7 @@
     #vnc-status { display: none; }
     canvas { display: block; border-radius: 0 !important; }
   </style>
-  <script src="/vnc/vendor/promise.js"></script>
+  <script src="./vnc/vendor/promise.js"></script>
   <script type="module">
     window._noVNC_has_module_support = true;
   </script>
@@ -20,22 +20,25 @@
     window.addEventListener("load", function() {
       if (window._noVNC_has_module_support) return;
       var loader = document.createElement("script");
-      loader.src = "/vnc/vendor/browser-es-module-loader/dist/browser-es-module-loader.js";
+      loader.src = "./vnc/vendor/browser-es-module-loader/dist/browser-es-module-loader.js";
       document.head.appendChild(loader);
     });
   </script>
   <script type="module" crossorigin="anonymous">
-    import * as WebUtil from '/vnc/app/webutil.js';
-    import RFB from '/vnc/core/rfb.js';
+    import * as WebUtil from './vnc/app/webutil.js';
+    import RFB from './vnc/core/rfb.js';
 
     const statusEl = document.getElementById('vnc-status');
     function setStatus(s) { statusEl.className = s; }
 
     var host = window.location.hostname;
     var port = window.location.port || (window.location.protocol === 'https:' ? 443 : 80);
-    var path = 'websockify';
+    // Extract path prefix from current URL (e.g., /peter, /hassan, /user3)
+    var pathParts = window.location.pathname.split('/').filter(Boolean);
+    var prefix = pathParts.length > 1 ? '/' + pathParts[0] : '';
+    var path = prefix + '/websockify';
     var proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    var url = proto + '://' + host + (port ? ':' + port : '') + '/' + path;
+    var url = proto + '://' + host + (port ? ':' + port : '') + path;
 
     setStatus('connecting');
 

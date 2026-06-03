@@ -36,7 +36,11 @@ try {
     chatData = JSON.parse(fs.readFileSync(CHAT_DB_PATH, 'utf8'));
   }
 } catch (e) {
-  console.warn(`Failed to load chat history: ${e.message}`);
+  // Likely a stale legacy SQLite chat.db baked into the image — discard it and
+  // start fresh so the file is rewritten as JSON on the next save.
+  console.warn(`Resetting unreadable chat history (${e.message})`);
+  chatData = {};
+  try { fs.unlinkSync(CHAT_DB_PATH); } catch (_) {}
 }
 
 function saveChatData() {
@@ -299,9 +303,15 @@ wss.on('connection', (ws) => {
     const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL];
     if (sessionId) args.push('--resume', sessionId);
 
+    // Use the Claude Code subscription (OAuth login in ~/.claude/.credentials.json)
+    // rather than API-key auth. If ANTHROPIC_API_KEY is present, Claude ignores the
+    // OAuth session and tries the key — so strip it to force subscription mode.
+    const claudeEnv = { ...process.env };
+    delete claudeEnv.ANTHROPIC_API_KEY;
+
     const proc = spawn('claude', args, {
       cwd: CLAUDE_CWD,
-      env: { ...process.env },
+      env: claudeEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     currentProc = proc;
@@ -427,6 +437,13 @@ wss.on('connection', (ws) => {
   ws.on('error', err => console.error('[Bridge] WS error:', err.message));
 
   send({ type: 'status', text: 'Connected to Claude Code bridge. Ready.' });
+});
+
+server.on('error', (err) => {
+  // If the port is already held (e.g. an orphaned sibling), exit instead of
+  // lingering as a zombie — the watchdog will free the port and relaunch cleanly.
+  console.error(`[Bridge] Server error on port ${BRIDGE_PORT}: ${err.code || err.message}`);
+  process.exit(1);
 });
 
 server.listen(BRIDGE_PORT, '0.0.0.0', () => {

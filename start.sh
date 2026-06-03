@@ -86,9 +86,19 @@ for ENTRY in "${USERS[@]}"; do
   BRIDGE_ENV="${BRIDGE_ENV} NOVNC_URL=https://claude-bridge.castle-global.com${BASE_PATH}/vnc"
   BRIDGE_ENV="${BRIDGE_ENV} CLAUDE_TZ=America/Argentina/Buenos_Aires"
 
-  bash -c "${BRIDGE_ENV} cd ${SCRIPT_DIR} && node bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1" &
+  # ── Bridge server watchdog (restarts the node process if it ever exits) ──
+  (
+    while true; do
+      # Free the port first so a relaunch can never collide with a stale/orphaned
+      # node still holding it (avoids EADDRINUSE crash loops).
+      fuser -k "${BRIDGE_PORT}/tcp" 2>/dev/null && sleep 1
+      bash -c "cd ${SCRIPT_DIR} && exec env ${BRIDGE_ENV} node bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1"
+      echo "[watchdog:${LUSER}] Bridge server exited, restarting in 3s..." >> "${ULOG_DIR}/bridge.log"
+      sleep 3
+    done
+  ) &
   ALL_PIDS+=($!)
-  echo "[start] Bridge for ${LUSER} started on port ${BRIDGE_PORT} (PID $!)"
+  echo "[start] Bridge watchdog for ${LUSER} started on port ${BRIDGE_PORT} (PID $!)"
 done
 
 echo ""
