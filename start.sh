@@ -86,9 +86,7 @@ for ENTRY in "${USERS[@]}"; do
   BRIDGE_ENV="${BRIDGE_ENV} NOVNC_URL=https://claude-bridge.castle-global.com${BASE_PATH}/vnc"
   BRIDGE_ENV="${BRIDGE_ENV} CLAUDE_TZ=America/Argentina/Buenos_Aires"
 
-  su -s /bin/bash "${LUSER}" -c "
-    ${BRIDGE_ENV} node ${SCRIPT_DIR}/bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1
-  " &
+  bash -c "${BRIDGE_ENV} cd ${SCRIPT_DIR} && node bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1" &
   ALL_PIDS+=($!)
   echo "[start] Bridge for ${LUSER} started on port ${BRIDGE_PORT} (PID $!)"
 done
