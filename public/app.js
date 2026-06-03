@@ -26,14 +26,26 @@
   function setVncDot(s) {
     _setDot(cdotVnc, s);
     if (!cbtnVnc) return;
-    if (s === 'disconnected' || s === 'error') cbtnVnc.classList.remove('hidden');
-    else cbtnVnc.classList.add('hidden');
+    if (s === 'disconnected' || s === 'error') {
+      cbtnVnc.classList.remove('hidden');
+      scheduleVncReconnect();
+    } else {
+      cbtnVnc.classList.add('hidden');
+      clearTimeout(vncReconnectTimer);
+      vncReconnectAttempt = 0;
+    }
   }
   function setMcpDot(s) {
     _setDot(cdotMcp, s);
     if (!cbtnMcp) return;
-    if (s === 'disconnected' || s === 'error') cbtnMcp.classList.remove('hidden');
-    else cbtnMcp.classList.add('hidden');
+    if (s === 'disconnected' || s === 'error') {
+      cbtnMcp.classList.remove('hidden');
+      scheduleMcpReconnect();
+    } else {
+      cbtnMcp.classList.add('hidden');
+      clearTimeout(mcpReconnectTimer);
+      mcpReconnectAttempt = 0;
+    }
   }
 
   // Uptime clock in conn-bar
@@ -48,12 +60,17 @@
 
   // ── Set noVNC iframe src from server config ────────────────────────────────
   const novncBase = (window.BRIDGE_CONFIG?.novncUrl || '').replace(/\/$/, '');
-  vncFrame.src = '/vnc_clean.html?v=2';
+  const API_BASE = (window.BRIDGE_CONFIG?.basePath || '').replace(/\/$/, '');
+  vncFrame.src = `${API_BASE}/vnc_clean.html?v=2`;
 
   // ── State ──────────────────────────────────────────────────────────────────
   let ws = null;
   let wsReconnectAttempt = 0;
   let wsReconnectTimer   = null;
+  let vncReconnectAttempt = 0;
+  let vncReconnectTimer  = null;
+  let mcpReconnectAttempt = 0;
+  let mcpReconnectTimer  = null;
   let keepaliveInterval  = null;
   let busy = false;
   let currentAssistantEl   = null;
@@ -82,7 +99,7 @@
   }
   async function fetchAndRestoreHistory(sessionId) {
     try {
-      const res = await fetch(`/history/${sessionId}`, { cache: 'no-store' });
+      const res = await fetch(`${API_BASE}/history/${sessionId}`, { cache: 'no-store' });
       const data = await res.json();
       if (data.messages && data.messages.length > 0) renderStoredDisplay(data.messages);
     } catch {}
@@ -349,7 +366,7 @@
   // ── MCP health polling ─────────────────────────────────────────────────────
   async function pollMcp() {
     try {
-      const res = await fetch('/mcp-health', { cache: 'no-store' });
+      const res = await fetch(API_BASE + '/mcp-health', { cache: 'no-store' });
       const data = await res.json();
       if (data.ok) {
         // Only upgrade to connected if currently unknown/disconnected (don't override session-init detection)
@@ -412,7 +429,7 @@
 
   async function pollUsage() {
     try {
-      const res  = await fetch('/usage', { cache: 'no-store' });
+      const res  = await fetch(API_BASE + '/usage', { cache: 'no-store' });
       const data = await res.json();
       if (!data.ok) return;
 
@@ -445,25 +462,48 @@
   pollUsage();
   setInterval(pollUsage, 30_000);
 
+  // ── Auto-reconnect schedulers ──────────────────────────────────────────────
+  function scheduleVncReconnect() {
+    clearTimeout(vncReconnectTimer);
+    const delay = Math.min(1000 * Math.pow(2, vncReconnectAttempt), 30_000);
+    vncReconnectAttempt++;
+    setVncDot('reconnecting');
+    vncReconnectTimer = setTimeout(reconnectVnc, delay);
+  }
+
+  function scheduleMcpReconnect() {
+    clearTimeout(mcpReconnectTimer);
+    const delay = Math.min(1000 * Math.pow(2, mcpReconnectAttempt), 30_000);
+    mcpReconnectAttempt++;
+    setMcpDot('reconnecting');
+    mcpReconnectTimer = setTimeout(reconnectMcp, delay);
+  }
+
+  function reconnectVnc() {
+    setVncDot('connecting');
+    const src = vncFrame.src;
+    vncFrame.src = '';
+    setTimeout(() => { vncFrame.src = src; }, 300);
+  }
+
+  function reconnectMcp() {
+    setMcpDot('connecting');
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    setTimeout(pollMcp, 3000);
+  }
+
   // ── MCP reconnect button ───────────────────────────────────────────────────
   if (cbtnMcp) {
     cbtnMcp.onclick = () => {
-      setMcpDot('connecting');
-      // Reset Claude session so next message spawns a fresh process that reconnects to MCP
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+      reconnectMcp();
       showToast('MCP session reset — send a message to reconnect', 'info');
-      setTimeout(pollMcp, 3000);
     };
   }
 
   // ── Browser (VNC) reconnect button ────────────────────────────────────────
   if (cbtnVnc) {
     cbtnVnc.onclick = () => {
-      setVncDot('connecting');
-      // Reload the noVNC iframe to force a fresh connection
-      const src = vncFrame.src;
-      vncFrame.src = '';
-      setTimeout(() => { vncFrame.src = src; }, 300);
+      reconnectVnc();
       showToast('Reconnecting browser display…', 'info');
     };
   }
@@ -473,7 +513,7 @@
     try {
       const text = await navigator.clipboard.readText();
       if (!text) { showToast('Clipboard is empty', 'warning'); return; }
-      const res = await fetch('/type-text', {
+      const res = await fetch(API_BASE + '/type-text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
@@ -601,7 +641,7 @@
   // ── WebSocket connection ───────────────────────────────────────────────────
   function wsUrl() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${location.host}/ws`;
+    return `${proto}//${location.host}${API_BASE}/ws`;
   }
 
   function startKeepalive() {
@@ -705,7 +745,7 @@
     storedMsgData        = [];
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
-    if (currentSessionId) fetch(`/history/${currentSessionId}`, { method: 'DELETE' }).catch(() => {});
+    if (currentSessionId) fetch(`${API_BASE}/history/${currentSessionId}`, { method: 'DELETE' }).catch(() => {});
     currentSessionId = null;
     localStorage.removeItem(SESSION_KEY);
     showToast('New session started', 'info');
@@ -739,7 +779,7 @@
     newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newSession(); };
     sessionList.appendChild(newBtn);
     try {
-      const res = await fetch('/sessions', { cache: 'no-store' });
+      const res = await fetch(API_BASE + '/sessions', { cache: 'no-store' });
       const data = await res.json();
       if (!data.sessions || data.sessions.length === 0) {
         const empty = document.createElement('div');
@@ -785,7 +825,7 @@
 
   btnLogout.addEventListener('click', e => {
     e.stopPropagation();
-    window.location.href = '/auth/logout';
+    window.location.href = API_BASE + '/auth/logout';
   });
 
   document.addEventListener('click', () => {
