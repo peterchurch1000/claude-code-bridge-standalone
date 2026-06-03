@@ -8,6 +8,7 @@
   const inputEl         = $('chat-input');
   const btnSend         = $('btn-send');
   const btnMenu         = $('btn-menu');
+  const btnLogout       = $('btn-logout');
   const sessionDropdown = $('session-dropdown');
   const sessionList     = $('session-list');
   const statusBar       = $('status-bar');
@@ -780,6 +781,11 @@
     } else {
       sessionDropdown.classList.add('hidden');
     }
+  });
+
+  btnLogout.addEventListener('click', e => {
+    e.stopPropagation();
+    window.location.href = '/auth/logout';
   });
 
   document.addEventListener('click', () => {
