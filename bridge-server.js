@@ -153,7 +153,7 @@ app.get('/usage', (req, res) => {
       const endTime = active.endTime ? new Date(active.endTime) : null;
       const minsLeft = endTime ? Math.max(0, Math.round((endTime - Date.now()) / 60000)) : null;
       const resetsAtMs = endTime ? endTime.getTime() : null;
-      const pct = rateLimits ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
+      const pct = rateLimits.five_hour_pct != null ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
       blockResult = {
         active: true, tokens,
         pct, minsLeft, resetsAtMs, burnRate: active.burnRate?.costPerHour || 0,
@@ -180,7 +180,7 @@ app.get('/usage', (req, res) => {
         weekTokens: current?.totalTokens || 0,
         prevCost:   prev?.totalCost      || 0,
         weekStart:  current?.week        || weekKey,
-        pct: rateLimits ? rateLimits.seven_day_pct : null,
+        pct: rateLimits.seven_day_pct != null ? rateLimits.seven_day_pct : null,
       };
     } catch { weekResult = null; }
     finish();
