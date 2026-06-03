@@ -12,6 +12,8 @@ const http = require('http');
   const CLAUDE_CWD   = process.env.CLAUDE_CWD  || __dirname;
   const MCP_PORT     = parseInt(process.env.MCP_PORT || '8931');
   const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001';
+  const BASE_PATH    = (process.env.BASE_PATH || '').replace(/\/$/, '');
+  const CHAT_DB_PATH = process.env.CHAT_DB || path.join(__dirname, 'chat.db');
 
 const app = express();
 app.use(express.json());
@@ -21,62 +23,70 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/config.js', (req, res) => {
   res.type('application/javascript');
-  res.send(`window.BRIDGE_CONFIG = ${JSON.stringify({ novncUrl: NOVNC_URL })};`);
+  res.send(`window.BRIDGE_CONFIG = ${JSON.stringify({ novncUrl: NOVNC_URL, basePath: BASE_PATH })};`);
 });
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ── Chat history persistence ──────────────────────────────────────────────────
-const Database = require('better-sqlite3');
-const chatDb = new Database(path.join(__dirname, 'chat.db'));
-chatDb.exec(`CREATE TABLE IF NOT EXISTS chat_history (
-  session_id TEXT PRIMARY KEY,
-  messages   TEXT NOT NULL DEFAULT '[]',
-  updated_at INTEGER NOT NULL DEFAULT 0
-)`);
-const stmtHistGet    = chatDb.prepare('SELECT messages FROM chat_history WHERE session_id = ?');
-const stmtHistUpsert = chatDb.prepare(`INSERT INTO chat_history (session_id, messages, updated_at) VALUES (?, ?, ?)
-  ON CONFLICT(session_id) DO UPDATE SET messages=excluded.messages, updated_at=excluded.updated_at`);
-const stmtHistDelete = chatDb.prepare('DELETE FROM chat_history WHERE session_id = ?');
-const stmtHistList   = chatDb.prepare('SELECT session_id, messages, updated_at FROM chat_history ORDER BY updated_at DESC LIMIT 50');
+// ── Chat history persistence (file-based, no compilation required) ──────────
+const fs = require('fs');
+let chatData = {};
+try {
+  if (fs.existsSync(CHAT_DB_PATH)) {
+    chatData = JSON.parse(fs.readFileSync(CHAT_DB_PATH, 'utf8'));
+  }
+} catch (e) {
+  console.warn(`Failed to load chat history: ${e.message}`);
+}
+
+function saveChatData() {
+  try {
+    fs.writeFileSync(CHAT_DB_PATH, JSON.stringify(chatData, null, 2));
+  } catch (e) {
+    console.warn(`Failed to save chat history: ${e.message}`);
+  }
+}
 
 app.get('/history/:sessionId', (req, res) => {
-  try {
-    const row = stmtHistGet.get(req.params.sessionId);
-    res.json({ messages: row ? JSON.parse(row.messages) : [] });
-  } catch { res.json({ messages: [] }); }
+  const data = chatData[req.params.sessionId];
+  res.json({ messages: data?.messages || [] });
 });
+
 app.post('/history/:sessionId', (req, res) => {
   try {
     const msgs = req.body?.messages;
     if (!Array.isArray(msgs)) return res.status(400).json({ error: 'messages array required' });
-    stmtHistUpsert.run(req.params.sessionId, JSON.stringify(msgs), Date.now());
+    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now() };
+    saveChatData();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.delete('/history/:sessionId', (req, res) => {
-  try { stmtHistDelete.run(req.params.sessionId); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    delete chatData[req.params.sessionId];
+    saveChatData();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/sessions', (req, res) => {
   try {
-    const rows = stmtHistList.all();
-    const sessions = rows.map(row => {
+    const entries = Object.entries(chatData).sort((a, b) => (b[1].updated_at || 0) - (a[1].updated_at || 0)).slice(0, 50);
+    const sessions = entries.map(([id, data]) => {
       let preview = '';
       try {
-        const msgs = JSON.parse(row.messages);
+        const msgs = data.messages || [];
         const first = msgs.find(m => m.type === 'user');
         preview = first ? String(first.text || '').slice(0, 80) : '';
       } catch {}
-      return { id: row.session_id, updatedAt: row.updated_at, preview };
+      return { id, updatedAt: data.updated_at, preview };
     });
     res.json({ sessions });
   } catch (e) { res.json({ sessions: [] }); }
 });
 
 // Read real API rate limit data saved by claude-session-status statusline script
-const fs = require('fs');
 const os = require('os');
 // Try multiple locations: user's home cache, then /tmp (for cross-instance access)
 const RATE_LIMITS_PATHS = [
@@ -401,7 +411,8 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'save_history') {
       if (msg.sessionId && Array.isArray(msg.messages)) {
         try {
-          stmtHistUpsert.run(msg.sessionId, JSON.stringify(msg.messages), Date.now());
+          chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now() };
+          saveChatData();
         } catch (e) {
           console.error('[Bridge] History save error:', e.message);
         }
