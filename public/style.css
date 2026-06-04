@@ -298,9 +298,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
 /* ── Input row ── */
 #input-row {
-  display: flex; gap: 8px; padding: 10px;
+  display: flex; gap: 8px; padding: 10px; align-items: stretch;
   border-top: 1px solid var(--border); flex-shrink: 0;
   background: #0d1220;
+}
+
+/* Left column spans the full field height: + tucked into the top-left corner,
+   paper-plane send pinned to the bottom (aligned with the field's bottom edge). */
+#input-buttons {
+  display: flex; flex-direction: column; align-items: flex-start;
+  gap: 6px; flex-shrink: 0;
 }
 
 #chat-input {
@@ -313,19 +320,22 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #chat-input::placeholder { color: var(--text-dim); }
 
 #btn-send {
-  background: var(--accent); border: none; border-radius: 6px;
-  color: #fff; padding: 0 14px; cursor: pointer; font-size: 13px;
-  font-weight: 600; align-self: flex-end; height: 36px;
-  transition: opacity 0.2s; flex-shrink: 0;
+  background: var(--accent); border: none; border-radius: 50%;
+  color: #fff; cursor: pointer; width: 36px; height: 36px;
+  flex-shrink: 0; margin-top: auto;   /* push send to the bottom of the column */
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.2s;
 }
+#btn-send svg { display: block; margin-left: 1px; }  /* optically centre the paper-plane */
 #btn-send:hover:not(:disabled) { opacity: 0.85; }
 #btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── Attach (+) button ── */
 #btn-attach {
   background: none; border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text-dim); width: 36px; height: 36px; align-self: flex-end;
-  cursor: pointer; font-size: 20px; line-height: 1; flex-shrink: 0;
+  color: var(--text-dim); width: 24px; height: 24px;
+  cursor: pointer; font-size: 15px; line-height: 1; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
   transition: color 0.2s, border-color 0.2s;
 }
 #btn-attach:hover { color: var(--text); border-color: var(--accent); }
