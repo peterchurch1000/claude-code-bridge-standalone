@@ -92,6 +92,14 @@ app.get('/sessions', (req, res) => {
 
 // Read real API rate limit data saved by claude-session-status statusline script
 const os = require('os');
+
+// Per-user upload directory for files/screenshots attached in the chat. Lives in
+// the user's HOME (so it's isolated per bridge account) and is read back by Claude
+// via its Read tool (Read(*) is allowed in the user's settings.json), so attached
+// images/files are referenced by absolute path in the prompt.
+const UPLOAD_DIR = path.join(os.homedir(), 'bridge-uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
+
 // Try multiple locations: user's home cache, then /tmp (for cross-instance access)
 const RATE_LIMITS_PATHS = [
   path.join(os.homedir(), '.cache', 'claude', 'rate-limits.json'),
@@ -229,6 +237,32 @@ app.post('/type-text', (req, res) => {
     execFile('xdotool', ['key', '--clearmodifiers', 'ctrl+v'], { env, timeout: 3000 },
       err => res.json({ ok: !err, method: 'xclip+ctrl+v', error: err?.message }));
   });
+});
+
+// Accept an attached file/screenshot. The raw bytes are POSTed as the body with
+// the original filename in the X-Filename header; the server writes it under the
+// per-user UPLOAD_DIR and returns the absolute path, which the front-end then
+// passes back with the chat message so Claude can Read() it.
+app.post('/upload', express.raw({ type: () => true, limit: '30mb' }), (req, res) => {
+  try {
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || buf.length === 0) {
+      return res.status(400).json({ error: 'empty upload' });
+    }
+    let raw = req.header('x-filename') || 'upload.bin';
+    try { raw = decodeURIComponent(raw); } catch {}
+    const origName = path.basename(raw);
+    // Strip any path components and keep a conservative on-disk filename charset.
+    const safe  = origName.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'file';
+    const uniq  = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+    const dest  = path.join(UPLOAD_DIR, uniq);
+    fs.writeFileSync(dest, buf);
+    console.log(`[Bridge] Upload saved: ${dest} (${buf.length} bytes)`);
+    res.json({ ok: true, path: dest, name: origName, size: buf.length });
+  } catch (e) {
+    console.error('[Bridge] Upload error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const server = http.createServer(app);
@@ -453,8 +487,21 @@ wss.on('connection', (ws) => {
     if (msg.type === 'ping') {
       send({ type: 'pong', ts: Date.now() });
     } else if (msg.type === 'chat') {
-      if (!msg.text?.trim()) return;
-      runClaude(msg.text.trim());
+      // Only accept attachment paths that the server itself created under
+      // UPLOAD_DIR — never let a client point Claude at an arbitrary file.
+      const atts = (Array.isArray(msg.attachments) ? msg.attachments : [])
+        .filter(a => a && typeof a.path === 'string'
+          && path.resolve(a.path).startsWith(UPLOAD_DIR + path.sep)
+          && fs.existsSync(a.path));
+      let prompt = (msg.text || '').trim();
+      if (atts.length) {
+        const list = atts.map(a => `- ${a.path}`).join('\n');
+        prompt += `${prompt ? '\n\n' : ''}[The user attached ${atts.length} file(s). ` +
+          `Use your Read tool to open ${atts.length > 1 ? 'each path' : 'the path'} below ` +
+          `(images render visually) before responding:\n${list}\n]`;
+      }
+      if (!prompt.trim()) return;
+      runClaude(prompt);
     } else if (msg.type === 'resume_session') {
       if (msg.id && !sessionId) {
         sessionId = msg.id;

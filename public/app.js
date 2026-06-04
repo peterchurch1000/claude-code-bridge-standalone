@@ -7,6 +7,9 @@
   const messagesEl      = $('messages');
   const inputEl         = $('chat-input');
   const btnSend         = $('btn-send');
+  const btnAttach       = $('btn-attach');
+  const fileInput       = $('file-input');
+  const attachBar       = $('attach-bar');
   const btnMenu         = $('btn-menu');
   const btnLogout       = $('btn-logout');
   const sessionDropdown = $('session-dropdown');
@@ -701,16 +704,132 @@
     };
   }
 
+  // ── Attachments (screenshots / files) ───────────────────────────────────────
+  // Files are uploaded to the server immediately and stored per-user; Claude reads
+  // them back by path. Pending uploads show as removable chips above the input.
+  let pendingAttachments = [];   // { path, name, isImage, previewUrl }
+  let uploadsInFlight = 0;
+
+  function renderAttachBar() {
+    attachBar.innerHTML = '';
+    if (!pendingAttachments.length && uploadsInFlight === 0) {
+      attachBar.classList.add('hidden');
+      return;
+    }
+    attachBar.classList.remove('hidden');
+    pendingAttachments.forEach((a, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      if (a.isImage && a.previewUrl) {
+        const img = document.createElement('img');
+        img.className = 'attach-thumb';
+        img.src = a.previewUrl;
+        chip.appendChild(img);
+      } else {
+        const ic = document.createElement('span');
+        ic.className = 'attach-icon';
+        ic.textContent = '📄';
+        chip.appendChild(ic);
+      }
+      const label = document.createElement('span');
+      label.className = 'attach-name';
+      label.textContent = a.name;
+      chip.appendChild(label);
+      const rm = document.createElement('button');
+      rm.className = 'attach-remove';
+      rm.title = 'Remove';
+      rm.textContent = '×';
+      rm.onclick = () => {
+        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+        pendingAttachments.splice(i, 1);
+        renderAttachBar();
+      };
+      chip.appendChild(rm);
+      attachBar.appendChild(chip);
+    });
+    if (uploadsInFlight > 0) {
+      const up = document.createElement('div');
+      up.className = 'attach-chip attach-uploading';
+      up.innerHTML = '<div class="spinner spinner-sm"></div><span>Uploading…</span>';
+      attachBar.appendChild(up);
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    uploadsInFlight++;
+    renderAttachBar();
+    try {
+      const res = await fetch(API_BASE + '/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'X-Filename': encodeURIComponent(file.name || 'file'),
+        },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.path) throw new Error(data.error || 'upload failed');
+      const isImage = (file.type || '').startsWith('image/');
+      pendingAttachments.push({
+        path: data.path,
+        name: data.name || file.name || 'file',
+        isImage,
+        previewUrl: isImage ? URL.createObjectURL(file) : null,
+      });
+    } catch (e) {
+      showToast('Upload failed: ' + e.message, 'error');
+    } finally {
+      uploadsInFlight--;
+      renderAttachBar();
+    }
+  }
+
+  function clearAttachments() {
+    pendingAttachments.forEach(a => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+    pendingAttachments = [];
+    renderAttachBar();
+  }
+
+  btnAttach.onclick = () => fileInput.click();
+  fileInput.addEventListener('change', () => {
+    Array.from(fileInput.files || []).forEach(uploadFile);
+    fileInput.value = '';   // allow re-selecting the same file
+  });
+
+  // Paste a screenshot/image straight into the message box.
+  inputEl.addEventListener('paste', e => {
+    const imgs = Array.from(e.clipboardData?.items || [])
+      .filter(it => it.kind === 'file' && it.type.startsWith('image/'));
+    if (!imgs.length) return;   // plain-text paste keeps default behaviour
+    e.preventDefault();
+    imgs.forEach(it => {
+      const blob = it.getAsFile();
+      if (blob) {
+        const named = new File([blob], blob.name || `screenshot-${Date.now()}.png`,
+          { type: blob.type });
+        uploadFile(named);
+      }
+    });
+  });
+
   // ── Send ──────────────────────────────────────────────────────────────────
   function sendMessage() {
     const text = inputEl.value.trim();
-    if (!text) return;
-    appendMsg('user', text);
+    if (!text && !pendingAttachments.length) return;
+    if (uploadsInFlight > 0) { showToast('Wait for the upload to finish', 'warning'); return; }
+    if (ws?.readyState !== WebSocket.OPEN) return;
+
+    const attachments = pendingAttachments.map(a => ({ path: a.path, name: a.name }));
+    const echo = text + (attachments.length
+      ? (text ? '\n' : '') + attachments.map(a => `📎 ${a.name}`).join('\n')
+      : '');
+    appendMsg('user', echo);
+    ws.send(JSON.stringify({ type: 'chat', text, attachments }));
+
     inputEl.value = '';
     inputEl.style.height = 'auto';
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'chat', text }));
-    }
+    clearAttachments();
   }
 
   btnSend.onclick = sendMessage;
