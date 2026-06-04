@@ -80,7 +80,13 @@
 
     <div id="messages"></div>
 
+    <!-- Pending attachments (screenshots / files) shown as chips before sending -->
+    <div id="attach-bar" class="hidden"></div>
+
     <div id="input-row">
+      <input type="file" id="file-input" multiple hidden
+        accept="image/*,application/pdf,text/*,.txt,.md,.csv,.json,.log,.xml,.yml,.yaml" />
+      <button id="btn-attach" title="Attach a file or screenshot">+</button>
       <textarea
         id="chat-input"
         placeholder="Message Claude Code… (Enter to send, Shift+Enter for newline)"

@@ -321,6 +321,43 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #btn-send:hover:not(:disabled) { opacity: 0.85; }
 #btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* ── Attach (+) button ── */
+#btn-attach {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-dim); width: 36px; height: 36px; align-self: flex-end;
+  cursor: pointer; font-size: 20px; line-height: 1; flex-shrink: 0;
+  transition: color 0.2s, border-color 0.2s;
+}
+#btn-attach:hover { color: var(--text); border-color: var(--accent); }
+
+/* ── Pending-attachment chips ── */
+#attach-bar {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0;
+  background: #0d1220; flex-shrink: 0;
+}
+#attach-bar.hidden { display: none; }
+.attach-chip {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--bg-msg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 6px; max-width: 180px;
+  font-size: 11px; color: var(--text);
+}
+.attach-thumb {
+  width: 28px; height: 28px; object-fit: cover; border-radius: 4px;
+  flex-shrink: 0;
+}
+.attach-icon { font-size: 16px; flex-shrink: 0; }
+.attach-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attach-remove {
+  background: none; border: none; color: var(--text-dim); cursor: pointer;
+  font-size: 15px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+}
+.attach-remove:hover { color: #ff6b6b; }
+.attach-uploading { color: var(--text-dim); }
+.spinner-sm { width: 10px; height: 10px; border-width: 2px; }
+
 /* ── Divider ── */
 #divider {
   width: 5px; background: #21262d; cursor: col-resize; flex-shrink: 0;
