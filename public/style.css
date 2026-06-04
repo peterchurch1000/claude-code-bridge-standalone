@@ -376,7 +376,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
    `display: contents` on #chat-panel dissolves its box so its children become
    direct flex items of #app, letting the browser slot between the status panel
    and the chat. Desktop layout above is untouched. */
-@media (max-width: 820px), (orientation: landscape) and (max-height: 600px) {
+@media (max-width: 820px) {
   #app { flex-direction: column; height: 100dvh; }
 
   /* Flatten the chat panel; its fixed width / borders no longer apply. */
