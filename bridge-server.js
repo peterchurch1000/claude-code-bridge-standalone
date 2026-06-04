@@ -36,7 +36,11 @@ try {
     chatData = JSON.parse(fs.readFileSync(CHAT_DB_PATH, 'utf8'));
   }
 } catch (e) {
-  console.warn(`Failed to load chat history: ${e.message}`);
+  // Likely a stale legacy SQLite chat.db baked into the image — discard it and
+  // start fresh so the file is rewritten as JSON on the next save.
+  console.warn(`Resetting unreadable chat history (${e.message})`);
+  chatData = {};
+  try { fs.unlinkSync(CHAT_DB_PATH); } catch (_) {}
 }
 
 function saveChatData() {
@@ -157,7 +161,7 @@ app.get('/usage', (req, res) => {
       const endTime = active.endTime ? new Date(active.endTime) : null;
       const minsLeft = endTime ? Math.max(0, Math.round((endTime - Date.now()) / 60000)) : null;
       const resetsAtMs = endTime ? endTime.getTime() : null;
-      const pct = rateLimits ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
+      const pct = rateLimits.five_hour_pct != null ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
       blockResult = {
         active: true, tokens,
         pct, minsLeft, resetsAtMs, burnRate: active.burnRate?.costPerHour || 0,
@@ -184,7 +188,7 @@ app.get('/usage', (req, res) => {
         weekTokens: current?.totalTokens || 0,
         prevCost:   prev?.totalCost      || 0,
         weekStart:  current?.week        || weekKey,
-        pct: rateLimits ? rateLimits.seven_day_pct : null,
+        pct: rateLimits.seven_day_pct != null ? rateLimits.seven_day_pct : null,
       };
     } catch { weekResult = null; }
     finish();
@@ -321,103 +325,113 @@ wss.on('connection', (ws) => {
 
   console.log('[Bridge] Client connected');
 
-  let sessionId    = null;
-  let processing   = false;
-  let currentProc  = null;
+  let sessionId     = null;
+  let processing    = false;   // a turn is in flight (awaiting its result)
+  let currentProc   = null;    // persistent streaming claude process (null when idle)
   let watchdogTimer = null;
-  const msgQueue   = [];
+  let pendingTurns  = 0;       // user messages sent but not yet resulted
+  let inFlight      = [];      // their texts, for self-heal resend after a stale --resume
+  let retried       = false;   // stale-session self-heal latch
 
   function send(data) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
   }
 
+  function clearWatch() { if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; } }
+  function armWatch(ms, msg) {
+    clearWatch();
+    watchdogTimer = setTimeout(() => { send({ type: 'error', text: msg }); killCurrentProc('watchdog timeout'); }, ms);
+  }
+  const WATCH_RUN = '⏱ Claude stopped responding (10 min timeout) — session reset.';
+
   function killCurrentProc(reason) {
-    if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
-    if (currentProc)   { try { currentProc.kill('SIGKILL'); } catch {} currentProc = null; }
-    if (processing)    { processing = false; send({ type: 'done', code: -1 }); }
-    msgQueue.length = 0;
+    clearWatch();
+    if (currentProc) { try { currentProc.kill('SIGKILL'); } catch {} currentProc = null; }
+    const wasProcessing = processing;
+    processing = false; pendingTurns = 0; inFlight = [];
+    if (wasProcessing) send({ type: 'done', code: -1 });
     if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   }
 
-  function runClaude(text) {
-    if (processing) {
-      msgQueue.push(text);
-      send({ type: 'queued', queueLength: msgQueue.length });
-      return;
-    }
-    processing = true;
-    send({ type: 'thinking' });
+  // Stream-json input envelope for one user turn.
+  function userMsgJSON(text) {
+    return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n';
+  }
 
-    const GENERAL_ASSISTANT_PROMPT =
-      'You are a helpful general-purpose assistant accessed through a web chat. ' +
-      'Help the user with ANY question or task they bring you — general knowledge, ' +
-      'research, writing, planning, personal and business tasks — not only software ' +
-      'engineering or this codebase. Do not refuse or redirect a request just because ' +
-      'it is unrelated to code.\n\n' +
-      'Your primary capability is browser interaction via the Playwright MCP tools, ' +
-      'shown live in the noVNC pane beside this chat. The workflow is semi-automated: ' +
-      'the user logs into websites themselves in that browser (so no credentials are ' +
-      'ever stored on the server), and once they are logged in you carry out the ' +
-      'automated steps directly with Playwright. Use this to help set up integrations ' +
-      'and systems, research projects, and perform any task that can be done through ' +
-      'the web. When a task needs a site the user is not yet logged into, ask them to ' +
-      'log in via the browser pane first, then proceed.\n\n' +
-      'IMPORTANT — what "log me in" means: when the user asks you to "log in" or ' +
-      '"sign in" to a website or web resource, they are asking you to NAVIGATE the ' +
-      'browser to that site\'s login page so THEY can enter their credentials ' +
-      'themselves. They are NOT asking you to type, supply, or guess any username or ' +
-      'password. Never enter credentials. Just navigate to the login page and tell the ' +
-      'user it is ready for them to sign in.';
-    const args = ['--output-format', 'stream-json', '--verbose', '--model', CLAUDE_MODEL,
-      '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
+  const GENERAL_ASSISTANT_PROMPT =
+    'You are a helpful general-purpose assistant accessed through a web chat. ' +
+    'Help the user with ANY question or task they bring you — general knowledge, ' +
+    'research, writing, planning, personal and business tasks — not only software ' +
+    'engineering or this codebase. Do not refuse or redirect a request just because ' +
+    'it is unrelated to code.\n\n' +
+    'Your primary capability is browser interaction via the Playwright MCP tools, ' +
+    'shown live in the noVNC pane beside this chat. The workflow is semi-automated: ' +
+    'the user logs into websites themselves in that browser (so no credentials are ' +
+    'ever stored on the server), and once they are logged in you carry out the ' +
+    'automated steps directly with Playwright. Use this to help set up integrations ' +
+    'and systems, research projects, and perform any task that can be done through ' +
+    'the web. When a task needs a site the user is not yet logged into, ask them to ' +
+    'log in via the browser pane first, then proceed.\n\n' +
+    'IMPORTANT — what "log me in" means: when the user asks you to "log in" or ' +
+    '"sign in" to a website or web resource, they are asking you to NAVIGATE the ' +
+    'browser to that site\'s login page so THEY can enter their credentials ' +
+    'themselves. They are NOT asking you to type, supply, or guess any username or ' +
+    'password. Never enter credentials. Just navigate to the login page and tell the ' +
+    'user it is ready for them to sign in.';
+
+  // Spawn the persistent streaming Claude process. With --input-format stream-json
+  // its stdin stays open across turns, so the user can send follow-up messages
+  // mid-session — they queue into the live process and steer it. Spawned lazily;
+  // killed on reset / cancel / disconnect / timeout.
+  function spawnProc() {
+    const triedResume = !!sessionId;
+    let resumeMissing = false;
+
+    const args = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+      '--model', CLAUDE_MODEL, '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
     if (sessionId) args.push('--resume', sessionId);
 
-    const proc = spawn('claude', args, {
-      cwd: CLAUDE_CWD,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    // Force subscription auth (strip any API key so the OAuth login is used).
+    const claudeEnv = { ...process.env };
+    delete claudeEnv.ANTHROPIC_API_KEY;
+
+    const proc = spawn('claude', args, { cwd: CLAUDE_CWD, env: claudeEnv, stdio: ['pipe', 'pipe', 'pipe'] });
     currentProc = proc;
-
-    // Startup watchdog: must produce first output within 2 minutes (catches MCP init hangs)
-    let firstOutput = false;
-    watchdogTimer = setTimeout(() => {
-      console.log('[Bridge] Startup watchdog fired — no output within 2 min');
-      send({ type: 'error', text: '⏱ Claude failed to start (MCP/init timeout) — session reset.' });
-      killCurrentProc('startup timeout');
-    }, CLAUDE_STARTUP_TIMEOUT);
-
-    proc.stdin.write(text + '\n');
-    proc.stdin.end();
+    // Startup watchdog: must produce first output within 2 min (catches MCP init hangs).
+    armWatch(CLAUDE_STARTUP_TIMEOUT, '⏱ Claude failed to start (MCP/init timeout) — session reset.');
 
     let buf = '';
     proc.stdout.on('data', chunk => {
-      // Switch from startup watchdog to running watchdog on first output
-      if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
-      if (!firstOutput) { firstOutput = true; }
-      watchdogTimer = setTimeout(() => {
-        send({ type: 'error', text: '⏱ Claude stopped responding (10 min timeout) — session reset.' });
-        killCurrentProc('watchdog timeout after output');
-      }, CLAUDE_TIMEOUT_MS);
-
       buf += chunk.toString();
       const lines = buf.split('\n');
       buf = lines.pop();
 
       for (const line of lines) {
         if (!line.trim()) continue;
-        try {
-          const ev = JSON.parse(line);
+        let ev;
+        try { ev = JSON.parse(line); } catch { send({ type: 'raw', text: line }); continue; }
 
-          if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
-            sessionId = ev.session_id;
-            console.log('[Bridge] Session ID:', sessionId);
-            send({ type: 'session_id', id: sessionId });
+        if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
+          sessionId = ev.session_id;
+          send({ type: 'session_id', id: sessionId });
+        }
+
+        send({ type: 'stream', data: ev });
+
+        if (ev.type === 'result') {
+          // One turn finished. More turns follow if the user queued messages.
+          retried = false;
+          if (inFlight.length) inFlight.shift();
+          pendingTurns = Math.max(0, pendingTurns - 1);
+          if (pendingTurns > 0) {
+            armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);   // a queued turn is still coming
+          } else {
+            processing = false;
+            clearWatch();
+            send({ type: 'done', code: 0 });
           }
-
-          send({ type: 'stream', data: ev });
-        } catch {
-          send({ type: 'raw', text: line });
+        } else {
+          armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);     // keep alive while output flows
         }
       }
     });
@@ -425,30 +439,57 @@ wss.on('connection', (ws) => {
     proc.stderr.on('data', chunk => {
       const txt = chunk.toString().trim();
       if (txt) console.log('[claude stderr]', txt.slice(0, 300));
+      if (/No conversation found with session ID/i.test(txt)) resumeMissing = true;
     });
 
     proc.on('close', code => {
-      if (currentProc === proc) {
-        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
-        currentProc = null;
-        processing  = false;
-        send({ type: 'done', code });
-        if (msgQueue.length > 0) {
-          const next = msgQueue.shift();
-          setTimeout(() => runClaude(next), 150);
-        }
+      if (currentProc !== proc) return;
+      clearWatch();
+      currentProc = null;
+      const wasProcessing = processing;
+      processing = false;
+
+      // Self-heal a stale --resume (orphaned session id after an account swap):
+      // drop the dead id, respawn fresh, and resend whatever was still in flight.
+      if (resumeMissing && triedResume && !retried) {
+        retried = true;
+        sessionId = null;
+        const resend = inFlight.slice();
+        inFlight = []; pendingTurns = 0;
+        send({ type: 'status', text: 'Previous session expired — starting a fresh conversation.' });
+        setTimeout(() => resend.forEach(t => sendToClaude(t)), 150);
+        return;
       }
+
+      pendingTurns = 0; inFlight = [];
+      if (wasProcessing) send({ type: 'done', code });   // unblock UI if it died mid-turn
     });
 
     proc.on('error', err => {
-      if (currentProc === proc) {
-        if (watchdogTimer) { clearTimeout(watchdogTimer); watchdogTimer = null; }
-        currentProc = null;
-        processing  = false;
-        console.error('[Bridge] spawn error:', err.message);
-        send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
-      }
+      if (currentProc !== proc) return;
+      clearWatch();
+      currentProc = null;
+      processing = false; pendingTurns = 0; inFlight = [];
+      console.error('[Bridge] spawn error:', err.message);
+      send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
     });
+  }
+
+  // Send one user turn. If the streaming process is already live, the message is
+  // written straight into its stdin — queuing/steering the running session.
+  // Otherwise a fresh process is spawned (resuming the session id when we have one).
+  function sendToClaude(text) {
+    const fresh = !currentProc;
+    const wasProcessing = processing;
+    if (fresh) spawnProc();
+    if (!currentProc) return;
+    inFlight.push(text);
+    pendingTurns++;
+    processing = true;
+    if (!wasProcessing) send({ type: 'thinking' });   // only show the spinner when starting from idle
+    try { currentProc.stdin.write(userMsgJSON(text)); }
+    catch (e) { console.error('[Bridge] stdin write failed:', e.message); }
+    if (!fresh) armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
   }
 
   ws.on('message', raw => {
@@ -472,7 +513,7 @@ wss.on('connection', (ws) => {
           `(images render visually) before responding:\n${list}\n]`;
       }
       if (!prompt.trim()) return;
-      runClaude(prompt);
+      sendToClaude(prompt);
     } else if (msg.type === 'resume_session') {
       if (msg.id && !sessionId) {
         sessionId = msg.id;
@@ -481,7 +522,7 @@ wss.on('connection', (ws) => {
       }
     } else if (msg.type === 'compact') {
       console.log('[Bridge] Compacting session:', sessionId);
-      runClaude('/compact');
+      sendToClaude('/compact');
     } else if (msg.type === 'cancel') {
       killCurrentProc('user cancel');
       send({ type: 'status', text: 'Cancelled.' });
@@ -513,6 +554,13 @@ wss.on('connection', (ws) => {
   ws.on('error', err => console.error('[Bridge] WS error:', err.message));
 
   send({ type: 'status', text: 'Connected to Claude Code bridge. Ready.' });
+});
+
+server.on('error', (err) => {
+  // If the port is already held (e.g. an orphaned sibling), exit instead of
+  // lingering as a zombie — the watchdog will free the port and relaunch cleanly.
+  console.error(`[Bridge] Server error on port ${BRIDGE_PORT}: ${err.code || err.message}`);
+  process.exit(1);
 });
 
 server.listen(BRIDGE_PORT, '0.0.0.0', () => {
