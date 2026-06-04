@@ -296,6 +296,16 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ── Stop / interrupt button (visible only while Claude is working) ── */
+#stop-row { display: flex; justify-content: center; padding: 4px 10px 0; background: #0d1220; }
+#btn-stop {
+  background: var(--bg-msg); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 14px; padding: 3px 14px; font-size: 11px; cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+#btn-stop:hover { color: #ff6b6b; border-color: #ff6b6b; }
+#btn-stop.hidden { display: none; }
+
 /* ── Input row ── */
 #input-row {
   display: flex; gap: 8px; padding: 10px; align-items: stretch;

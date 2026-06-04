@@ -10,6 +10,7 @@
   const btnAttach       = $('btn-attach');
   const fileInput       = $('file-input');
   const attachBar       = $('attach-bar');
+  const btnStop         = $('btn-stop');
   const btnMenu         = $('btn-menu');
   const btnLogout       = $('btn-logout');
   const sessionDropdown = $('session-dropdown');
@@ -276,9 +277,16 @@
 
   function setBusy(b) {
     busy = b;
-    btnSend.disabled = b;
-    inputEl.disabled = b;
+    // Input stays enabled while Claude works so the user can send follow-up
+    // messages to steer the running session. Only the Stop button toggles.
+    btnStop.classList.toggle('hidden', !b);
   }
+
+  // Stop / interrupt the running Claude turn.
+  btnStop.onclick = () => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'cancel' }));
+    setBusy(false);
+  };
 
   // ── Server message handler ─────────────────────────────────────────────────
   function handleMsg(msg) {

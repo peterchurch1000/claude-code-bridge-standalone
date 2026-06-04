@@ -83,6 +83,11 @@
     <!-- Pending attachments (screenshots / files) shown as chips before sending -->
     <div id="attach-bar" class="hidden"></div>
 
+    <!-- Interrupt button, shown only while Claude is working -->
+    <div id="stop-row">
+      <button id="btn-stop" class="hidden" title="Stop / interrupt Claude">■ Stop</button>
+    </div>
+
     <div id="input-row">
       <input type="file" id="file-input" multiple hidden
         accept="image/*,application/pdf,text/*,.txt,.md,.csv,.json,.log,.xml,.yml,.yaml" />
