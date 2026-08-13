@@ -22,6 +22,7 @@ declare -a USERS=(
   "bridge-peter:31:5931:6093:9231:8941:3467:/peter:ANTHROPIC_API_KEY_PETER"
   "bridge-roy:32:5932:6094:9232:8942:3468:/roy:ANTHROPIC_API_KEY_ROY"
   "bridge-john:33:5933:6095:9233:8943:3470:/john:ANTHROPIC_API_KEY_JOHN"
+  "bridge-luciano:34:5934:6096:9234:8944:3471:/luciano:ANTHROPIC_API_KEY_LUCIANO"
 )
 
 ALL_PIDS=()
@@ -34,13 +35,14 @@ for ENTRY in "${USERS[@]}"; do
   echo "[start] Initializing $LUSER (display :$DISPLAY_NUM, bridge port $BRIDGE_PORT)..."
 
   UHOME="/home/${LUSER}"
-  CHROME_PROFILE_DIR="${UHOME}/.config/chromium-bridge-profile"
+  CHROME_PROFILE_DIR="${UHOME}/.claude/chromium-bridge-profile"
   ULOG_DIR="${LOG_DIR}/${LUSER}"
   mkdir -p "$ULOG_DIR"
   chown "${LUSER}:${LUSER}" "$ULOG_DIR" 2>/dev/null || true
 
   # ── Browser+VNC watchdog (runs as root, sets DISPLAY/etc. env, starts Xvfb/Chrome as children) ──
   (
+    set +e   # keep the relaunch loop alive regardless of start-browser.sh exit code
     export DISPLAY_NUM=":$DISPLAY_NUM"
     export VNC_PORT="$VNC_PORT"
     export NOVNC_PORT="$NOVNC_PORT"
@@ -71,7 +73,10 @@ for ENTRY in "${USERS[@]}"; do
   API_KEY="${!API_KEY_ENV}"
   UHOME="/home/${LUSER}"
   ULOG_DIR="${LOG_DIR}/${LUSER}"
-  CHAT_DB="${UHOME}/chat.db"
+  # Under .claude (bind-mounted) so the UI chat history survives container recreate.
+  # Migrate any legacy chat.db from the old non-persisted path on first run.
+  CHAT_DB="${UHOME}/.claude/bridge-chat.json"
+  [ -f "${UHOME}/chat.db" ] && [ ! -f "$CHAT_DB" ] && cp "${UHOME}/chat.db" "$CHAT_DB" 2>/dev/null || true
 
   # Build env string for bridge process
   BRIDGE_ENV="HOME=${UHOME}"
@@ -82,17 +87,26 @@ for ENTRY in "${USERS[@]}"; do
   BRIDGE_ENV="${BRIDGE_ENV} CLAUDE_CWD=${CLAUDE_CWD}"
   BRIDGE_ENV="${BRIDGE_ENV} BASE_PATH=${BASE_PATH}"
   BRIDGE_ENV="${BRIDGE_ENV} CHAT_DB=${CHAT_DB}"
-  BRIDGE_ENV="${BRIDGE_ENV} ANTHROPIC_API_KEY=${API_KEY}"
+  # Only pass API_KEY if it's a real key, not a placeholder
+  if [[ ! "${API_KEY}" =~ YOUR_.*_API_KEY ]]; then
+    BRIDGE_ENV="${BRIDGE_ENV} ANTHROPIC_API_KEY=${API_KEY}"
+  fi
   BRIDGE_ENV="${BRIDGE_ENV} NOVNC_URL=https://claude-bridge.castle-global.com${BASE_PATH}/vnc"
   BRIDGE_ENV="${BRIDGE_ENV} CLAUDE_TZ=America/Argentina/Buenos_Aires"
 
   # ── Bridge server watchdog (restarts the node process if it ever exits) ──
   (
+    # CRITICAL: disable errexit inside the watchdog. The script runs under `set -e`,
+    # and `su ... node` returns non-zero whenever node exits abnormally (e.g. killed
+    # by a signal -> 137, or EADDRINUSE -> 1). Under errexit that non-zero return
+    # would kill this watchdog subshell, permanently taking the bridge down until a
+    # container restart. `set +e` keeps the relaunch loop alive across any exit code.
+    set +e
     while true; do
       # Free the port first so a relaunch can never collide with a stale/orphaned
       # node still holding it (avoids EADDRINUSE crash loops).
       fuser -k "${BRIDGE_PORT}/tcp" 2>/dev/null && sleep 1
-      bash -c "cd ${SCRIPT_DIR} && exec env ${BRIDGE_ENV} node bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1"
+      su -s /bin/bash "${LUSER}" -c "cd ${SCRIPT_DIR} && exec env ${BRIDGE_ENV} node bridge-server.js >> ${ULOG_DIR}/bridge.log 2>&1"
       echo "[watchdog:${LUSER}] Bridge server exited, restarting in 3s..." >> "${ULOG_DIR}/bridge.log"
       sleep 3
     done
@@ -102,6 +116,11 @@ for ENTRY in "${USERS[@]}"; do
 done
 
 echo ""
+# Session reaper (kills duplicate/stuck claude procs; see reaper.sh)
+( bash "$SCRIPT_DIR/reaper.sh" ) &
+ALL_PIDS+=($!)
+echo "[start] Session reaper started (PID $!)"
+
 echo "✅ All user stacks running"
 echo "   Peter Church (peter):  http://0.0.0.0:3467"
 echo "   Roy James (roy):       http://0.0.0.0:3468"

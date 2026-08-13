@@ -337,3 +337,36 @@ For issues with the standalone instance:
 3. Verify all ports are available
 4. Ensure original Bridge is not affected (test: `curl http://localhost:3457/ping`)
 5. Ensure Procyss Playwright MCP is not affected (test: `curl http://localhost:3001/mcp`)
+
+---
+
+## PETER TEST BROWSER (on-demand parallel stack — Peter only)
+
+A second, isolated Playwright browser + noVNC used to TEST this app without the
+noVNC infinite-mirror effect. Start/stop by hand; not supervised by any watchdog.
+
+Start: `./start-test-browser.sh`   Stop: `./stop-test-browser.sh`
+Live view: **https://claude-bridge.castle-global.com/peter/playwrite_browser_test**
+MCP (for Claude): second server `playwright-test` → `http://localhost:8951/mcp`
+in `/home/bridge-peter/.claude/settings.json`.
+
+### Test-stack port allocation (verified non-conflicting)
+
+| Service | Test port | Interactive (Peter) | Others in use |
+|---------|-----------|---------------------|---------------|
+| Playwright MCP | **8951** | 8941 | roy 8942, john 8943, luciano 8944, playwright.castle 8931 |
+| Chrome CDP | **9241** | 9231 | roy/john/luciano 9232-9234 |
+| x11vnc (VNC) | **5941** | 5931 | roy/john/luciano 5932-5934 |
+| websockify (noVNC) | **6193** | 6093 | 6094-6096; playwright.castle 6920; browser-automation 6080/6081 |
+| X Display | **:41** | :31 | :32-:34 |
+
+nginx route lives in `sites-available/claude-bridge.castle-global.com`
+(location `/peter/playwrite_browser_test`, proxies to noVNC 6193).
+
+### Host port bridge (important)
+
+The container publishes 6093-6096 but NOT 6193, and adding a published port needs a
+container recreate (avoided — OOM-prone box). Instead a host systemd service bridges it:
+`testbrowser-6193.service` runs `/usr/local/bin/testbrowser-6193-forward.sh`
+(socat 127.0.0.1:6193 -> castle-app container :6193, re-resolves container IP on start).
+On container recreate: `systemctl restart testbrowser-6193` AND re-run `start-test-browser.sh`.

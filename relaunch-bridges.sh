@@ -19,12 +19,13 @@ for ENTRY in "${USERS[@]}"; do
   (
     while true; do
       fuser -k "${BP}/tcp" 2>/dev/null && sleep 1
-      ( cd "$SCRIPT_DIR" && env \
-          HOME="$UHOME" DISPLAY_NUM="$DN" BRIDGE_PORT="$BP" NOVNC_PORT="$NP" MCP_PORT="$MP" \
-          CLAUDE_CWD=/var/www/castle-sistema BASE_PATH="$BASE" CHAT_DB="$UHOME/chat.db" \
-          NOVNC_URL="https://claude-bridge.castle-global.com$BASE/vnc" \
+      # Note: NOT passing ANTHROPIC_API_KEY - let Claude use OAuth credentials from ~/.claude.json
+      su -s /bin/bash "$LUSER" -c "cd $SCRIPT_DIR && env \
+          HOME=$UHOME DISPLAY_NUM=$DN BRIDGE_PORT=$BP NOVNC_PORT=$NP MCP_PORT=$MP \
+          CLAUDE_CWD=/var/www/castle-sistema BASE_PATH=$BASE CHAT_DB=$UHOME/.claude/bridge-chat.json \
+          NOVNC_URL=https://claude-bridge.castle-global.com$BASE/vnc \
           CLAUDE_TZ=America/Argentina/Buenos_Aires \
-          node bridge-server.js ) >> "$ULOG/bridge.log" 2>&1
+          node bridge-server.js" >> "$ULOG/bridge.log" 2>&1
       echo "[watchdog:$LUSER] Bridge server exited, restarting in 3s..." >> "$ULOG/bridge.log"
       sleep 3
     done

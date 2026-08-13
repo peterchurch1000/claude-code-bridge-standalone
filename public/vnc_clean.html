@@ -38,25 +38,153 @@
     var prefix = pathParts.length > 1 ? '/' + pathParts[0] : '';
     var path = prefix + '/websockify';
     var proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    var url = proto + '://' + host + (port ? ':' + port : '') + path;
+    // Per-room browsers: this iframe is loaded with ?room=<key>; forward it so the
+    // server proxies to THIS room's own noVNC port. Absent => shared panel (classic).
+    var roomQ = '';
+    try { var _rp = new URLSearchParams(window.location.search).get('room'); if (_rp) roomQ = '?room=' + encodeURIComponent(_rp); } catch (e) {}
+    var url = proto + '://' + host + (port ? ':' + port : '') + path + roomQ;
 
-    setStatus('connecting');
+    // rfb is (re)created by connect(); a mutable var so the soft-keyboard /
+    // clipboard / reconnect helpers below always reach the live instance.
+    var rfb = null;
+    var reconnectTimer = null;
+    var reconnectDelay = 1000;   // backoff, reset on a successful connect
 
-    var rfb = new RFB(document.body, url, { shared: true });
-    rfb.scaleViewport = true;
+    function connect() {
+      setStatus('connecting');
+      rfb = new RFB(document.body, url, { shared: true });
+      rfb.scaleViewport = true;
+      // Slow-link tuning: lower image quality + max compression so a full
+      // framebuffer actually fits through a narrow pipe (the cause of the
+      // "connected but black pane" bug on a dial-up-rate connection).
+      try { rfb.qualityLevel = 4; rfb.compressionLevel = 9; } catch (e) {}
 
-    rfb.addEventListener('connect', function() { setStatus('connected'); });
-    rfb.addEventListener('disconnect', function(e) {
-      setStatus(e.detail.clean ? 'disconnected' : 'error');
-    });
+      rfb.addEventListener('connect', function() {
+        setStatus('connected');
+        reconnectDelay = 1000;
+      });
+      rfb.addEventListener('disconnect', function(e) {
+        setStatus(e.detail.clean ? 'disconnected' : 'error');
+        scheduleReconnect();   // self-heal: any drop auto-reconnects with backoff
+      });
+      // Remote → OS clipboard: push remote clipboard changes to the local OS.
+      rfb.addEventListener('clipboard', function(e) {
+        if (!e.detail.text) return;
+        navigator.clipboard.writeText(e.detail.text).catch(function() {});
+      });
+    }
 
-    // ── Clipboard sync ────────────────────────────────────────────────────────
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(function() {
+        reconnectTimer = null;
+        connect();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    }
 
-    // Remote → Windows: when VNC server reports a clipboard change, push to OS
-    rfb.addEventListener('clipboard', function(e) {
-      if (!e.detail.text) return;
-      navigator.clipboard.writeText(e.detail.text).catch(function() {});
-    });
+    // Parent watchdog calls this to force a clean reconnect (re-requests a full
+    // framebuffer) when the canvas is connected but never painted.
+    window.__rfbReconnect = function () {
+      try { if (rfb) rfb.disconnect(); } catch (e) {}  // disconnect → scheduleReconnect
+    };
+
+    // ── Mobile soft-keyboard bridge ──────────────────────────────────────────
+    // The remote view is a <canvas>, which can't raise the phone keyboard. The
+    // parent page owns a hidden editable field (which DOES raise it) and forwards
+    // each keystroke here. keysym → remote key; `down` omitted = press+release.
+    window.__rfbSendKey = function (keysym, down) {
+      try { if (rfb) rfb.sendKey(keysym, null, down); } catch (e) {}
+    };
+
+    connect();
+
+    // --- Trackpad mode: relative pointer + tap-click + long-press drag -------
+    // Opt-in (off by default). Drives a virtual cursor through noVNC internals
+    // so a drag moves the pointer RELATIVE to its position (never teleports).
+    (function initTrackpad() {
+      var TP_KEY = 'bridgeTrackpad';
+      var SENS = 1.4, LONGPRESS_MS = 500, MOVE_CANCEL = 10;
+
+      var style = document.createElement('style');
+      style.textContent =
+        '#tp-overlay{position:fixed;inset:0;z-index:50;touch-action:none;display:none}' +
+        '#tp-overlay.on{display:block}' +
+        '#tp-toggle{position:fixed;right:10px;bottom:10px;z-index:60;font:12px/1 sans-serif;' +
+          'padding:7px 11px;border:0;border-radius:6px;background:rgba(40,40,40,.7);color:#eee;opacity:.55}' +
+        '#tp-toggle.on{background:#2563eb;opacity:1}' +
+        '#tp-dot{position:fixed;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;' +
+          'border:2px solid #2563eb;background:rgba(37,99,235,.25);z-index:55;pointer-events:none;display:none}' +
+        '#tp-dot.drag{background:#2563eb}';
+      document.head.appendChild(style);
+
+      var overlay = document.createElement('div'); overlay.id = 'tp-overlay';
+      var toggle  = document.createElement('button'); toggle.id = 'tp-toggle'; toggle.textContent = 'Trackpad';
+      var dot     = document.createElement('div'); dot.id = 'tp-dot';
+      document.body.appendChild(overlay);
+      document.body.appendChild(dot);
+      document.body.appendChild(toggle);
+
+      var tpOn = localStorage.getItem(TP_KEY) === '1';
+      var vx = 0, vy = 0;
+
+      function canvas() { return rfb && rfb._canvas; }
+      function rect() { var c = canvas(); return c ? c.getBoundingClientRect() : null; }
+      function centre() { var r = rect(); if (!r) return; vx = r.width/2; vy = r.height/2; place(); }
+      function clamp() { var r = rect(); if (!r) return; vx = Math.max(0, Math.min(r.width-1, vx)); vy = Math.max(0, Math.min(r.height-1, vy)); }
+      function place() { var r = rect(); if (!r) return; dot.style.left = (r.left+vx)+'px'; dot.style.top = (r.top+vy)+'px'; }
+      function move() { try { rfb._handleMouseMove(vx, vy); } catch(e){} place(); }
+      function btn(down) { try { rfb._handleMouseButton(vx, vy, down?1:0, 0x1); } catch(e){} }
+
+      function setTp(on) {
+        tpOn = on; localStorage.setItem(TP_KEY, on?'1':'0');
+        overlay.classList.toggle('on', on); toggle.classList.toggle('on', on);
+        dot.style.display = on ? 'block' : 'none';
+        if (on) centre();
+      }
+      toggle.addEventListener('click', function(){ setTp(!tpOn); });
+
+      var active=false, pid=null, lastX=0, lastY=0, startX=0, startY=0, moved=false, dragging=false, lp=null;
+      function clearLp(){ if (lp) { clearTimeout(lp); lp=null; } }
+
+      overlay.addEventListener('pointerdown', function(e){
+        if (!tpOn || active) return;
+        e.preventDefault();
+        active=true; pid=e.pointerId; try{ overlay.setPointerCapture(pid); }catch(_){}
+        lastX=startX=e.clientX; lastY=startY=e.clientY; moved=false; dragging=false;
+        clearLp();
+        lp = setTimeout(function(){
+          if (!active || moved) return;
+          dragging=true; dot.classList.add('drag');
+          if (navigator.vibrate) navigator.vibrate(15);
+          btn(true);
+        }, LONGPRESS_MS);
+      });
+      overlay.addEventListener('pointermove', function(e){
+        if (!tpOn || !active || e.pointerId!==pid) return;
+        e.preventDefault();
+        var dx=(e.clientX-lastX)*SENS, dy=(e.clientY-lastY)*SENS;
+        lastX=e.clientX; lastY=e.clientY;
+        if (!dx && !dy) return;
+        vx+=dx; vy+=dy; clamp();
+        if (!dragging && Math.hypot(e.clientX-startX, e.clientY-startY) > MOVE_CANCEL) { moved=true; clearLp(); }
+        move();
+      });
+      function end(e){
+        if (!active || (e && e.pointerId!==pid)) return;
+        if (e) e.preventDefault();
+        clearLp();
+        if (dragging) btn(false);
+        else if (!moved) { btn(true); btn(false); }
+        dot.classList.remove('drag');
+        active=false; pid=null; dragging=false; moved=false;
+      }
+      overlay.addEventListener('pointerup', end);
+      overlay.addEventListener('pointercancel', end);
+      window.addEventListener('resize', function(){ clamp(); place(); });
+
+      setTp(tpOn);
+    })();
 
     // Windows → Remote: intercept Ctrl+V before noVNC sees it,
     // sync the Windows clipboard to the remote then send the keystroke

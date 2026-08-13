@@ -8,6 +8,7 @@
 #   even when Claude CLI processes start and stop between messages.
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DISPLAY_NUM="${DISPLAY_NUM:-:31}"
 VNC_PORT="${VNC_PORT:-5931}"
 NOVNC_PORT="${NOVNC_PORT:-6093}"
@@ -28,6 +29,7 @@ pkill -f "websockify.*$NOVNC_PORT" 2>/dev/null || true
 fuser -k ${MCP_PORT}/tcp 2>/dev/null || true
 fuser -k ${CDP_PORT}/tcp 2>/dev/null || true
 pkill -f "$CHROME_PROFILE_DIR" 2>/dev/null || true
+pkill -f "dbus-daemon --session" 2>/dev/null || true
 sleep 1
 
 # --- Run the browser stack as the owning bridge user (task 071) ----------------
@@ -51,6 +53,26 @@ if [ "$(id -u)" = "0" ]; then
   fi
 fi
 
+# --- on-demand browser gate (lazy start / idle stop) -------------------------
+# Opt-in per user via ~/.claude/browser-on-demand. When set, park here until the
+# always-on bridge-server marks the browser "wanted" (touches
+# ~/.claude/browser-wanted); the monitor loop below idle-stops the stack once that
+# signal goes stale. The parent watchdog just re-invokes this script, which parks
+# here again. No flag => classic always-on behaviour (unchanged).
+BROWSER_IDLE=1200
+[ -r "$HOME/.claude/browser-idle" ] && BROWSER_IDLE="$(tr -d '[:space:]' < "$HOME/.claude/browser-idle" 2>/dev/null || echo 1200)"
+_wanted_fresh() {
+  local w="$HOME/.claude/browser-wanted"
+  [ -f "$w" ] || return 1
+  local age=$(( $(date +%s) - $(stat -c %Y "$w" 2>/dev/null || echo 0) ))
+  [ "$age" -lt "$BROWSER_IDLE" ]
+}
+if [ -f "$HOME/.claude/browser-on-demand" ] && ! _wanted_fresh; then
+  echo "[browser] on-demand: parked, waiting for browser-wanted signal ..."
+  while ! _wanted_fresh; do sleep 5; done
+  echo "[browser] on-demand: wanted — starting stack ..."
+fi
+
 echo "[browser] Starting Xvfb $DISPLAY_NUM ..."
 Xvfb $DISPLAY_NUM -screen 0 1088x898x24 -ac +extension GLX +render -noreset \
   > "$LOG_DIR/xvfb.log" 2>&1 &
@@ -60,12 +82,18 @@ sleep 1.5
 if command -v xfwm4 &>/dev/null; then
   echo "[browser] Starting window manager (xfwm4) ..."
   # xfwm4 requires D-Bus and xfconfd; start them first
-  DBUS_ADDR=$(dbus-daemon --session --fork --print-address 2>/dev/null || true)
+  _dbus_addr_file=$(mktemp)
+  dbus-daemon --session --nofork --print-address > "$_dbus_addr_file" 2>/dev/null &
+  DBUS_PID=$!
+  sleep 0.4
+  DBUS_ADDR=$(cat "$_dbus_addr_file" 2>/dev/null || true)
+  rm -f "$_dbus_addr_file"
   if [ -n "$DBUS_ADDR" ]; then
     export DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR"
     XFCONFD=/usr/lib/x86_64-linux-gnu/xfce4/xfconf/xfconfd
     if [ -x "$XFCONFD" ]; then
       DBUS_SESSION_BUS_ADDRESS="$DBUS_ADDR" "$XFCONFD" &>/dev/null &
+      XFCONFD_PID=$!
       sleep 0.3
     fi
   fi
@@ -107,8 +135,9 @@ CHROME_ACTIVE_PROFILE="Default"
 _apf="$HOME/.claude/active-chrome-profile"
 [ -r "$_apf" ] && CHROME_ACTIVE_PROFILE="$(tr -d '[:space:]' < "$_apf" 2>/dev/null)"
 [ -z "$CHROME_ACTIVE_PROFILE" ] && CHROME_ACTIVE_PROFILE="Default"
+start_chrome() {
 echo "[browser] Starting persistent Chrome on CDP port $CDP_PORT ..."
-DISPLAY=$DISPLAY_NUM /opt/google/chrome/chrome \
+DISPLAY=$DISPLAY_NUM NO_AT_BRIDGE=1 /opt/google/chrome/chrome \
   --no-sandbox \
   --disable-dev-shm-usage \
   --no-first-run \
@@ -131,7 +160,6 @@ DISPLAY=$DISPLAY_NUM /opt/google/chrome/chrome \
   --remote-debugging-port=$CDP_PORT \
   --user-data-dir="$CHROME_PROFILE_DIR" \
   --profile-directory="$CHROME_ACTIVE_PROFILE" \
-  --test-type \
   --disable-http2 \
   --window-size=1088,898 \
   --window-position=0,0 \
@@ -144,7 +172,10 @@ CHROME_WIN=$(DISPLAY=$DISPLAY_NUM xdotool search --onlyvisible --class "Chrome" 
 if [ -n "$CHROME_WIN" ]; then
   DISPLAY=$DISPLAY_NUM xdotool windowmove "$CHROME_WIN" 0 0
 fi
+}
+start_chrome
 
+start_mcp() {
 echo "[browser] Starting Playwright MCP SSE server on port $MCP_PORT ..."
 DISPLAY=$DISPLAY_NUM npx @playwright/mcp@latest \
   --cdp-endpoint http://localhost:$CDP_PORT \
@@ -153,7 +184,75 @@ DISPLAY=$DISPLAY_NUM npx @playwright/mcp@latest \
   --port $MCP_PORT \
   > "$LOG_DIR/playwright-mcp.log" 2>&1 &
 MCP_PID=$!
+# npx spawns sh->node, so $MCP_PID is the wrapper; resolve the real listener pid
+REAL_MCP_PID=""
+for _i in $(seq 1 20); do
+  REAL_MCP_PID="$(fuser ${MCP_PORT}/tcp 2>/dev/null | awk '{print $1}')"
+  [ -n "$REAL_MCP_PID" ] && break
+  sleep 0.5
+done
+echo "${REAL_MCP_PID:-$MCP_PID}" > "$HOME/.claude/bridge-mcp.pid"   # for shim watchdog
+}
+start_mcp
 sleep 2
+
+# --- Per-room browser shim (task 3ac9f55e) -------------------------------------
+# When SHIM_PORT is set, launch the shim that gives each bridge room its OWN tab
+# while reusing this single Playwright MCP + Chrome. No-op when SHIM_PORT is unset
+# (classic single-tab behaviour), so tenants are unaffected until they opt in.
+SHIM_PID=""
+start_shim() {
+  # Fall back to ~/.claude/shim-port so a tenant is flipped by writing one file.
+  if [ -z "$SHIM_PORT" ] && [ -r "$HOME/.claude/shim-port" ]; then
+    SHIM_PORT="$(tr -d '[:space:]' < "$HOME/.claude/shim-port" 2>/dev/null)"
+  fi
+  [ -z "$SHIM_PORT" ] && return 0
+  # Adopt an already-healthy shim so the CLI's connection to $SHIM_PORT survives
+  # Chrome/MCP restarts (the shim self-heals CDP + upstream underneath).
+  if [ -f "$HOME/.claude/bridge-shim.pid" ]; then
+    _sp="$(cat "$HOME/.claude/bridge-shim.pid" 2>/dev/null)"
+    if [ -n "$_sp" ] && kill -0 "$_sp" 2>/dev/null && fuser "${SHIM_PORT}/tcp" >/dev/null 2>&1; then
+      SHIM_PID="$_sp"; echo "[browser]   adopting existing shim PID $SHIM_PID on $SHIM_PORT"; return 0
+    fi
+  fi
+  fuser -k "${SHIM_PORT}/tcp" 2>/dev/null || true; sleep 1
+  echo "[browser] Starting per-room shim on port $SHIM_PORT (upstream MCP $MCP_PORT) ..."
+  ( cd "$SCRIPT_DIR" && env SHIM_PORT="$SHIM_PORT" \
+      UPSTREAM="http://localhost:$MCP_PORT/mcp" \
+      CDP_URL="http://127.0.0.1:$CDP_PORT" \
+      MCP_PIDFILE="$HOME/.claude/bridge-mcp.pid" \
+      node "$SCRIPT_DIR/shim.js" > "$LOG_DIR/shim.log" 2>&1 ) &
+  SHIM_PID=$!
+  echo "$SHIM_PID" > "$HOME/.claude/bridge-shim.pid"
+  echo "[browser]   shim PID $SHIM_PID"
+}
+start_shim
+
+# --- Per-room live viewer relay (task 190) -------------------------------------
+# When ROOMVIEW_PORT is set (or ~/.claude/roomview-port exists), launch the CDP
+# screencast relay that streams each room's own browser window into its pane over
+# a <canvas>. No-op when unset, so the classic noVNC pane is byte-for-byte intact.
+ROOMVIEW_PID=""
+start_roomview() {
+  if [ -z "$ROOMVIEW_PORT" ] && [ -r "$HOME/.claude/roomview-port" ]; then
+    ROOMVIEW_PORT="$(tr -d '[:space:]' < "$HOME/.claude/roomview-port" 2>/dev/null)"
+  fi
+  [ -z "$ROOMVIEW_PORT" ] && return 0
+  if [ -f "$HOME/.claude/bridge-roomview.pid" ]; then
+    _rp="$(cat "$HOME/.claude/bridge-roomview.pid" 2>/dev/null)"
+    if [ -n "$_rp" ] && kill -0 "$_rp" 2>/dev/null && fuser "${ROOMVIEW_PORT}/tcp" >/dev/null 2>&1; then
+      ROOMVIEW_PID="$_rp"; echo "[browser]   adopting existing room-view relay PID $ROOMVIEW_PID"; return 0
+    fi
+  fi
+  fuser -k "${ROOMVIEW_PORT}/tcp" 2>/dev/null || true; sleep 1
+  echo "[browser] Starting room-view relay on port $ROOMVIEW_PORT (CDP $CDP_PORT) ..."
+  ( cd "$SCRIPT_DIR" && env RELAY_PORT="$ROOMVIEW_PORT" CDP_PORT="$CDP_PORT" SHIM_PORT="$SHIM_PORT" \
+      node "$SCRIPT_DIR/room-view-relay.js" > "$LOG_DIR/room-view-relay.log" 2>&1 ) &
+  ROOMVIEW_PID=$!
+  echo "$ROOMVIEW_PID" > "$HOME/.claude/bridge-roomview.pid"
+  echo "[browser]   room-view relay PID $ROOMVIEW_PID"
+}
+start_roomview
 
 echo ""
 echo "✅ Browser environment ready"
@@ -168,17 +267,59 @@ echo ""
 # Trap cleanup
 cleanup() {
   echo "[browser] Shutting down..."
-  kill $XVFB_PID ${XFWM_PID:-} $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID 2>/dev/null || true
+  kill $XVFB_PID ${XFWM_PID:-} $X11VNC_PID $NOVNC_PID $MCP_PID $CHROME_PID ${DBUS_PID:-} ${XFCONFD_PID:-} 2>/dev/null || true
+  # Aux (shim + room-view) stay alive across component restarts so the CLI's MCP
+  # connection is never dropped by a flap; only killed on a deliberate stop.
+  if [ "${KILL_AUX:-0}" = "1" ]; then
+    kill ${SHIM_PID:-} ${ROOMVIEW_PID:-} 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT SIGTERM SIGINT
 
-# Monitor critical processes; exit (triggering watchdog restart) if any die
+# Monitor critical processes; exit (triggering watchdog restart) if any die.
+# The shim is non-critical: if it dies we relaunch it in place rather than nuking
+# the whole browser stack.
+CHROME_FAILS=0
 while true; do
   sleep 10
-  for pid in $XVFB_PID $CHROME_PID $MCP_PID; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "[browser] Process $pid died, triggering restart..."
-      exit 1
+  # Xvfb death = display gone; a full restart is required (aux survives, KILL_AUX=0).
+  if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+    echo "[browser] Xvfb $XVFB_PID died — full restart ..."
+    exit 1
+  fi
+  # Chrome/MCP death = restart just that component IN PLACE (no full teardown) so the
+  # VNC pane + shim + room-view stay up and the CLI keeps its MCP connection. Fall
+  # back to a full restart after 3 consecutive Chrome failures.
+  if ! kill -0 "$CHROME_PID" 2>/dev/null; then
+    CHROME_FAILS=$((CHROME_FAILS+1))
+    if [ "$CHROME_FAILS" -ge 3 ]; then
+      echo "[browser] Chrome died $CHROME_FAILS times — full restart ..."; exit 1
     fi
-  done
+    echo "[browser] Chrome died — relaunching in place (attempt $CHROME_FAILS) ..."
+    fuser -k "${MCP_PORT}/tcp" 2>/dev/null || true
+    fuser -k "${CDP_PORT}/tcp" 2>/dev/null || true
+    sleep 1
+    start_chrome
+    start_mcp
+  elif ! kill -0 "$MCP_PID" 2>/dev/null; then
+    echo "[browser] Playwright MCP died — relaunching in place ..."
+    fuser -k "${MCP_PORT}/tcp" 2>/dev/null || true
+    sleep 1
+    start_mcp
+  else
+    CHROME_FAILS=0
+  fi
+  if [ -f "$HOME/.claude/browser-on-demand" ] && ! _wanted_fresh; then
+    echo "[browser] on-demand: idle (browser-wanted stale) — stopping stack ..."
+    KILL_AUX=1
+    exit 0
+  fi
+  if [ -n "$SHIM_PORT" ] && [ -n "$SHIM_PID" ] && ! kill -0 "$SHIM_PID" 2>/dev/null; then
+    echo "[browser] shim died — relaunching ..."
+    start_shim
+  fi
+  if [ -n "$ROOMVIEW_PORT" ] && [ -n "$ROOMVIEW_PID" ] && ! kill -0 "$ROOMVIEW_PID" 2>/dev/null; then
+    echo "[browser] room-view relay died — relaunching ..."
+    start_roomview
+  fi
 done

@@ -51,7 +51,7 @@ launch_browser(){   # $1=luser  rest via positional below
     # MARKER=ccbmon-browser-'"$LUSER"'
     export DISPLAY_NUM=":'"$DN"'" VNC_PORT="'"$VNC"'" NOVNC_PORT="'"$NOVNC"'" \
            CDP_PORT="'"$CDP"'" MCP_PORT="'"$MCP"'" \
-           CHROME_PROFILE_DIR="'"$UHOME"'/.config/chromium-bridge-profile" \
+           CHROME_PROFILE_DIR="'"$UHOME"'/.claude/chromium-bridge-profile" \
            LOG_DIR="'"$ULOG"'" NOVNC_WEB="'"$NOVNC_WEB"'" HOME="'"$UHOME"'"
     mkdir -p "$LOG_DIR"
     while true; do
