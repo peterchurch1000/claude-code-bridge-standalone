@@ -30,8 +30,29 @@ fuser -k ${CDP_PORT}/tcp 2>/dev/null || true
 pkill -f "$CHROME_PROFILE_DIR" 2>/dev/null || true
 sleep 1
 
+# --- Run the browser stack as the owning bridge user (task 071) ----------------
+# Chrome was previously launched as root, so its profile (including the saved
+# passwords in "Login Data") was written root:600 and unreadable by the per-user
+# bridge-server. Drop to the user that owns $HOME so the profile is user-owned
+# and each user's own automation can read its OWN saved credentials with no root.
+# Cleanup above runs as root (so it can clear any root-owned X locks/processes);
+# the actual stack runs as the user. The re-exec below is skipped on the second
+# pass because we are no longer uid 0, so there is no loop.
+if [ "$(id -u)" = "0" ]; then
+  TARGET_USER="$(basename "${HOME:-/root}")"
+  if [ "$TARGET_USER" != "root" ] && id "$TARGET_USER" >/dev/null 2>&1 && [ -d "$HOME" ]; then
+    echo "[browser] Dropping privileges to $TARGET_USER ..."
+    chown -R "$TARGET_USER:$TARGET_USER" "$HOME/.claude/chromium-bridge-profile" 2>/dev/null || true
+    chown -R "$TARGET_USER:$TARGET_USER" "$HOME/.config" 2>/dev/null || true
+    chown -h "$TARGET_USER:$TARGET_USER" "$HOME/.config/chromium-bridge-profile" 2>/dev/null || true
+    chown -R "$TARGET_USER:$TARGET_USER" "$HOME/.npm" "$HOME/.cache" "$HOME/.local" 2>/dev/null || true
+    chown -R "$TARGET_USER:$TARGET_USER" "$LOG_DIR" 2>/dev/null || true
+    exec su -s /bin/bash "$TARGET_USER" -c "exec env HOME='$HOME' DISPLAY_NUM='$DISPLAY_NUM' VNC_PORT='$VNC_PORT' NOVNC_PORT='$NOVNC_PORT' NOVNC_WEB='$NOVNC_WEB' CDP_PORT='$CDP_PORT' MCP_PORT='$MCP_PORT' CHROME_PROFILE_DIR='$CHROME_PROFILE_DIR' LOG_DIR='$LOG_DIR' bash '$0'"
+  fi
+fi
+
 echo "[browser] Starting Xvfb $DISPLAY_NUM ..."
-Xvfb $DISPLAY_NUM -screen 0 1920x1080x24 -ac +extension GLX +render -noreset \
+Xvfb $DISPLAY_NUM -screen 0 1088x898x24 -ac +extension GLX +render -noreset \
   > "$LOG_DIR/xvfb.log" 2>&1 &
 XVFB_PID=$!
 sleep 1.5
@@ -75,12 +96,20 @@ websockify --web="$NOVNC_WEB" $NOVNC_PORT localhost:$VNC_PORT \
 NOVNC_PID=$!
 sleep 1
 
+# Clipboard sync between host (noVNC panel) and the in-VNC X session.
+if command -v autocutsel &>/dev/null; then
+  echo "[browser] Starting autocutsel clipboard sync ..."
+  DISPLAY=$DISPLAY_NUM autocutsel -selection CLIPBOARD -fork 2>/dev/null || true
+  DISPLAY=$DISPLAY_NUM autocutsel -selection PRIMARY -fork 2>/dev/null || true
+fi
+
 echo "[browser] Starting persistent Chrome on CDP port $CDP_PORT ..."
 DISPLAY=$DISPLAY_NUM /opt/google/chrome/chrome \
   --no-sandbox \
   --disable-dev-shm-usage \
   --no-first-run \
   --no-default-browser-check \
+  --password-store=basic \
   --disable-extensions \
   --disable-background-networking \
   --disable-sync \
@@ -91,10 +120,16 @@ DISPLAY=$DISPLAY_NUM /opt/google/chrome/chrome \
   --disable-software-rasterizer \
   --enable-unsafe-swiftshader \
   --use-gl=swiftshader \
+  --disable-backgrounding-occluded-windows \
+  --disable-renderer-backgrounding \
+  --disable-background-timer-throttling \
+  --disable-features=CalculateNativeWinOcclusion \
   --remote-debugging-port=$CDP_PORT \
   --user-data-dir="$CHROME_PROFILE_DIR" \
   --profile-directory=Default \
-  --window-size=1920,1080 \
+  --test-type \
+  --disable-http2 \
+  --window-size=1088,898 \
   --window-position=0,0 \
   about:blank \
   > "$LOG_DIR/chrome.log" 2>&1 &
@@ -121,7 +156,8 @@ echo "✅ Browser environment ready"
 echo "   Display:   $DISPLAY_NUM"
 echo "   Chrome:    CDP port $CDP_PORT (PID $CHROME_PID)"
 echo "   MCP SSE:   http://localhost:$MCP_PORT/sse"
-echo "   noVNC:     http://localhost:$NOVNC_PORT/vnc_auto.html"
+echo "   VNC:       localhost:$VNC_PORT (access via VNC viewer or noVNC)"
+echo "   noVNC Web: http://localhost:$NOVNC_PORT/vnc_auto.html"
 echo "   PIDs:      Xvfb=$XVFB_PID xfwm4=${XFWM_PID:-n/a} x11vnc=$X11VNC_PID websockify=$NOVNC_PID MCP=$MCP_PID Chrome=$CHROME_PID"
 echo ""
 

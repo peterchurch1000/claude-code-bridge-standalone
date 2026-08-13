@@ -5,44 +5,101 @@
   const $ = id => document.getElementById(id);
 
   const messagesEl      = $('messages');
+
+  // ── Chat search (filter/highlight messages) ───────────────────────────────
+  (function initChatSearch(){
+    const btnSearch = $('btn-search');
+    const bar       = $('msg-search-bar');
+    const input     = $('msg-search-input');
+    const countEl   = $('msg-search-count');
+    const closeBtn  = $('msg-search-close');
+    if (!btnSearch || !bar || !input) return;
+    function clearSearch(){
+      messagesEl.querySelectorAll('.search-hidden, .search-hit').forEach(el => el.classList.remove('search-hidden','search-hit'));
+      if (countEl) countEl.textContent = '';
+    }
+    function runSearch(q){
+      q = (q || '').trim().toLowerCase();
+      const items = messagesEl.querySelectorAll('.msg, .msg-tool');
+      if (!q) { clearSearch(); return; }
+      let hits = 0;
+      items.forEach(el => {
+        const match = el.textContent.toLowerCase().includes(q);
+        el.classList.toggle('search-hidden', !match);
+        el.classList.toggle('search-hit', match);
+        if (match) hits++;
+      });
+      if (countEl) countEl.textContent = hits + (hits === 1 ? ' match' : ' matches');
+    }
+    function closeSearch(){ bar.classList.add('hidden'); btnSearch.classList.remove('active'); clearSearch(); input.value=''; }
+    btnSearch.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const hidden = bar.classList.toggle('hidden');
+      btnSearch.classList.toggle('active', !hidden);
+      if (!hidden) { input.focus(); } else { clearSearch(); }
+    });
+    input.addEventListener('input', () => runSearch(input.value));
+    input.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSearch(); });
+    if (closeBtn) closeBtn.addEventListener('click', closeSearch);
+  })();
   const inputEl         = $('chat-input');
   const btnSend         = $('btn-send');
+  const btnAttach       = $('btn-attach');
+  const fileInput       = $('file-input');
+  const attachBar       = $('attach-bar');
+
   const btnMenu         = $('btn-menu');
   const btnLogout       = $('btn-logout');
   const sessionDropdown = $('session-dropdown');
   const sessionList     = $('session-list');
   const statusBar       = $('status-bar');
+  const statusText      = $('status-text');
+  const busySpin        = $('busy-spin');
+  let   activityEl      = null;  // turn-scoped activity/intent row
   const vncFrame        = $('vnc-frame');
   const cdotWs     = $('cdot-ws');
   const cdotVnc    = $('cdot-vnc');
   const cdotMcp    = $('cdot-mcp');
+  const cbtnWs     = $('cbtn-ws');
   const cbtnVnc    = $('cbtn-vnc');
   const cbtnMcp    = $('cbtn-mcp');
   const connTime   = $('conn-time');
 
   // ── Status dot helpers ─────────────────────────────────────────────────────
   function _setDot(el, state) { if (el) el.className = `cdot cdot-${state}`; }
-  function setWsDot(s) { _setDot(cdotWs, s); }
+  // Each refresh button (Chat / Browser / MCP) is shown ONLY when that element is
+  // disconnected or errored; hidden while connecting/connected. The dot also drives
+  // the automatic reconnect scheduling on error/disconnect.
+  const isDown = (s) => s === 'disconnected' || s === 'error';
+  function setWsDot(s) {
+    _setDot(cdotWs, s);
+    if (cbtnWs) cbtnWs.classList.toggle('hidden', !isDown(s));
+  }
+  // The manual refresh button shows whenever the browser display isn't healthy —
+  // disconnected, error, OR mid auto-reconnect ('reconnecting') — so the user always
+  // has an escape hatch when the automatic reconnect can't recover on its own
+  // (common after a mobile tab is backgrounded and the socket quietly dies).
+  // Previously it only showed for disconnected/error, but scheduleVncReconnect()
+  // flips straight to 'reconnecting' in the same tick, so the button never stayed up.
+  const vncNeedsBtn = (s) => s === 'disconnected' || s === 'error' || s === 'reconnecting';
   function setVncDot(s) {
     _setDot(cdotVnc, s);
-    if (!cbtnVnc) return;
-    if (s === 'disconnected' || s === 'error') {
-      cbtnVnc.classList.remove('hidden');
+    if (cbtnVnc) cbtnVnc.classList.toggle('hidden', !vncNeedsBtn(s));
+    if (isDown(s)) {
       scheduleVncReconnect();
-    } else {
-      cbtnVnc.classList.add('hidden');
+    } else if (s !== 'reconnecting') {
+      // 'reconnecting' must keep its pending timer + attempt count (backoff);
+      // only a healthy state (connected/connecting) clears them.
       clearTimeout(vncReconnectTimer);
       vncReconnectAttempt = 0;
     }
   }
   function setMcpDot(s) {
     _setDot(cdotMcp, s);
-    if (!cbtnMcp) return;
-    if (s === 'disconnected' || s === 'error') {
-      cbtnMcp.classList.remove('hidden');
+    if (cbtnMcp) cbtnMcp.classList.toggle('hidden', !isDown(s));
+    if (isDown(s)) {
       scheduleMcpReconnect();
     } else {
-      cbtnMcp.classList.add('hidden');
       clearTimeout(mcpReconnectTimer);
       mcpReconnectAttempt = 0;
     }
@@ -61,7 +118,192 @@
   // ── Set noVNC iframe src from server config ────────────────────────────────
   const novncBase = (window.BRIDGE_CONFIG?.novncUrl || '').replace(/\/$/, '');
   const API_BASE = (window.BRIDGE_CONFIG?.basePath || '').replace(/\/$/, '');
-  vncFrame.src = `${API_BASE}/vnc_clean.html?v=2`;
+  vncFrame.src = `${API_BASE}/vnc_clean.html?v=3`;
+
+  // ── Live-browser zoom (slider) + pan (one-finger) — mobile ──────────────────
+  // Interaction model on touch devices:
+  //   • SLIDER            → zoom 100–500%.
+  //   • ONE finger, tap   → forwarded to noVNC as a mouse click.
+  //   • ONE finger, drag  → pan the zoomed view.
+  const browserPanel = $('browser-panel');
+  const zoomSlider   = $('zoom-slider');
+  const zoomPct      = $('zoom-pct');
+  let gZoom = 1, gTx = 0, gTy = 0;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  function applyView() {
+    vncFrame.style.transformOrigin = '0 0';
+    vncFrame.style.width  = (gZoom * 100) + '%';
+    vncFrame.style.height = (gZoom * 100) + '%';
+    vncFrame.style.transform = `translate(${gTx}px, ${gTy}px)`;
+  }
+  function clampPan() {
+    const Wp = browserPanel.clientWidth, Hp = browserPanel.clientHeight;
+    gTx = clamp(gTx, Wp - gZoom * Wp, 0);
+    gTy = clamp(gTy, Hp - gZoom * Hp, 0);
+  }
+
+  // ── Slider zoom, anchored on the pane centre ──
+  function zoomTo(z) {
+    const Wp = browserPanel.clientWidth, Hp = browserPanel.clientHeight;
+    const fx = (Wp / 2 - gTx) / (gZoom * Wp);
+    const fy = (Hp / 2 - gTy) / (gZoom * Hp);
+    gZoom = z;
+    gTx = Wp / 2 - fx * (z * Wp);
+    gTy = Hp / 2 - fy * (z * Hp);
+    clampPan();
+    applyView();
+  }
+  if (zoomSlider) {
+    zoomSlider.addEventListener('input', (e) => {
+      const pct = parseInt(e.target.value, 10) || 100;
+      if (zoomPct) zoomPct.textContent = pct + '%';
+      zoomTo(pct / 100);
+    });
+  }
+
+  // ── Two-finger pan ──  (ROLLED BACK to the original working behaviour)
+  //   • ONE finger  → falls through untouched to noVNC = the remote mouse
+  //                   (tap / click-drag inside the remote browser).
+  //   • TWO fingers → captured here BEFORE noVNC sees them = pan the zoomed view.
+  let gest = null;                        // active two-finger pan, or null
+
+  // Centroid in stable top-window coords (the iframe's own clientX is relative
+  // to a viewport that moves as we pan, so add the iframe's rect to cancel it).
+  function centroid(e) {
+    const r = vncFrame.getBoundingClientRect();
+    const a = e.touches[0], b = e.touches[1];
+    return { cx: r.left + (a.clientX + b.clientX) / 2,
+             cy: r.top  + (a.clientY + b.clientY) / 2 };
+  }
+  function startGesture(e) {
+    const c = centroid(e);
+    gest = { cx0: c.cx, cy0: c.cy, tx0: gTx, ty0: gTy };
+    // Release any half-started one-finger mouse press inside noVNC so the first
+    // finger of the gesture doesn't leave a stuck button / stray click.
+    try {
+      const cv = vncFrame.contentDocument && vncFrame.contentDocument.querySelector('canvas');
+      if (cv) cv.dispatchEvent(new TouchEvent('touchcancel', { bubbles: true, cancelable: true }));
+    } catch (_) {}
+  }
+  function updateGesture(e) {
+    const c = centroid(e);
+    gTx = gest.tx0 + (c.cx - gest.cx0);
+    gTy = gest.ty0 + (c.cy - gest.cy0);
+    clampPan();
+    applyView();
+  }
+
+  function onTouchStart(e) {
+    if (!e.isTrusted) return;                 // ignore our own synthetic cancel
+    if (e.touches.length >= 2) {
+      if (!gest) startGesture(e);
+      e.preventDefault(); e.stopImmediatePropagation();
+    } else if (gest) {                        // stray finger mid-gesture — swallow
+      e.preventDefault(); e.stopImmediatePropagation();
+    }
+    // length 1 & no gesture → do nothing: noVNC handles it as the mouse.
+  }
+  function onTouchMove(e) {
+    if (!e.isTrusted || !gest) return;        // 1-finger move → noVNC mouse
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.touches.length >= 2) updateGesture(e);
+  }
+  function onTouchEnd(e) {
+    if (!e.isTrusted || !gest) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.touches.length === 0) gest = null;  // all fingers up → finish pan
+  }
+
+  // Listeners live INSIDE the same-origin iframe doc (capture phase) so they
+  // run before noVNC's canvas handlers; re-attach whenever the frame reloads.
+  function attachGestures() {
+    const doc = vncFrame.contentDocument;
+    if (!doc) return;
+    const opts = { capture: true, passive: false };
+    doc.addEventListener('touchstart',  onTouchStart, opts);
+    doc.addEventListener('touchmove',   onTouchMove,  opts);
+    doc.addEventListener('touchend',    onTouchEnd,   opts);
+    doc.addEventListener('touchcancel', onTouchEnd,   opts);
+  }
+  if (browserPanel) vncFrame.addEventListener('load', attachGestures);
+
+  // ── Mobile soft-keyboard (touch only) ───────────────────────────────────────
+  // Tapping a field in the remote can't raise the phone keyboard (the remote is
+  // a <canvas>). The ⌨ button focuses a hidden editable field — which DOES raise
+  // the OS keyboard — and we forward what's typed into the remote via the
+  // iframe's __rfbSendKey bridge. Flow: tap the remote field (one-finger = mouse)
+  // to focus it, tap ⌨, then type.
+  const kbdBtn = $('kbd-btn');
+  const kbdCap = $('kbd-capture');
+  const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  if (kbdBtn && kbdCap && isTouch) {
+    const XK = { Tab: 0xff09, Enter: 0xff0d, Escape: 0xff1b, Delete: 0xffff,
+                 Home: 0xff50, ArrowLeft: 0xff51, ArrowUp: 0xff52,
+                 ArrowRight: 0xff53, ArrowDown: 0xff54, PageUp: 0xff55,
+                 PageDown: 0xff56, End: 0xff57 };
+    const sendKey = (ks, down) => {
+      try { vncFrame.contentWindow.__rfbSendKey(ks, down); } catch (_) {}
+    };
+    const sendChar = (ch) => {
+      let ks;
+      if (ch === '\n' || ch === '\r') ks = 0xff0d;            // Return
+      else if (ch === '\t') ks = 0xff09;                       // Tab
+      else { const cp = ch.codePointAt(0); ks = cp < 0x100 ? cp : 0x01000000 + cp; }
+      sendKey(ks);                                             // press+release
+    };
+
+    // Diff the field against its previous value: typed chars are sent forward,
+    // deletions become Backspaces. This also handles autocorrect (it rewrites
+    // the tail, which diffs cleanly to backspaces + retype).
+    let prev = '';
+    kbdCap.addEventListener('input', () => {
+      const cur = kbdCap.value;
+      let i = 0;
+      const m = Math.min(prev.length, cur.length);
+      while (i < m && prev[i] === cur[i]) i++;
+      for (let k = prev.length - 1; k >= i; k--) sendKey(0xff08);   // Backspace
+      for (let k = i; k < cur.length; k++) sendChar(cur[k]);
+      prev = cur;
+      if (cur.length > 2000) { kbdCap.value = ''; prev = ''; }      // cap growth
+    });
+    // Non-text keys that don't fire 'input' (Enter handled here to avoid a stray
+    // newline; Backspace is left to the input-diff above to avoid double-send).
+    kbdCap.addEventListener('keydown', (e) => {
+      if (e.key === 'Backspace') return;
+      const ks = XK[e.key];
+      if (ks) { e.preventDefault(); sendKey(ks); }
+    });
+
+    let kbdLocked = false;
+    kbdBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (kbdLocked) {
+        kbdLocked = false;
+        kbdCap.blur();
+      } else {
+        kbdLocked = true;
+        prev = ''; kbdCap.value = '';
+        // Blur anything else first so iOS doesn't get confused about which input is active.
+        if (document.activeElement && document.activeElement !== kbdCap) {
+          document.activeElement.blur();
+        }
+        kbdCap.focus({ preventScroll: true });
+      }
+    });
+    kbdCap.addEventListener('focus', () => kbdBtn.classList.add('kbd-on'));
+    kbdCap.addEventListener('blur', () => {
+      kbdBtn.classList.remove('kbd-on');
+      // If lock is still on, something stole focus (layout shift, tap elsewhere) — grab it back.
+      if (kbdLocked) {
+        setTimeout(() => {
+          if (kbdLocked) kbdCap.focus({ preventScroll: true });
+        }, 50);
+      }
+    });
+  } else if (kbdBtn) {
+    kbdBtn.style.display = 'none';   // desktop: physical keyboard goes via canvas
+  }
 
   // ── State ──────────────────────────────────────────────────────────────────
   let ws = null;
@@ -81,11 +323,29 @@
 
   // ── Chat persistence (server-side SQLite) ─────────────────────────────────
   const SESSION_KEY  = 'bridge_session_id';
+  // Stable per-browser id so the bridge can reattach a live Claude turn after a
+  // disconnect (refresh / network blip) instead of killing it. Distinct from the
+  // Claude session id; survives session resets.
+  const CLIENT_KEY = 'bridge_client_id';
+  let clientId = localStorage.getItem(CLIENT_KEY);
+  if (!clientId) {
+    clientId = 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem(CLIENT_KEY, clientId);
+  }
   let currentSessionId     = localStorage.getItem(SESSION_KEY) || null;
+  // Room id = which conversation THIS device drives. Equals the Claude session id
+  // once known; a per-device 'draft-…' id before the first reply. Two devices with
+  // the same room id mirror; different room ids run independently.
+  const ROOM_KEY = 'bridge_room_id';
+  const newDraftRoomId = () => 'draft-' + clientId + '-' + Math.random().toString(36).slice(2, 8);
+  let currentRoomId = currentSessionId || localStorage.getItem(ROOM_KEY) || newDraftRoomId();
+  localStorage.setItem(ROOM_KEY, currentRoomId);
   let storedMsgData        = [];
   let lastAssistantDataIdx = -1;
   let lastToolDataIdx      = -1;
   let _restoring           = false;
+
+  let pendingTaskLink = null;   // task file awaiting its new session id (see openTaskChat)
 
   let _saveTimer = null;
   function saveToStorage() {
@@ -251,6 +511,7 @@
 
   function updateLastToolResult(content) {
     if (!lastToolEl) return;
+    lastToolEl.querySelector('.tool-spin')?.remove();
     const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
     if (resEl) {
       resEl.classList.remove('pending');
@@ -269,12 +530,79 @@
   }
 
   function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
-  function setStatus(t)   { statusBar.textContent = t; }
+  function setStatus(t)   { (statusText || statusBar).textContent = t; }
+
+  // Deterministic, client-side map from a tool call to a plain-language intent.
+  // Uses only data already in the stream — zero extra model cost.
+  function toolIntent(name, input) {
+    const n = name || 'tool';
+    const i = input || {};
+    const base = (p) => { try { return String(p).split('/').pop(); } catch { return p; } };
+    const host = (u) => { try { return new URL(u).host; } catch { return u; } };
+    const clip = (s, len = 60) => { s = String(s == null ? '' : s); return s.length > len ? s.slice(0, len) + '…' : s; };
+    switch (n) {
+      case 'Read':         return `Reading ${base(i.file_path) || 'a file'}`;
+      case 'Write':        return `Writing ${base(i.file_path) || 'a file'}`;
+      case 'Edit':         return `Editing ${base(i.file_path) || 'a file'}`;
+      case 'NotebookEdit': return `Editing ${base(i.notebook_path) || 'a notebook'}`;
+      case 'Bash':         return i.description ? `Running: ${clip(i.description)}` : 'Running a command';
+      case 'Grep':         return `Searching for “${clip(i.pattern, 40)}”`;
+      case 'Glob':         return `Finding files: ${clip(i.pattern, 40)}`;
+      case 'WebSearch':    return `Searching the web: “${clip(i.query, 40)}”`;
+      case 'WebFetch':     return `Fetching ${host(i.url) || 'a page'}`;
+      case 'Task':         return 'Running a subtask';
+      case 'TaskCreate':   return 'Creating a task';
+      case 'TaskUpdate':   return 'Updating a task';
+      case 'TaskList':     return 'Checking tasks';
+    }
+    if (n.startsWith('mcp__playwright__browser_')) {
+      const act = n.replace('mcp__playwright__browser_', '');
+      const map = {
+        navigate: `Browsing to ${host(i.url) || 'a page'}`,
+        navigate_back: 'Going back',
+        click: `Clicking ${clip(i.element, 30) || 'an element'}`,
+        type: `Typing ${clip(i.text, 30)}`,
+        fill_form: 'Filling a form',
+        select_option: 'Selecting an option',
+        snapshot: 'Reading the page',
+        take_screenshot: 'Taking a screenshot',
+        wait_for: 'Waiting on the page',
+        evaluate: 'Running a page script',
+        press_key: `Pressing ${i.key || 'a key'}`,
+        hover: 'Hovering on the page',
+        tabs: 'Managing browser tabs',
+        close: 'Closing the browser',
+      };
+      return map[act] || `Browser: ${act.replace(/_/g, ' ')}`;
+    }
+    if (n.startsWith('mcp__')) return `Using ${n.replace(/^mcp__/, '').replace(/__/g, ' / ')}`;
+    return `Using ${n}`;
+  }
+
+  // Single turn-scoped indicator: one spinner + intent line, always pinned to
+  // the bottom of the conversation while a turn is active.
+  function setActivity(label) {
+    if (!activityEl) {
+      activityEl = document.createElement('div');
+      activityEl.className = 'msg msg-activity';
+      activityEl.dataset.role = 'activity';
+      activityEl.innerHTML = '<div class="spinner"></div><span class="activity-text"></span>';
+    }
+    const t = activityEl.querySelector('.activity-text');
+    if (t) t.textContent = label || 'Working…';
+    messagesEl.appendChild(activityEl); // re-append => stays last, below tool rows
+    scrollBottom();
+  }
+  function clearActivity() { activityEl?.remove(); activityEl = null; }
 
   function setBusy(b) {
     busy = b;
-    btnSend.disabled = b;
-    inputEl.disabled = b;
+    if (busySpin) busySpin.classList.toggle('busy-hidden', !b);
+    if (b) { if (statusText) statusText.textContent = 'Working…'; }
+    else {
+      document.querySelectorAll('.tool-spin').forEach(e => e.remove());
+      clearActivity();
+    }
   }
 
   // ── Server message handler ─────────────────────────────────────────────────
@@ -287,12 +615,24 @@
         setStatus(msg.text || '');
         break;
 
+      // A message sent from another device on this shared session.
+      case 'user_msg':
+        appendMsg('user', msg.text || '');
+        break;
+
+      // Full history pushed by server when a second device joins mid-session.
+      case 'history_sync':
+        if (Array.isArray(msg.messages) && msg.messages.length && !storedMsgData.length) {
+          renderStoredDisplay(msg.messages);
+        }
+        break;
+
       case 'thinking':
         currentAssistantEl   = null;
         currentAssistantText = '';
         lastToolEl = null;
-        appendMsg('thinking', '');
         setBusy(true);
+        setActivity('Thinking…');
         break;
 
       case 'stream':
@@ -325,6 +665,17 @@
       case 'session_id':
         currentSessionId = msg.id;
         localStorage.setItem(SESSION_KEY, msg.id);
+        // Server re-keys the room to the real session id; track it so a reconnect
+        // rejoins the SAME live room (mirroring / mid-turn reattach survive).
+        currentRoomId = msg.id;
+        localStorage.setItem(ROOM_KEY, msg.id);
+        if (pendingTaskLink) {
+          const file = pendingTaskLink; pendingTaskLink = null;
+          fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/session`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session: msg.id }),
+          }).then(() => loadTasks()).catch(() => {});
+        }
         break;
 
       case 'error':
@@ -362,6 +713,39 @@
     } catch { setVncDot('unknown'); }
   }
   setInterval(pollVnc, 3000);
+
+  // ── VNC "connected-but-black" watchdog ──────────────────────────────────────
+  let vncBlankStreak = 0;
+  let lastVncForceReconnect = 0;
+  function vncBlankCheck() {
+    try {
+      if (!cdotVnc.className.includes('connected')) { vncBlankStreak = 0; return; }
+      const doc = vncFrame.contentDocument || vncFrame.contentWindow?.document;
+      const cv  = doc && doc.querySelector('canvas');
+      if (!cv || !cv.width || !cv.height) { vncBlankStreak = 0; return; }
+      const ctx = cv.getContext('2d');
+      if (!ctx) return;
+      let nonBlack = 0;
+      for (let gx = 1; gx <= 5 && nonBlack === 0; gx++) {
+        for (let gy = 1; gy <= 5; gy++) {
+          const p = ctx.getImageData(Math.floor(cv.width * gx / 6),
+                                     Math.floor(cv.height * gy / 6), 1, 1).data;
+          if (p[0] > 16 || p[1] > 16 || p[2] > 16) { nonBlack++; break; }
+        }
+      }
+      if (nonBlack === 0) {
+        vncBlankStreak++;
+        if (vncBlankStreak >= 2 && Date.now() - lastVncForceReconnect > 30000) {
+          lastVncForceReconnect = Date.now();
+          vncBlankStreak = 0;
+          try { vncFrame.contentWindow.__rfbReconnect(); } catch { reconnectVnc(); }
+        }
+      } else {
+        vncBlankStreak = 0;
+      }
+    } catch { /* cross-origin / not ready — ignore */ }
+  }
+  setInterval(vncBlankCheck, 3000);
 
   // ── MCP health polling ─────────────────────────────────────────────────────
   async function pollMcp() {
@@ -486,16 +870,35 @@
     setTimeout(() => { vncFrame.src = src; }, 300);
   }
 
-  function reconnectMcp() {
+  // `manual` is true only when the user clicks the MCP reconnect button. The
+  // automatic scheduler must NEVER send a reset: reset kills the live Claude
+  // process, and reacting to a transient MCP-down by resetting was the cause of
+  // the "no response" loop (Claude was killed before it could reply). The MCP
+  // server is a persistent standalone process — for an auto-recover we just
+  // re-probe its health; the next spawned Claude turn picks it up on its own.
+  function reconnectMcp(manual) {
     setMcpDot('connecting');
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    if (manual && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
     setTimeout(pollMcp, 3000);
+  }
+
+  // ── Chat (WebSocket) reconnect button ──────────────────────────────────────
+  // Force an immediate fresh WebSocket. The bridge reattaches our live session by
+  // clientId, so an in-flight answer is preserved across the reconnect.
+  if (cbtnWs) {
+    cbtnWs.onclick = () => {
+      showToast('Reconnecting chat…', 'info');
+      wsReconnectAttempt = 0;
+      clearTimeout(wsReconnectTimer);
+      try { if (ws) { ws.onclose = null; ws.close(); } } catch {}
+      connect();
+    };
   }
 
   // ── MCP reconnect button ───────────────────────────────────────────────────
   if (cbtnMcp) {
     cbtnMcp.onclick = () => {
-      reconnectMcp();
+      reconnectMcp(true);
       showToast('MCP session reset — send a message to reconnect', 'info');
     };
   }
@@ -507,6 +910,33 @@
       showToast('Reconnecting browser display…', 'info');
     };
   }
+
+  // ── Mobile: force a fresh reconnect when the tab returns to the foreground ──
+  // On mobile the OS frequently kills the VNC websocket while the tab is
+  // backgrounded WITHOUT firing a clean close, so the iframe's #vnc-status is left
+  // stale at 'connected' and the 3s poller never detects the drop — the pane just
+  // freezes with no auto-recovery. When the page becomes visible again after being
+  // hidden for more than a few seconds, proactively reload the VNC and nudge the
+  // chat socket. (pageshow handles bfcache restores from mobile back/forward.)
+  let _hiddenSince = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      _hiddenSince = Date.now();
+      return;
+    }
+    const away = _hiddenSince ? Date.now() - _hiddenSince : 0;
+    _hiddenSince = 0;
+    if (away > 5000) {
+      reconnectVnc();
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+    }
+  });
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) {                       // restored from bfcache → sockets are dead
+      reconnectVnc();
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+    }
+  });
 
   // ── Clipboard paste into VNC ───────────────────────────────────────────────
   async function pasteClipboardToVnc() {
@@ -566,9 +996,16 @@
           }
           currentAssistantText += block.text;
           renderMd(currentAssistantEl, currentAssistantText);
+          // Persist THIS bubble's text immediately. Without this, assistant text
+          // that precedes a tool_use is never written back to storedMsgData (only
+          // the turn's final bubble was, via lastAssistantDataIdx at 'result'),
+          // so it saved empty and reloaded as a blank thin line.
+          if (lastAssistantDataIdx >= 0) storedMsgData[lastAssistantDataIdx].text = currentAssistantText;
+          saveToStorage();
           scrollBottom();
         } else if (block.type === 'tool_use') {
           appendToolMsg(block.name, block.input);
+          setActivity(toolIntent(block.name, block.input));
           currentAssistantEl   = null;
           currentAssistantText = '';
         }
@@ -580,6 +1017,7 @@
       // Tool execution result from Claude Code
       const content = ev.content?.[0]?.text || ev.result || '';
       updateLastToolResult(content);
+      setActivity('Thinking…');
       return;
     }
 
@@ -607,35 +1045,126 @@
   }
 
   // ── Restore saved chat from localStorage ───────────────────────────────────
+  // ── Restore saved chat (lazy / folded for long transcripts) ───────────────
+  // Long transcripts are costly to render at once, so on restore we render only
+  // the most recent slice and keep older messages in _pendingOlder — revealed
+  // via a "Load older" button or by scrolling to the top (infinite scroll).
+  const INITIAL_RENDER = 30;   // messages rendered immediately on restore
+  const OLDER_BATCH    = 30;   // messages revealed per "load older" step
+  let _pendingOlder = [];
+  let _olderBtn = null;
+  let _olderScrollWired = false;
+
+  function renderOneStored(m) {            // bottom-append, mirrors the live path
+    if (m.type === 'tool') {
+      appendToolMsg(m.toolName, m.args);
+      if (m.result !== null && m.result !== undefined && lastToolEl) {
+        const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
+        if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
+      }
+    } else {
+      appendMsg(m.type, m.text || '');
+    }
+  }
+
+  function buildMsgNode(role, text) {
+    const div = document.createElement('div');
+    div.className = `msg msg-${role}`;
+    if (role === 'assistant') { div.style.whiteSpace = 'normal'; renderMd(div, text || ''); }
+    else div.textContent = text || '';
+    return div;
+  }
+
+  function buildToolNode(name, args, result) {
+    const wrap = document.createElement('div'); wrap.className = 'msg-tool';
+    const header = document.createElement('div'); header.className = 'tool-header';
+    const icon = document.createElement('span'); icon.className = 'tool-icon'; icon.textContent = '⚙';
+    const nameEl = document.createElement('span'); nameEl.className = 'tool-name-text'; nameEl.textContent = name || 'tool';
+    const caret = document.createElement('span'); caret.className = 'tool-caret'; caret.textContent = '›';
+    header.append(icon, nameEl, caret);
+    const body = document.createElement('div'); body.className = 'tool-body';
+    const argsEl = document.createElement('pre'); argsEl.className = 'tool-args'; argsEl.textContent = args ? JSON.stringify(args, null, 2) : '';
+    const resEl = document.createElement('pre'); resEl.dataset.role = 'tool-result';
+    if (result !== null && result !== undefined) { resEl.className = 'tool-result'; resEl.textContent = String(result); }
+    else { resEl.className = 'tool-result pending'; resEl.textContent = '…running'; }
+    body.append(argsEl, resEl);
+    let expanded = false;
+    header.addEventListener('click', () => { expanded = !expanded; body.style.display = expanded ? 'block' : 'none'; caret.style.transform = expanded ? 'rotate(90deg)' : ''; });
+    wrap.append(header, body);
+    return wrap;
+  }
+
+  function ensureOlderBtn() {
+    if (!_pendingOlder.length) { _olderBtn?.remove(); _olderBtn = null; return; }
+    if (!_olderBtn) {
+      _olderBtn = document.createElement('button');
+      _olderBtn.className = 'load-older-btn';
+      _olderBtn.addEventListener('click', loadOlder);
+    }
+    if (_olderBtn !== messagesEl.firstChild) messagesEl.insertBefore(_olderBtn, messagesEl.firstChild);
+    const n = Math.min(OLDER_BATCH, _pendingOlder.length);
+    _olderBtn.textContent = `↑ Load ${n} older — ${_pendingOlder.length} hidden`;
+  }
+
+  function loadOlder() {
+    if (!_pendingOlder.length) return;
+    const cut = Math.max(0, _pendingOlder.length - OLDER_BATCH);
+    const batch = _pendingOlder.slice(cut);
+    _pendingOlder = _pendingOlder.slice(0, cut);
+    const prevH = messagesEl.scrollHeight, prevTop = messagesEl.scrollTop;
+    const frag = document.createDocumentFragment();
+    for (const m of batch) {
+      const node = m.type === 'tool' ? buildToolNode(m.toolName, m.args, m.result) : buildMsgNode(m.type, m.text || '');
+      if (node) frag.appendChild(node);
+    }
+    const anchor = _olderBtn ? _olderBtn.nextSibling : messagesEl.firstChild;
+    messagesEl.insertBefore(frag, anchor);
+    ensureOlderBtn();
+    messagesEl.scrollTop = prevTop + (messagesEl.scrollHeight - prevH);
+  }
+
   function renderStoredDisplay(msgs) {
     _restoring = true;
     messagesEl.innerHTML = '';
-    storedMsgData        = [];
+    _olderBtn = null;
+    storedMsgData        = msgs.slice();   // full data retained for save fidelity
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
-
-    for (const m of msgs) {
-      storedMsgData.push(m);
-      if (m.type === 'tool') {
-        appendToolMsg(m.toolName, m.args);
-        lastToolDataIdx = storedMsgData.length - 1;
-        // Restore completed result
-        if (m.result !== null && lastToolEl) {
-          const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
-          if (resEl) {
-            resEl.classList.remove('pending');
-            resEl.className = 'tool-result';
-            resEl.textContent = m.result;
-          }
-        }
-      } else {
-        appendMsg(m.type, m.text || '');
-        if (m.type === 'assistant') lastAssistantDataIdx = storedMsgData.length - 1;
-      }
+    for (let k = 0; k < storedMsgData.length; k++) {
+      if (storedMsgData[k].type === 'assistant') lastAssistantDataIdx = k;
+      else if (storedMsgData[k].type === 'tool') lastToolDataIdx = k;
     }
 
-    _restoring = false;
-    scrollBottom();
+    const split = Math.max(0, msgs.length - INITIAL_RENDER);
+    _pendingOlder = msgs.slice(0, split);
+    ensureOlderBtn();
+    for (const m of msgs.slice(split)) renderOneStored(m);
+
+    if (!_olderScrollWired) {
+      _olderScrollWired = true;
+      messagesEl.addEventListener('scroll', () => {
+        if (!_restoring && _pendingOlder.length && messagesEl.scrollTop < 60) loadOlder();
+      });
+    }
+
+    // Pin to the newest message. Content (markdown/images/fonts) reflows after
+    // insertion, so a single synchronous scroll lands mid-transcript; re-pin across
+    // several frames + on image load, and keep _restoring=true until settled so the
+    // scroll-to-load-older handler cannot fire and drag the view far back.
+    pinToBottomAfterRestore();
+  }
+
+  function pinToBottomAfterRestore() {
+    let frames = 0;
+    const pin = () => {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (++frames < 8) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    messagesEl.querySelectorAll('img').forEach(img => {
+      if (!img.complete) img.addEventListener('load', () => { if (_restoring) messagesEl.scrollTop = messagesEl.scrollHeight; }, { once: true });
+    });
+    setTimeout(() => { messagesEl.scrollTop = messagesEl.scrollHeight; _restoring = false; }, 300);
   }
 
   // ── WebSocket connection ───────────────────────────────────────────────────
@@ -672,6 +1201,9 @@
       startConnTime();
       btnSend.disabled = false;
       startKeepalive();
+      // Announce our stable client id FIRST so the bridge can reattach a live
+      // Claude turn that was running when we disconnected (refresh / blip).
+      ws.send(JSON.stringify({ type: 'hello', clientId, roomId: currentRoomId }));
       const prevSessionId = localStorage.getItem(SESSION_KEY);
       if (prevSessionId) {
         currentSessionId = prevSessionId;
@@ -701,16 +1233,132 @@
     };
   }
 
+  // ── Attachments (screenshots / files) ───────────────────────────────────────
+  // Files are uploaded to the server immediately and stored per-user; Claude reads
+  // them back by path. Pending uploads show as removable chips above the input.
+  let pendingAttachments = [];   // { path, name, isImage, previewUrl }
+  let uploadsInFlight = 0;
+
+  function renderAttachBar() {
+    attachBar.innerHTML = '';
+    if (!pendingAttachments.length && uploadsInFlight === 0) {
+      attachBar.classList.add('hidden');
+      return;
+    }
+    attachBar.classList.remove('hidden');
+    pendingAttachments.forEach((a, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      if (a.isImage && a.previewUrl) {
+        const img = document.createElement('img');
+        img.className = 'attach-thumb';
+        img.src = a.previewUrl;
+        chip.appendChild(img);
+      } else {
+        const ic = document.createElement('span');
+        ic.className = 'attach-icon';
+        ic.textContent = '📄';
+        chip.appendChild(ic);
+      }
+      const label = document.createElement('span');
+      label.className = 'attach-name';
+      label.textContent = a.name;
+      chip.appendChild(label);
+      const rm = document.createElement('button');
+      rm.className = 'attach-remove';
+      rm.title = 'Remove';
+      rm.textContent = '×';
+      rm.onclick = () => {
+        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+        pendingAttachments.splice(i, 1);
+        renderAttachBar();
+      };
+      chip.appendChild(rm);
+      attachBar.appendChild(chip);
+    });
+    if (uploadsInFlight > 0) {
+      const up = document.createElement('div');
+      up.className = 'attach-chip attach-uploading';
+      up.innerHTML = '<div class="spinner spinner-sm"></div><span>Uploading…</span>';
+      attachBar.appendChild(up);
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    uploadsInFlight++;
+    renderAttachBar();
+    try {
+      const res = await fetch(API_BASE + '/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'X-Filename': encodeURIComponent(file.name || 'file'),
+        },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.path) throw new Error(data.error || 'upload failed');
+      const isImage = (file.type || '').startsWith('image/');
+      pendingAttachments.push({
+        path: data.path,
+        name: data.name || file.name || 'file',
+        isImage,
+        previewUrl: isImage ? URL.createObjectURL(file) : null,
+      });
+    } catch (e) {
+      showToast('Upload failed: ' + e.message, 'error');
+    } finally {
+      uploadsInFlight--;
+      renderAttachBar();
+    }
+  }
+
+  function clearAttachments() {
+    pendingAttachments.forEach(a => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+    pendingAttachments = [];
+    renderAttachBar();
+  }
+
+  btnAttach.onclick = () => fileInput.click();
+  fileInput.addEventListener('change', () => {
+    Array.from(fileInput.files || []).forEach(uploadFile);
+    fileInput.value = '';   // allow re-selecting the same file
+  });
+
+  // Paste a screenshot/image straight into the message box.
+  inputEl.addEventListener('paste', e => {
+    const imgs = Array.from(e.clipboardData?.items || [])
+      .filter(it => it.kind === 'file' && it.type.startsWith('image/'));
+    if (!imgs.length) return;   // plain-text paste keeps default behaviour
+    e.preventDefault();
+    imgs.forEach(it => {
+      const blob = it.getAsFile();
+      if (blob) {
+        const named = new File([blob], blob.name || `screenshot-${Date.now()}.png`,
+          { type: blob.type });
+        uploadFile(named);
+      }
+    });
+  });
+
   // ── Send ──────────────────────────────────────────────────────────────────
   function sendMessage() {
     const text = inputEl.value.trim();
-    if (!text) return;
-    appendMsg('user', text);
+    if (!text && !pendingAttachments.length) return;
+    if (uploadsInFlight > 0) { showToast('Wait for the upload to finish', 'warning'); return; }
+    if (ws?.readyState !== WebSocket.OPEN) return;
+
+    const attachments = pendingAttachments.map(a => ({ path: a.path, name: a.name }));
+    const echo = text + (attachments.length
+      ? (text ? '\n' : '') + attachments.map(a => `📎 ${a.name}`).join('\n')
+      : '');
+    appendMsg('user', echo);
+    ws.send(JSON.stringify({ type: 'chat', text, attachments }));
+
     inputEl.value = '';
     inputEl.style.height = 'auto';
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'chat', text }));
-    }
+    clearAttachments();
   }
 
   btnSend.onclick = sendMessage;
@@ -734,7 +1382,12 @@
   }
 
   function newSession() {
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    // Move THIS device to a fresh draft room; other devices keep their rooms
+    // untouched (so we no longer reset a shared session or delete its history).
+    const draft = newDraftRoomId();
+    currentRoomId = draft;
+    localStorage.setItem(ROOM_KEY, draft);
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'switch_session', id: draft }));
     messagesEl.innerHTML = '';
     currentAssistantEl   = null;
     currentAssistantText = '';
@@ -745,7 +1398,6 @@
     storedMsgData        = [];
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
-    if (currentSessionId) fetch(`${API_BASE}/history/${currentSessionId}`, { method: 'DELETE' }).catch(() => {});
     currentSessionId = null;
     localStorage.removeItem(SESSION_KEY);
     showToast('New session started', 'info');
@@ -764,6 +1416,8 @@
     lastToolDataIdx      = -1;
     currentSessionId = id;
     localStorage.setItem(SESSION_KEY, id);
+    currentRoomId = id;
+    localStorage.setItem(ROOM_KEY, id);
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'switch_session', id }));
     }
@@ -789,6 +1443,8 @@
         return;
       }
       for (const s of data.sessions) {
+        const row = document.createElement('div');
+        row.className = 'sess-row';
         const btn = document.createElement('button');
         btn.className = 'sess-item';
         const time = document.createElement('span');
@@ -796,11 +1452,74 @@
         time.textContent = fmtSessionDate(s.updatedAt);
         const preview = document.createElement('span');
         preview.className = 'sess-preview';
-        preview.textContent = s.preview || '(empty)';
+        preview.textContent = s.name || s.preview || '(empty)';
         btn.appendChild(time);
         btn.appendChild(preview);
+        const subText = s.lastMessage || (s.name ? s.preview : '');
+        if (subText && subText !== preview.textContent) {
+          const sub = document.createElement('span');
+          sub.className = 'sess-sub';
+          sub.textContent = subText;
+          btn.appendChild(sub);
+        }
         btn.onclick = () => switchToSession(s.id);
-        sessionList.appendChild(btn);
+        const edit = document.createElement('span');
+        edit.className = 'sess-edit';
+        edit.textContent = '✎';
+        edit.title = 'Rename session';
+        edit.onclick = async (e) => {
+          e.stopPropagation();
+          const name = prompt('Session name:', s.name || '');
+          if (name === null) return;
+          try {
+            await fetch(`${API_BASE}/sessions/${s.id}/name`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name })
+            });
+            loadSessions();
+          } catch { showToast('Rename failed', 'error'); }
+        };
+        row.appendChild(btn);
+        if (s.active) {
+          const live = document.createElement('span');
+          live.className = 'sess-live';
+          live.style.cssText = 'flex:0 0 auto;margin:0 4px;display:inline-flex;align-items:center;';
+          if (s.busy) {
+            const sp = document.createElement('span');
+            sp.className = 'spinner spinner-sm';
+            live.appendChild(sp);
+            live.title = 'Active — running now';
+          } else {
+            live.textContent = '\u25CF';                 // green dot = live room
+            live.style.color = '#22c55e';
+            live.style.fontSize = '22px';
+            live.style.lineHeight = '1';
+            live.title = s.viewers
+              ? `Active — ${s.viewers} device(s) connected`
+              : 'Active — running in background';
+          }
+          row.appendChild(live);
+        }
+        const del = document.createElement('span');
+        del.className = 'sess-edit';
+        del.textContent = '\uD83D\uDDD1';
+        del.title = 'Delete session';
+        del.style.cssText = 'cursor:pointer;flex:0 0 auto;margin-left:2px;opacity:0.7;';
+        del.onclick = async (e) => {
+          e.stopPropagation();
+          if (!confirm('Are you sure you want to delete this session? It will be permanently deleted.')) return;
+          try {
+            const r = await fetch(`${API_BASE}/sessions/${s.id}`, { method: 'DELETE' });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { showToast(d.error || 'Delete failed', 'error'); return; }
+            if (s.id === currentSessionId) newSession();
+            loadSessions();
+            showToast('Session deleted', 'success');
+          } catch { showToast('Delete failed', 'error'); }
+        };
+        row.appendChild(edit);
+        row.appendChild(del);
+        sessionList.appendChild(row);
       }
     } catch {
       const empty = document.createElement('div');
@@ -808,6 +1527,20 @@
       empty.textContent = 'Failed to load sessions';
       sessionList.appendChild(empty);
     }
+  }
+
+  // Refresh the live dots while the dropdown is open (every 60s). Self-stops when
+  // the menu is closed by any path, so no stray timer keeps running.
+  let sessionPollTimer = null;
+  function startSessionPoll() {
+    stopSessionPoll();
+    sessionPollTimer = setInterval(() => {
+      if (sessionDropdown.classList.contains('hidden')) { stopSessionPoll(); return; }
+      loadSessions();
+    }, 60000);
+  }
+  function stopSessionPoll() {
+    if (sessionPollTimer) { clearInterval(sessionPollTimer); sessionPollTimer = null; }
   }
 
   btnMenu.addEventListener('click', e => {
@@ -818,8 +1551,13 @@
       sessionDropdown.style.left = Math.max(4, rect.right - 240) + 'px';
       loadSessions();
       sessionDropdown.classList.remove('hidden');
+      // Keep the menu fully on-screen (esp. narrow mobile): clamp after layout.
+      const ddw = sessionDropdown.offsetWidth;
+      sessionDropdown.style.left = Math.max(4, Math.min(rect.right - 240, window.innerWidth - ddw - 4)) + 'px';
+      startSessionPoll();
     } else {
       sessionDropdown.classList.add('hidden');
+      stopSessionPoll();
     }
   });
 
@@ -837,13 +1575,727 @@
   const chatPanel = $('chat-panel');
   let dragging = false;
 
-  divider.addEventListener('mousedown', e => { dragging = true; divider.classList.add('dragging'); e.preventDefault(); });
+  divider.addEventListener('mousedown', e => {
+    dragging = true;
+    divider.classList.add('dragging');
+    vncFrame.style.pointerEvents = 'none';   // stop iframe swallowing mouse events
+    chatPanel.style.maxWidth = 'none';        // lift CSS max-width cap
+    e.preventDefault();
+  });
   window.addEventListener('mousemove', e => {
     if (!dragging) return;
-    const w = Math.max(200, Math.min(e.clientX, window.innerWidth * 0.6));
+    const chatLeft = chatPanel.getBoundingClientRect().left;
+    const w = Math.max(200, Math.min(e.clientX - chatLeft, window.innerWidth * 0.90));
     chatPanel.style.width = w + 'px';
   });
-  window.addEventListener('mouseup', () => { dragging = false; divider.classList.remove('dragging'); });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    divider.classList.remove('dragging');
+    vncFrame.style.pointerEvents = '';       // restore
+  });
+
+  // ── Tasks panel toggle ────────────────────────────────────────────────────
+  const btnTasks  = $('btn-tasks');
+  const tasksPanel = $('tasks-panel');
+  if (btnTasks && tasksPanel) {
+    btnTasks.addEventListener('click', () => {
+      const isHidden = tasksPanel.classList.contains('tasks-panel-hidden');
+      tasksPanel.classList.toggle('tasks-panel-hidden', !isHidden);
+      tasksPanel.classList.toggle('tasks-panel-visible', isHidden);
+      btnTasks.classList.toggle('active', isHidden);
+      if (isHidden) loadTasks();
+    });
+  }
+
+  // ── Settings dropdown (Connectors / Settings) ─────────────────────────────
+  const btnSettings      = $('btn-settings');
+  const settingsDropdown = $('settings-dropdown');
+  const btnOpenSettings  = $('btn-open-settings');
+  const settingsPanel    = $('settings-panel');
+  const btnCloseSettings = $('btn-close-settings');
+  const settingsBody     = $('settings-body');
+
+  if (btnSettings && settingsDropdown) {
+    btnSettings.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const hidden = settingsDropdown.classList.toggle('hidden');
+      btnSettings.classList.toggle('active', !hidden);
+    });
+    settingsDropdown.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => {
+      settingsDropdown.classList.add('hidden');
+      btnSettings.classList.remove('active');
+    });
+  }
+  if (btnOpenSettings && settingsPanel) {
+    btnOpenSettings.addEventListener('click', () => {
+      settingsDropdown.classList.add('hidden');
+      btnSettings.classList.remove('active');
+      settingsPanel.classList.remove('hidden');
+      if (settingsBody) {
+        settingsBody.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Settings coming soon.</p>';
+      }
+    });
+  }
+  if (btnCloseSettings) {
+    btnCloseSettings.addEventListener('click', () => {
+      settingsPanel && settingsPanel.classList.add('hidden');
+    });
+  }
+
+  // ── Light / dark theme toggle ─────────────────────────────────────────────
+  const btnTheme = document.getElementById('btn-theme');
+  if (btnTheme) {
+    const curTheme = () => (document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark');
+    const refreshThemeLabel = () => { btnTheme.textContent = (curTheme() === 'light' ? '\u{1F319} Dark mode' : '\u2600\uFE0F Light mode'); };
+    refreshThemeLabel();
+    btnTheme.addEventListener('click', () => {
+      const next = curTheme() === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('ccb-theme', next); } catch (e) {}
+      refreshThemeLabel();
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+    });
+  }
+
+  // ── Claude Code re-authentication (per-user, self-service) ────────────────
+  const btnClaudeAuth = document.getElementById('btn-claude-auth');
+  if (btnClaudeAuth) {
+    btnClaudeAuth.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      openClaudeAuth();
+    });
+  }
+  function openClaudeAuth() {
+    document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
+    const ov = document.createElement('div');
+    ov.className = 'cauth-overlay';
+    ov.innerHTML = `
+      <div class="cauth-modal">
+        <div class="cauth-head"><span>\u{1F511} Authenticate Claude Code</span><button class="cauth-x" title="Close">✕</button></div>
+        <div class="cauth-body">
+          <p class="cauth-intro">Sets up <b>your own</b> Claude Code credentials for this assistant. Click start, open the link to sign in &amp; approve, then paste the code back here.</p>
+          <button class="cauth-btn" id="cauth-start">Start sign-in</button>
+          <div id="cauth-step2" class="cauth-hidden">
+            <p><b>1.</b> Open this link, sign in and approve:</p>
+            <div class="cauth-linkrow">
+              <a id="cauth-link" target="_blank" rel="noopener">Open sign-in page ↗</a>
+              <button class="cauth-btn cauth-sm" id="cauth-copy">Copy link</button>
+            </div>
+            <p><b>2.</b> Paste the code shown after approving:</p>
+            <div class="cauth-linkrow">
+              <input id="cauth-code" type="text" placeholder="Paste code here" autocomplete="off" spellcheck="false" />
+              <button class="cauth-btn cauth-sm" id="cauth-submit">Submit</button>
+            </div>
+          </div>
+          <div id="cauth-msg" class="cauth-msg"></div>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    const msg = ov.querySelector('#cauth-msg');
+    const setMsg = (t, kind) => { msg.textContent = t || ''; msg.className = 'cauth-msg' + (kind ? ' cauth-' + kind : ''); };
+    const close = () => { try { fetch(`${API_BASE}/auth/cancel`, { method: 'POST' }); } catch (_) {} ov.remove(); };
+    ov.querySelector('.cauth-x').addEventListener('click', close);
+    ov.addEventListener('click', e => { if (e.target === ov) close(); });
+    const startBtn = ov.querySelector('#cauth-start');
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true; setMsg('Starting sign-in…', 'info');
+      try {
+        const r = await fetch(`${API_BASE}/auth/start`, { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok || !d.url) throw new Error(d.error || 'Could not start sign-in.');
+        ov.querySelector('#cauth-link').href = d.url;
+        ov.querySelector('#cauth-step2').classList.remove('cauth-hidden');
+        startBtn.classList.add('cauth-hidden');
+        setMsg('', '');
+        ov.querySelector('#cauth-copy').addEventListener('click', () => {
+          navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => setMsg('Copy failed — select the link manually.', 'err'));
+        });
+      } catch (e) { startBtn.disabled = false; setMsg(e.message, 'err'); }
+    });
+    const submit = async () => {
+      const code = (ov.querySelector('#cauth-code').value || '').trim();
+      if (!code) { setMsg('Paste the code first.', 'err'); return; }
+      const sBtn = ov.querySelector('#cauth-submit'); sBtn.disabled = true;
+      setMsg('Completing sign-in…', 'info');
+      try {
+        const r = await fetch(`${API_BASE}/auth/code`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
+        const d = await r.json();
+        if (r.ok && d.ok) { setMsg('✓ ' + (d.message || 'Authenticated.'), 'ok'); setTimeout(() => ov.remove(), 2500); }
+        else { sBtn.disabled = false; setMsg(d.message || d.error || 'Sign-in failed.', 'err'); }
+      } catch (e) { sBtn.disabled = false; setMsg(e.message, 'err'); }
+    };
+    ov.querySelector('#cauth-submit').addEventListener('click', submit);
+    ov.querySelector('#cauth-code').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  }
+
+  // ── Task panel rendering: state, filters, sort ────────────────────────────
+  const tasksListEl     = $('tasks-list');
+  const tasksCountEl    = $('tasks-count');
+  const btnTasksRefresh = $('btn-tasks-refresh');
+  const openTasks       = new Set();
+
+  const statusClass  = s => 's-' + String(s || 'new').replace(/[^a-z-]/g, '');
+  const prettyStatus = s => String(s || 'new').replace(/-/g, ' ');
+  const SHORT_STATUS = { 'new': 'new', 'needs-clarification': 'clarify', 'objective-clear': 'clear',
+    'planned': 'plan', 'approved': 'appr', 'in-progress': 'active', 'blocked': 'block', 'done': 'done' };
+  const shortStatus = s => SHORT_STATUS[s] || prettyStatus(s);
+
+  const STATUS_RANK = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3,
+    'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
+  const rankOf = s => (STATUS_RANK[s] ?? 5);
+  const todayStr = () => new Date().toISOString().slice(0, 10);
+  const isFuture = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && d > todayStr();
+
+  const TS_KEY = 'taskloop.tasks.v1';
+  function loadTaskState() {
+    let s = {};
+    try { s = JSON.parse(localStorage.getItem(TS_KEY) || '{}'); } catch (_) {}
+    return {
+      sort:   s.sort || '',
+      dir:    s.dir === 'desc' ? 'desc' : 'asc',
+      date:   ['pending','today','past','no-date','all'].includes(s.date) ? s.date : 'pending',
+      status: Array.isArray(s.status) ? s.status : [],
+      area:   Array.isArray(s.area) ? s.area : [],
+      type:   Array.isArray(s.type) ? s.type : [],
+      person: Array.isArray(s.person) ? s.person : [],
+      project:Array.isArray(s.project) ? s.project : [],
+    };
+  }
+  let taskState  = loadTaskState();
+  let taskSearch = '';
+  let lastTasks  = [];
+
+  function saveTaskState() { try { localStorage.setItem(TS_KEY, JSON.stringify(taskState)); } catch (_) {} }
+
+  function applyTaskView(tasks) {
+    let list = tasks.slice();
+    const today = todayStr();
+    switch (taskState.date) {
+      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled)); break;
+      case 'today':   list = list.filter(t => t.scheduled === today); break;
+      case 'past':    list = list.filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') && t.scheduled < today); break;
+      case 'no-date': list = list.filter(t => !t.scheduled); break;
+      /* 'all' => no date constraint */
+    }
+    if (taskState.status.length)  list = list.filter(t => taskState.status.includes(t.status));
+    if (taskState.area.length)    list = list.filter(t => taskState.area.includes(t.area || '__none__'));
+    if (taskState.type.length)    list = list.filter(t => taskState.type.includes(t.type || '__none__'));
+    if (taskState.person.length)  list = list.filter(t => taskState.person.includes(t.person || '__none__'));
+    if (taskState.project.length) list = list.filter(t => taskState.project.includes(t.project || '__none__'));
+    const q = taskSearch.trim().toLowerCase();
+    if (q) list = list.filter(t => (t.title || '').toLowerCase().includes(q));
+    if (taskState.sort) {
+      const col = taskState.sort, mul = taskState.dir === 'desc' ? -1 : 1;
+      const val = t => col === 'priority' ? (parseInt(t.priority, 10) || 99)
+                     : col === 'status'   ? rankOf(t.status)
+                     : String(t[col] || '').toLowerCase();
+      list.sort((a, b) => {
+        const va = val(a), vb = val(b);
+        return ((va < vb ? -1 : va > vb ? 1 : 0) * mul) ||
+          String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+      });
+    }
+    return list;
+  }
+
+  // ── Server actions ──
+  async function updateTaskFields(file, fields) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/update`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }) });
+      const data = await res.json();
+      if (res.ok && data.ok) loadTasks(); else showToast('Update failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+  }
+  async function reorderTask(file, move) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/reorder`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ move }) });
+      const data = await res.json();
+      if (res.ok && data.ok) { taskState.sort = ''; saveTaskState(); loadTasks(); }
+      else showToast('Reorder failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Reorder failed: ' + e.message, 'error'); }
+  }
+  async function deleteTask(t) {
+    const ok = await confirmDialog('Delete "' + t.title + '" permanently? This cannot be undone.');
+    if (!ok) return;
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok && data.ok) { showToast('Task deleted', 'success'); openTasks.delete(t.file); loadTasks(); }
+      else showToast('Delete failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
+  }
+  function deferTask(t, days) {
+    const d = new Date(); d.setDate(d.getDate() + days);
+    updateTaskFields(t.file, { scheduled: d.toISOString().slice(0, 10) });
+    showToast('Deferred ' + days + ' day' + (days > 1 ? 's' : ''), 'info');
+  }
+  function cyclePriority(t) {
+    const cur = parseInt(t.priority, 10);
+    const next = Number.isNaN(cur) ? 1 : (cur >= 3 ? '' : cur + 1);
+    updateTaskFields(t.file, { priority: next });
+  }
+  function editArea(t) {
+    const v = prompt('Area for "' + t.title + '":', t.area || '');
+    if (v === null) return;
+    updateTaskFields(t.file, { area: v.trim() });
+  }
+  function editPriority(t) {
+    const v = prompt('Priority 1–3 (blank to clear):', t.priority || '');
+    if (v === null) return;
+    const n = v.trim();
+    updateTaskFields(t.file, { priority: n === '' ? '' : String(Math.max(1, Math.min(3, parseInt(n, 10) || 1))) });
+  }
+  function renameTask(t) {
+    const v = prompt('Task title:', t.title);
+    if (v === null) return;
+    const title = v.replace(/\s+/g, ' ').trim();
+    if (!title) return;
+    fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/title`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) })
+      .then(r => r.json()).then(d => { if (d.ok) loadTasks(); else showToast('Rename failed: ' + (d.error || ''), 'error'); })
+      .catch(e => showToast('Rename failed: ' + e.message, 'error'));
+  }
+
+  // ── Per-row ⋮ action menu ──
+  function closeTaskMenu() { const m = document.querySelector('.task-menu'); if (m) m.remove(); }
+  function openTaskMenu(t, anchor) {
+    closeTaskMenu();
+    const menu = document.createElement('div');
+    menu.className = 'task-menu';
+    const item = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); closeTaskMenu(); fn(); });
+      menu.appendChild(b);
+    };
+    const sep = () => { const s = document.createElement('div'); s.className = 'task-menu-sep'; menu.appendChild(s); };
+    item(t.session ? '💬 Open chat' : '→ Start chat', () => openTaskChat(t));
+    sep();
+    item('▲ Move to top', () => reorderTask(t.file, 'top'));
+    item('↑ Move up',     () => reorderTask(t.file, 'up'));
+    item('↓ Move down',   () => reorderTask(t.file, 'down'));
+    sep();
+    if (t.status === 'planned') item('✓ Approve plan', () => setTaskStatus(t, 'approved'));
+    if (t.status === 'blocked') item('↻ Resume',       () => setTaskStatus(t, 'approved'));
+    item('✎ Rename…',       () => renameTask(t));
+    item('⊞ Set area…',    () => editArea(t));
+    item('⚑ Set priority…', () => editPriority(t));
+    sep();
+    item('⏰ Defer 1 day',  () => deferTask(t, 1));
+    item('⏰ Defer 3 days', () => deferTask(t, 3));
+    item('⏰ Defer 7 days', () => deferTask(t, 7));
+    item('⏰ Defer 15 days', () => deferTask(t, 15));
+    item('⏰ Defer 30 days', () => deferTask(t, 30));
+    sep();
+    if (t.status === 'done') item('↺ Reopen', () => setTaskStatus(t, 'new'));
+    else                     item('✓ Completed', () => setTaskStatus(t, 'done'));
+    item('🗑 Delete', () => deleteTask(t), 'danger');
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.top  = Math.max(8, Math.min(r.bottom + 2, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    setTimeout(() => document.addEventListener('click', closeTaskMenu, { once: true }), 0);
+  }
+
+  // ── Confirm dialog (returns a Promise<boolean>) ──
+  function confirmDialog(message) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div'); ov.className = 'task-confirm-overlay';
+      const box = document.createElement('div'); box.className = 'task-confirm';
+      const msg = document.createElement('div'); msg.className = 'task-confirm-msg'; msg.textContent = message;
+      const btns = document.createElement('div'); btns.className = 'task-confirm-btns';
+      const cancel = document.createElement('button'); cancel.className = 'tc-cancel'; cancel.textContent = 'Cancel';
+      const ok = document.createElement('button'); ok.className = 'tc-ok'; ok.textContent = 'Delete';
+      const done = v => { ov.remove(); resolve(v); };
+      cancel.addEventListener('click', () => done(false));
+      ok.addEventListener('click', () => done(true));
+      ov.addEventListener('click', (e) => { if (e.target === ov) done(false); });
+      btns.appendChild(cancel); btns.appendChild(ok);
+      box.appendChild(msg); box.appendChild(btns); ov.appendChild(box);
+      document.body.appendChild(ov);
+    });
+  }
+
+  // ── One task row ──
+  function renderTaskRow(t) {
+    const row = document.createElement('div');
+    row.className = 'task-row ' + statusClass(t.status);
+    if (openTasks.has(t.file)) row.classList.add('open');
+
+    const line = document.createElement('div');
+    line.className = 'task-line';
+
+    const idEl = document.createElement('span');
+    idEl.className = 'task-id';
+    idEl.textContent = (t.id != null ? t.id : '?');
+    idEl.title = 'Task number';
+
+    const pri = document.createElement('span');
+    pri.className = 'task-pri p' + (t.priority || '0');
+    pri.textContent = t.priority ? ('P' + t.priority) : '–';
+    pri.title = 'Priority (click to cycle)';
+    pri.addEventListener('click', (e) => { e.stopPropagation(); cyclePriority(t); });
+
+    const area = document.createElement('span');
+    area.className = 'task-area';
+    area.textContent = t.area || '—';
+    area.title = 'Area (click to edit)';
+    area.addEventListener('click', (e) => { e.stopPropagation(); editArea(t); });
+
+    const title = document.createElement('span');
+    title.className = 'task-title-cell';
+    title.textContent = t.title;
+    if (t.session) { const c = document.createElement('span'); c.className = 'task-chat-dot'; c.textContent = ' 💬'; c.title = 'Has a chat thread'; title.appendChild(c); }
+
+    const badge = document.createElement('span');
+    badge.className = 'task-badge ' + statusClass(t.status);
+    badge.textContent = shortStatus(t.status);
+    badge.title = prettyStatus(t.status);
+
+    const more = document.createElement('button');
+    more.className = 'task-more'; more.textContent = '⋮'; more.title = 'Task actions';
+    more.addEventListener('click', (e) => { e.stopPropagation(); openTaskMenu(t, more); });
+
+    line.appendChild(idEl); line.appendChild(pri); line.appendChild(area); line.appendChild(title); line.appendChild(badge); line.appendChild(more);
+    row.appendChild(line);
+
+    const detail = document.createElement('div');
+    detail.className = 'task-detail';
+    const meta = document.createElement('div');
+    meta.className = 'tr-meta';
+    meta.textContent = [
+      t.scheduled ? 'sched ' + t.scheduled : '',
+      t.updated ? 'upd ' + t.updated : '',
+      t.completed_at ? 'done ' + String(t.completed_at).slice(0, 10) : '',
+    ].filter(Boolean).join('  ·  ');
+    detail.appendChild(meta);
+    const addField = (label, value, cls) => {
+      if (!value) return;
+      const f = document.createElement('div'); f.className = 'tr-field ' + (cls || '');
+      const l = document.createElement('span'); l.className = 'tr-field-label'; l.textContent = label;
+      const b = document.createElement('span'); b.className = 'tr-field-val'; b.textContent = value;
+      f.appendChild(l); f.appendChild(b); detail.appendChild(f);
+    };
+    addField('Objective', t.objective, 'tr-objective');
+    addField('Description', t.description, 'tr-desc');
+    addField('Location', t.location || t.file, 'tr-loc');
+    if (t.notes) { const n = document.createElement('div'); n.className = 'tr-notes'; n.textContent = t.notes; detail.appendChild(n); }
+    if (t.plan)  {
+      const p = document.createElement('div'); p.className = 'tr-plan';
+      const l = document.createElement('span'); l.className = 'tr-plan-label'; l.textContent = 'Plan';
+      const b = document.createElement('span'); b.textContent = t.plan;
+      p.appendChild(l); p.appendChild(b); detail.appendChild(p);
+    }
+    const openBtn = document.createElement('button');
+    openBtn.className = 'tr-openchat';
+    openBtn.textContent = t.session ? '💬 Open chat' : '→ Start chat';
+    openBtn.addEventListener('click', (e) => { e.stopPropagation(); openTaskChat(t); });
+    detail.appendChild(openBtn);
+    row.appendChild(detail);
+
+    line.addEventListener('click', () => {
+      row.classList.toggle('open');
+      if (row.classList.contains('open')) openTasks.add(t.file); else openTasks.delete(t.file);
+    });
+    return row;
+  }
+
+  // ── Filter dropdown menus ──
+  function renderCheckMenu(menuEl, options, selected, onChange, labelFn, allLabel) {
+    if (!menuEl) return;
+    const temp = new Set(selected);
+    const draw = () => {
+      menuEl.innerHTML = '';
+      const allRow = document.createElement('label'); allRow.className = 'tf-opt tf-opt-all';
+      const allCb = document.createElement('input'); allCb.type = 'checkbox'; allCb.checked = temp.size === 0;
+      allCb.addEventListener('change', () => { temp.clear(); draw(); });
+      allRow.appendChild(allCb); allRow.appendChild(document.createTextNode(' ' + (allLabel || 'All')));
+      menuEl.appendChild(allRow);
+      const sep = document.createElement('div'); sep.className = 'tf-sep'; menuEl.appendChild(sep);
+      const scroll = document.createElement('div'); scroll.className = 'tf-scroll';
+      for (const opt of options) {
+        const row = document.createElement('label'); row.className = 'tf-opt' + (opt === '__none__' ? ' tf-opt-none' : '');
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = temp.has(opt);
+        cb.addEventListener('change', () => { temp.has(opt) ? temp.delete(opt) : temp.add(opt); draw(); });
+        row.appendChild(cb); row.appendChild(document.createTextNode(' ' + labelFn(opt)));
+        scroll.appendChild(row);
+      }
+      menuEl.appendChild(scroll);
+      const okWrap = document.createElement('div'); okWrap.className = 'tf-ok-wrap';
+      const ok = document.createElement('button'); ok.type = 'button'; ok.className = 'tf-ok'; ok.textContent = 'OK';
+      ok.addEventListener('click', (e) => { e.stopPropagation(); onChange(Array.from(temp)); closeDropdowns(); });
+      okWrap.appendChild(ok); menuEl.appendChild(okWrap);
+    };
+    draw();
+  }
+  function setFilterBtn(btn, sel, base, labelFn) {
+    if (!btn) return;
+    const on = sel && sel.length > 0;
+    btn.classList.toggle('active', on);
+    if (!on) { btn.textContent = base + ' \u25be'; return; }
+    const label = sel.length === 1 ? labelFn(sel[0]) : base + ' (' + sel.length + ')';
+    btn.textContent = label + ' \u25be';
+  }
+  const DATE_OPTS = [['pending','Pending'],['today','Today'],['past','Past'],['no-date','No Date'],['all','All']];
+  function buildDateMenu() {
+    const menu = $('tf-date-menu');
+    if (menu) {
+      menu.innerHTML = '';
+      for (const [val, label] of DATE_OPTS) {
+        const row = document.createElement('label'); row.className = 'tf-opt';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = taskState.date === val;
+        cb.addEventListener('change', () => { taskState.date = val; saveTaskState(); closeDropdowns(); renderTasks(lastTasks); });
+        row.appendChild(cb); row.appendChild(document.createTextNode(' ' + label));
+        menu.appendChild(row);
+      }
+    }
+    const btn = $('tf-date');
+    if (btn) {
+      const cur = DATE_OPTS.find(o => o[0] === taskState.date);
+      btn.textContent = (cur ? cur[1] : 'Pending') + ' \u25be';
+      btn.classList.toggle('active', taskState.date !== 'pending');
+    }
+  }
+  function buildFilterMenus(tasks) {
+    const noneLabel = v => v === '__none__' ? '(unassigned)' : v;
+    const optsFor = key => {
+      const vals = Array.from(new Set(tasks.map(t => t[key]).filter(Boolean))).sort();
+      return vals.concat(tasks.some(t => !t[key]) ? ['__none__'] : []);
+    };
+    const menuOpen = id => { const m = $(id); return m && !m.classList.contains('hidden'); };
+    if (!menuOpen('tf-status-menu')) renderCheckMenu($('tf-status-menu'),
+      Array.from(new Set(tasks.map(t => t.status))).sort(), taskState.status,
+      sel => { taskState.status = sel; saveTaskState(); renderTasks(lastTasks); }, prettyStatus, 'All Statuses');
+    if (!menuOpen('tf-area-menu')) renderCheckMenu($('tf-area-menu'), optsFor('area'), taskState.area,
+      sel => { taskState.area = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Areas');
+    if (!menuOpen('tf-type-menu')) renderCheckMenu($('tf-type-menu'), optsFor('type'), taskState.type,
+      sel => { taskState.type = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Types');
+    if (!menuOpen('tf-person-menu')) renderCheckMenu($('tf-person-menu'), optsFor('person'), taskState.person,
+      sel => { taskState.person = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All People');
+    if (!menuOpen('tf-project-menu')) renderCheckMenu($('tf-project-menu'), optsFor('project'), taskState.project,
+      sel => { taskState.project = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Projects');
+    buildDateMenu();
+    setFilterBtn($('tf-status'), taskState.status, 'Status', prettyStatus);
+    setFilterBtn($('tf-area'), taskState.area, 'Area', noneLabel);
+    setFilterBtn($('tf-type'), taskState.type, 'Type', noneLabel);
+    setFilterBtn($('tf-person'), taskState.person, 'Person', noneLabel);
+    setFilterBtn($('tf-project'), taskState.project, 'Project', noneLabel);
+  }
+
+  // ── Sort-header arrows ──
+  function updateSortHeader() {
+    document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
+      const col = th.getAttribute('data-sort');
+      let base = th.getAttribute('data-label');
+      if (!base) { base = th.textContent.trim(); th.setAttribute('data-label', base); }
+      const active = taskState.sort === col;
+      th.classList.toggle('sorted', active);
+      th.textContent = base + (active ? (taskState.dir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+  }
+
+  // ── Wire task controls ──
+  function closeDropdowns() { document.querySelectorAll('.tf-menu').forEach(m => m.classList.add('hidden')); }
+  function wireDropdown(btnId, menuId) {
+    const btn = $(btnId), menu = $(menuId);
+    if (!btn || !menu) return;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = !menu.classList.contains('hidden');
+      closeDropdowns();
+      if (!wasOpen) { menu.classList.remove('hidden'); setTimeout(() => document.addEventListener('click', closeDropdowns, { once: true }), 0); }
+    });
+    menu.addEventListener('click', e => e.stopPropagation());
+  }
+  function wireTaskControls() {
+    const search = $('task-search');
+    if (search) search.addEventListener('input', () => { taskSearch = search.value; renderTasks(lastTasks); });
+    wireDropdown('tf-date', 'tf-date-menu');
+    wireDropdown('tf-status', 'tf-status-menu');
+    wireDropdown('tf-area', 'tf-area-menu');
+    wireDropdown('tf-type', 'tf-type-menu');
+    wireDropdown('tf-person', 'tf-person-menu');
+    wireDropdown('tf-project', 'tf-project-menu');
+    buildDateMenu();
+    document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.getAttribute('data-sort');
+        if (taskState.sort === col) taskState.dir = taskState.dir === 'asc' ? 'desc' : 'asc';
+        else { taskState.sort = col; taskState.dir = 'asc'; }
+        saveTaskState(); renderTasks(lastTasks);
+      });
+    });
+  }
+  wireTaskControls();
+
+  // ── Render task list ──
+  function renderTasks(tasks) {
+    if (!tasksListEl) return;
+    const pendingCount = tasks.filter(t => t.status !== 'done' && !isFuture(t.scheduled)).length;
+    if (tasksCountEl) tasksCountEl.textContent = pendingCount || '';
+    buildFilterMenus(tasks);
+    updateSortHeader();
+    if (!tasks.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks yet.</div>'; return; }
+    const list = applyTaskView(tasks);
+    if (!list.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks match the current filters.</div>'; return; }
+    tasksListEl.innerHTML = '';
+    for (const t of list) tasksListEl.appendChild(renderTaskRow(t));
+  }
+
+  async function loadTasks() {
+    try {
+      const res = await fetch(API_BASE + '/tasks', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      lastTasks = data.tasks || [];
+      renderTasks(lastTasks);
+    } catch (_) {}
+  }
+
+  // ── Task chat integration ──
+  function startFreshSession() {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    messagesEl.innerHTML = '';
+    currentAssistantEl   = null;
+    currentAssistantText = '';
+    lastToolEl = null;
+    setBusy(false);
+    hideContextWarning();
+    setMcpDot('unknown');
+    storedMsgData        = [];
+    lastAssistantDataIdx = -1;
+    lastToolDataIdx      = -1;
+    currentSessionId = null;
+    localStorage.removeItem(SESSION_KEY);
+  }
+
+  function openTaskChat(t) {
+    if (t.session) {
+      switchToSession(t.session);
+      showToast('Reopened this task\'s chat', 'info');
+      return;
+    }
+    startFreshSession();
+    pendingTaskLink = t.file;
+    let msg = `Let's work on this task: "${t.title}".`;
+    if (t.notes) msg += `\n\nCurrent notes / objective:\n${t.notes}`;
+    if (t.plan)  msg += `\n\nPlan:\n${t.plan}`;
+    msg += `\n\nPlease pick up from here.`;
+    inputEl.value = msg;
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    inputEl.focus();
+    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    showToast('New chat thread for this task — review and send', 'info');
+  }
+
+  async function setTaskStatus(t, status) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        const msg = status === 'done'     ? 'Task marked done'
+                  : status === 'approved' ? 'Plan approved'
+                  : status === 'new'      ? 'Task reopened'
+                  : 'Status updated';
+        showToast(msg, status === 'done' || status === 'approved' ? 'success' : 'info');
+        loadTasks();
+      } else {
+        showToast('Update failed: ' + (data.error || res.status), 'error');
+      }
+    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+  }
+
+  // ── New-task form ──
+  const btnTasksNew  = $('btn-tasks-new');
+  const taskNewForm  = $('task-new-form');
+  const taskNewTitle = $('task-new-title');
+  const taskNewDesc  = $('task-new-desc');
+  const taskNewCancel= $('task-new-cancel');
+
+  function toggleNewForm(show) {
+    if (!taskNewForm) return;
+    taskNewForm.classList.toggle('hidden', !show);
+    if (show && taskNewTitle) { taskNewTitle.value = ''; if (taskNewDesc) taskNewDesc.value = ''; taskNewTitle.focus(); }
+  }
+  if (btnTasksNew)   btnTasksNew.addEventListener('click', () => toggleNewForm(taskNewForm && taskNewForm.classList.contains('hidden')));
+  if (taskNewCancel) taskNewCancel.addEventListener('click', () => toggleNewForm(false));
+  if (taskNewForm) taskNewForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const title = taskNewTitle?.value.trim();
+    if (!title) { taskNewTitle?.focus(); return; }
+    try {
+      const res = await fetch(API_BASE + '/tasks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, description: taskNewDesc?.value.trim() || '' }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        showToast(`Task ${data.id} created`, 'success');
+        toggleNewForm(false);
+        loadTasks();
+      } else {
+        showToast('Could not create task: ' + (data.error || res.status), 'error');
+      }
+    } catch (err) {
+      showToast('Could not create task: ' + err.message, 'error');
+    }
+  });
+
+  if (btnTasksRefresh) btnTasksRefresh.addEventListener('click', loadTasks);
+  setInterval(() => { if (tasksPanel && tasksPanel.classList.contains('tasks-panel-visible')) loadTasks(); }, 30000);
+
+  // ── Mobile status dropdown ──────────────────────────────────────────────────
+  const btnStatus   = $('btn-status');
+  const statusStack = $('status-stack');
+  const statusDot   = $('status-dot');
+
+  if (btnStatus && statusStack) {
+    btnStatus.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = statusStack.classList.toggle('open');
+      if (open) {
+        const r   = btnStatus.getBoundingClientRect();
+        const w   = Math.min(340, window.innerWidth * 0.92);
+        const top = r.bottom + 6;
+        const left = Math.max(8, r.right - w);
+        statusStack.style.top   = top + 'px';
+        statusStack.style.width = w + 'px';
+        statusStack.style.left  = left + 'px';
+        statusStack.style.right = 'auto';
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (statusStack.classList.contains('open') &&
+          !statusStack.contains(e.target) && !btnStatus.contains(e.target)) {
+        statusStack.classList.remove('open');
+      }
+    });
+  }
+
+  function refreshStatusAlert() {
+    if (!statusDot) return;
+    let alert = false;
+    statusStack && statusStack.querySelectorAll('.cdot').forEach((d) => {
+      if (d.classList.contains('cdot-disconnected') || d.classList.contains('cdot-error')) alert = true;
+    });
+    ['fill-5h', 'fill-7d', 'fill-ctx'].forEach((id) => {
+      const f = $(id);
+      if (f && /--red/.test(f.style.background || '')) alert = true;
+    });
+    statusDot.classList.toggle('alert', alert);
+  }
+  setInterval(refreshStatusAlert, 1500);
+  refreshStatusAlert();
 
   // ── Init ──────────────────────────────────────────────────────────────────
   // History is restored from server via fetchAndRestoreHistory() on first WS connect

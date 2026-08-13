@@ -4,7 +4,7 @@
   <title>VNC</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <link rel="stylesheet" href="/vnc/app/styles/lite.css">
+  <link rel="stylesheet" href="./vnc/app/styles/lite.css">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; border-radius: 0 !important; }
     html, body { width: 100%; height: 100%; background: #1a1a1a; overflow: hidden; }
@@ -12,7 +12,7 @@
     #vnc-status { display: none; }
     canvas { display: block; border-radius: 0 !important; }
   </style>
-  <script src="/vnc/vendor/promise.js"></script>
+  <script src="./vnc/vendor/promise.js"></script>
   <script type="module">
     window._noVNC_has_module_support = true;
   </script>
@@ -20,40 +20,80 @@
     window.addEventListener("load", function() {
       if (window._noVNC_has_module_support) return;
       var loader = document.createElement("script");
-      loader.src = "/vnc/vendor/browser-es-module-loader/dist/browser-es-module-loader.js";
+      loader.src = "./vnc/vendor/browser-es-module-loader/dist/browser-es-module-loader.js";
       document.head.appendChild(loader);
     });
   </script>
   <script type="module" crossorigin="anonymous">
-    import * as WebUtil from '/vnc/app/webutil.js';
-    import RFB from '/vnc/core/rfb.js';
+    import * as WebUtil from './vnc/app/webutil.js';
+    import RFB from './vnc/core/rfb.js';
 
     const statusEl = document.getElementById('vnc-status');
     function setStatus(s) { statusEl.className = s; }
 
     var host = window.location.hostname;
     var port = window.location.port || (window.location.protocol === 'https:' ? 443 : 80);
-    var path = 'websockify';
+    // Extract path prefix from current URL (e.g., /peter, /hassan, /user3)
+    var pathParts = window.location.pathname.split('/').filter(Boolean);
+    var prefix = pathParts.length > 1 ? '/' + pathParts[0] : '';
+    var path = prefix + '/websockify';
     var proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    var url = proto + '://' + host + (port ? ':' + port : '') + '/' + path;
+    var url = proto + '://' + host + (port ? ':' + port : '') + path;
 
-    setStatus('connecting');
+    // rfb is (re)created by connect(); a mutable var so the soft-keyboard /
+    // clipboard / reconnect helpers below always reach the live instance.
+    var rfb = null;
+    var reconnectTimer = null;
+    var reconnectDelay = 1000;   // backoff, reset on a successful connect
 
-    var rfb = new RFB(document.body, url, { shared: true });
-    rfb.scaleViewport = true;
+    function connect() {
+      setStatus('connecting');
+      rfb = new RFB(document.body, url, { shared: true });
+      rfb.scaleViewport = true;
+      // Slow-link tuning: lower image quality + max compression so a full
+      // framebuffer actually fits through a narrow pipe (the cause of the
+      // "connected but black pane" bug on a dial-up-rate connection).
+      try { rfb.qualityLevel = 4; rfb.compressionLevel = 9; } catch (e) {}
 
-    rfb.addEventListener('connect', function() { setStatus('connected'); });
-    rfb.addEventListener('disconnect', function(e) {
-      setStatus(e.detail.clean ? 'disconnected' : 'error');
-    });
+      rfb.addEventListener('connect', function() {
+        setStatus('connected');
+        reconnectDelay = 1000;
+      });
+      rfb.addEventListener('disconnect', function(e) {
+        setStatus(e.detail.clean ? 'disconnected' : 'error');
+        scheduleReconnect();   // self-heal: any drop auto-reconnects with backoff
+      });
+      // Remote → OS clipboard: push remote clipboard changes to the local OS.
+      rfb.addEventListener('clipboard', function(e) {
+        if (!e.detail.text) return;
+        navigator.clipboard.writeText(e.detail.text).catch(function() {});
+      });
+    }
 
-    // ── Clipboard sync ────────────────────────────────────────────────────────
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(function() {
+        reconnectTimer = null;
+        connect();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    }
 
-    // Remote → Windows: when VNC server reports a clipboard change, push to OS
-    rfb.addEventListener('clipboard', function(e) {
-      if (!e.detail.text) return;
-      navigator.clipboard.writeText(e.detail.text).catch(function() {});
-    });
+    // Parent watchdog calls this to force a clean reconnect (re-requests a full
+    // framebuffer) when the canvas is connected but never painted.
+    window.__rfbReconnect = function () {
+      try { if (rfb) rfb.disconnect(); } catch (e) {}  // disconnect → scheduleReconnect
+    };
+
+    // ── Mobile soft-keyboard bridge ──────────────────────────────────────────
+    // The remote view is a <canvas>, which can't raise the phone keyboard. The
+    // parent page owns a hidden editable field (which DOES raise it) and forwards
+    // each keystroke here. keysym → remote key; `down` omitted = press+release.
+    window.__rfbSendKey = function (keysym, down) {
+      try { if (rfb) rfb.sendKey(keysym, null, down); } catch (e) {}
+    };
+
+    connect();
 
     // Windows → Remote: intercept Ctrl+V before noVNC sees it,
     // sync the Windows clipboard to the remote then send the keystroke

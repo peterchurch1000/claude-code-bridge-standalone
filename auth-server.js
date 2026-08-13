@@ -17,6 +17,33 @@ const bridgeName = process.env.BRIDGE_NAME || 'Claude Code Bridge Standalone';
 const dbPath = path.join(__dirname, 'auth.db');
 const db = new Database(dbPath);
 
+// -- Production credential delegation (Adlux Production users table) ----------
+// Logins are verified against the live production users table so the bridge
+// uses the exact same email + password as the production Adlux app. The local
+// auth.db still owns the pane mapping (home_path) and sessions; only the
+// password check is delegated. bcrypt ($2y$) hashes verify fine under bcryptjs.
+const mysql = require("mysql2/promise");
+const prodPool = mysql.createPool({
+  host: process.env.PROD_DB_HOST,
+  port: +(process.env.PROD_DB_PORT || 3306),
+  user: process.env.PROD_DB_USERNAME,
+  password: process.env.PROD_DB_PASSWORD,
+  database: process.env.PROD_DB_DATABASE,
+  connectionLimit: 5,
+  waitForConnections: true,
+});
+
+async function verifyProdPassword(email, password) {
+  try {
+    const [rows] = await prodPool.query("SELECT password FROM users WHERE email = ? LIMIT 1", [email]);
+    if (!rows.length || !rows[0].password) return false;
+    return bcrypt.compareSync(password, rows[0].password);
+  } catch (err) {
+    console.error("[auth] prod password check failed:", err.code || err.message);
+    return false; // fail closed
+  }
+}
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -50,6 +77,13 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 `);
+
+// Migration: add home_path column if it doesn't exist
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN home_path TEXT NOT NULL DEFAULT '/peter'`);
+} catch (e) {
+  // column already exists, ignore
+}
 
 // Utility functions
 function verifySessionToken(token) {
@@ -349,7 +383,7 @@ function getForgotPasswordForm(error = null, success = null) {
 <body>
   <div class="container">
     <h1>Reset Password</h1>
-    <div class="subtitle">Enter your email to receive a reset link</div>
+    <div class="subtitle">Manage your password in the Adlux Production app - the bridge uses the same login.</div>
 
     ${error ? `<div class="error">${error}</div>` : ''}
     ${success ? `<div class="success">${success}</div>` : ''}
@@ -498,16 +532,18 @@ app.get('/auth/login', (req, res) => {
   res.set('Content-Type', 'text/html').send(getLoginForm(error));
 });
 
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
     return res.set('Content-Type', 'text/html').send(getLoginForm('Username and password are required'));
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  // Accept either the bridge username or the production email as the identifier.
+  const user = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(username, username);
 
-  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+  // Password is verified against the live production users table (single source of truth).
+  if (!user || !(await verifyProdPassword(user.email, password))) {
     return res.set('Content-Type', 'text/html').send(getLoginForm('Invalid username or password'));
   }
 
@@ -519,7 +555,7 @@ app.post('/auth/login', (req, res) => {
     maxAge: 7 * 24 * 60 * 60 * 1000
   });
 
-  res.redirect('/');
+  res.redirect(user.home_path || '/');
 });
 
 app.get('/auth/logout', (req, res) => {
@@ -612,13 +648,24 @@ app.post('/auth/reset-password', (req, res) => {
 // Verify endpoint (used by nginx)
 app.get('/auth/verify', (req, res) => {
   const token = req.cookies.bridge_session;
-  const user = verifySessionToken(token);
+  const decoded = verifySessionToken(token);
 
-  if (user) {
-    res.status(200).json({ valid: true });
-  } else {
-    res.status(401).json({ valid: false });
+  if (!decoded) {
+    return res.status(401).json({ valid: false });
   }
+
+  // Cross-user path isolation check
+  const originalUri = req.headers['x-original-uri'] || '';
+  const user = db.prepare('SELECT home_path FROM users WHERE id = ?').get(decoded.userId);
+
+  if (user && user.home_path) {
+    // Exempt /auth/ paths from path check (login/logout/reset)
+    if (!originalUri.startsWith('/auth/') && !originalUri.startsWith(user.home_path)) {
+      return res.status(403).json({ valid: false, reason: 'path_mismatch' });
+    }
+  }
+
+  res.status(200).json({ valid: true });
 });
 
 // Health check

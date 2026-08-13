@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MCP Connectors — Claude Code Bridge</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    /* style.css locks html,body to height:100%/overflow:hidden for the chat app's fixed
+       layout. This is a normal scrolling document, so undo that here (this block loads
+       after style.css, so it wins). */
+    html, body { height: auto; min-height: 100%; overflow: auto; }
+    body { margin: 0; font-size: 14px; }
+    #conn-page { max-width: 920px; margin: 0 auto; padding: 18px 20px 60px; color: var(--text); }
+    #conn-top { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+    #conn-top a.back { color: var(--text-dim); text-decoration: none; border: 1px solid var(--border);
+      border-radius: 4px; padding: 3px 9px; font-size: 13px; }
+    #conn-top a.back:hover { color: var(--text); border-color: var(--accent); }
+    #conn-top h1 { font-size: 18px; margin: 0; font-weight: 650; }
+    .conn-sub { color: var(--text-dim); font-size: 12px; margin: 0 0 18px; line-height: 1.5; }
+    .conn-card { background: var(--bg-msg); border: 1px solid var(--border); border-left: 3px solid var(--text-dim);
+      border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+    .conn-card.h-connected { border-left-color: var(--green); }
+    .conn-card.h-needs-auth { border-left-color: var(--yellow); }
+    .conn-card.h-error      { border-left-color: var(--red); }
+    .conn-row1 { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .conn-name { font-weight: 650; font-size: 14px; }
+    .conn-target { color: var(--text-dim); font-size: 11px; font-family: monospace; word-break: break-all; }
+    .conn-badge { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px;
+      padding: 2px 7px; border-radius: 8px; border: 1px solid var(--border); }
+    .b-connected { color: var(--green); border-color: rgba(76,175,125,.4); }
+    .b-needs-auth { color: var(--yellow); border-color: rgba(230,200,74,.4); }
+    .b-error { color: var(--red); border-color: rgba(224,85,85,.4); }
+    .conn-prov { color: var(--text-dim); font-size: 10px; text-transform: uppercase; letter-spacing: .4px; }
+    .conn-meta { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+    .conn-ctl { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); display: flex;
+      flex-direction: column; gap: 9px; }
+    .conn-line { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); }
+    .conn-line label { color: var(--text); }
+    .switch { position: relative; display: inline-block; width: 34px; height: 18px; }
+    .switch input { display: none; }
+    .slider { position: absolute; inset: 0; background: var(--border); border-radius: 18px; transition: .15s; cursor: pointer; }
+    .slider::before { content: ""; position: absolute; height: 14px; width: 14px; left: 2px; top: 2px;
+      background: var(--text-dim); border-radius: 50%; transition: .15s; }
+    .switch input:checked + .slider { background: rgba(76,175,125,.45); }
+    .switch input:checked + .slider::before { transform: translateX(16px); background: var(--green); }
+    .restr-box { width: 100%; }
+    .restr-box textarea { width: 100%; box-sizing: border-box; background: #0f1220; border: 1px solid var(--border);
+      color: var(--text); border-radius: 5px; padding: 6px 8px; font-family: monospace; font-size: 11px; resize: vertical; }
+    .restr-hint { color: var(--text-dim); font-size: 10.5px; margin-top: 3px; line-height: 1.4; }
+    button.act { background: none; border: 1px solid var(--border); color: var(--text-dim); border-radius: 4px;
+      padding: 3px 10px; font-size: 12px; cursor: pointer; transition: .15s; }
+    button.act:hover { color: var(--text); border-color: var(--accent); }
+    button.act.danger:hover { color: var(--red); border-color: var(--red); }
+    button.act.primary { color: var(--accent); border-color: rgba(74,158,255,.4); }
+    button.act.save { color: var(--green); border-color: rgba(76,175,125,.4); }
+    #add-card { background: var(--bg-msg); border: 1px dashed var(--border); border-radius: 8px; padding: 14px; margin-bottom: 22px; }
+    #add-card h2 { font-size: 13px; margin: 0 0 10px; }
+    .fld { display: flex; flex-direction: column; gap: 4px; margin-bottom: 9px; }
+    .fld label { font-size: 11px; color: var(--text-dim); }
+    .fld input, .fld select { background: #0f1220; border: 1px solid var(--border); color: var(--text);
+      border-radius: 5px; padding: 6px 8px; font-size: 13px; }
+    .hdr-rows { display: flex; flex-direction: column; gap: 6px; }
+    .hdr-row { display: flex; gap: 6px; }
+    .hdr-row input { flex: 1; }
+    .hidden { display: none !important; }
+    .empty { color: var(--text-dim); font-style: italic; font-size: 12px; padding: 10px 2px; }
+    #toast-container { position: fixed; top: 14px; right: 14px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  </style>
+</head>
+<body>
+<div id="conn-page">
+  <div id="conn-top">
+    <a class="back" href="index.html">← Chat</a>
+    <h1>⚙ MCP Connectors</h1>
+  </div>
+  <p class="conn-sub">
+    Connect email, calendar, documents and other systems. Each connector is its own
+    named MCP server — add the same provider more than once (different names) to connect
+    several accounts (e.g. <code>gmail-peter</code>, <code>gmail-sales</code>). The
+    autonomous loop may <strong>read &amp; prepare</strong>; it is blocked from the
+    <strong>restricted actions</strong> you list per connector (e.g. sending mail) until
+    you approve them.
+  </p>
+
+  <div id="add-card">
+    <h2>Add a connector</h2>
+    <div class="fld">
+      <label>Provider preset</label>
+      <select id="f-preset">
+        <option value="generic-http">Generic — HTTP server</option>
+        <option value="generic-sse">Generic — SSE server</option>
+        <option value="generic-stdio">Generic — stdio command</option>
+        <option value="gmail">Google Gmail</option>
+        <option value="gcal">Google Calendar</option>
+        <option value="gdrive">Google Drive</option>
+        <option value="msgraph">Microsoft Graph (Outlook mail / calendar)</option>
+      </select>
+    </div>
+    <div class="fld">
+      <label>Name (unique — used in tool names, e.g. <code>gmail-peter</code>)</label>
+      <input id="f-name" type="text" placeholder="gmail-peter" autocomplete="off" />
+    </div>
+    <div class="fld" id="wrap-url">
+      <label>URL</label>
+      <input id="f-url" type="text" placeholder="https://…/mcp" autocomplete="off" />
+    </div>
+    <div class="fld hidden" id="wrap-cmd">
+      <label>Command + args (space-separated)</label>
+      <input id="f-cmd" type="text" placeholder="npx some-mcp-server --flag" autocomplete="off" />
+    </div>
+    <div class="fld" id="wrap-headers">
+      <label>Auth headers / env (optional) — key + value</label>
+      <div class="hdr-rows" id="hdr-rows"></div>
+      <button class="act" id="btn-add-hdr" type="button" style="align-self:flex-start;margin-top:4px;">+ add header</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:4px;">
+      <button class="act primary" id="btn-add" type="button">Add connector</button>
+      <span id="add-note" class="restr-hint" style="align-self:center;"></span>
+    </div>
+  </div>
+
+  <div id="conn-list"><div class="empty">Loading…</div></div>
+</div>
+
+<div id="toast-container"></div>
+<script src="connectors.js"></script>
+</body>
+</html>

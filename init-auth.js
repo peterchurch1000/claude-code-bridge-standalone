@@ -39,16 +39,16 @@ function createSchema() {
   console.log('✓ Database schema created');
 }
 
-function createUser(username, password, email) {
+function createUser(username, password, email, homePath = '/peter') {
   const passwordHash = bcrypt.hashSync(password, 10);
 
   try {
     const stmt = db.prepare(`
-      INSERT INTO users (username, email, password_hash)
-      VALUES (?, ?, ?)
+      INSERT INTO users (username, email, password_hash, home_path)
+      VALUES (?, ?, ?, ?)
     `);
-    const result = stmt.run(username, email, passwordHash);
-    console.log(`✓ User created: ${username} (ID: ${result.lastInsertRowid})`);
+    const result = stmt.run(username, email, passwordHash, homePath);
+    console.log(`✓ User created: ${username} (ID: ${result.lastInsertRowid}, home: ${homePath})`);
     return result.lastInsertRowid;
   } catch (err) {
     if (err.message.includes('UNIQUE constraint failed')) {
@@ -81,17 +81,23 @@ function main() {
       console.error('Error: create-user requires username, password, and email');
       process.exit(1);
     }
+    // Parse optional --home-path flag
+    let homePath = '/peter';
+    const homePathIdx = args.indexOf('--home-path');
+    if (homePathIdx !== -1 && homePathIdx + 1 < args.length) {
+      homePath = args[homePathIdx + 1];
+    }
     createSchema();
-    createUser(args[1], args[2], args[3]);
+    createUser(args[1], args[2], args[3], homePath);
   } else if (command === 'list-users') {
     createSchema();
-    const users = db.prepare('SELECT id, username, email, created_at FROM users').all();
+    const users = db.prepare('SELECT id, username, email, home_path, created_at FROM users').all();
     if (users.length === 0) {
       console.log('No users found');
     } else {
       console.log('Users:');
       users.forEach(user => {
-        console.log(`  ${user.id}: ${user.username} (${user.email}) - ${user.created_at}`);
+        console.log(`  ${user.id}: ${user.username} (${user.email}) → ${user.home_path} - ${user.created_at}`);
       });
     }
   } else {
