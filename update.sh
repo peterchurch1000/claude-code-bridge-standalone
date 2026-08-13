@@ -15,7 +15,7 @@ echo ""
 cd "$SCRIPT_DIR"
 
 echo "[1/3] Pulling latest code from GitHub..."
-git pull origin master
+git pull origin main
 
 echo "[2/3] Installing/updating Node dependencies..."
 npm install --production --silent
