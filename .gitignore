@@ -128,3 +128,7 @@ auth.db
 chat.db
 # Local user-seeding scripts with plaintext test passwords
 create-users.js
+start.sh
+start-browser.sh
+auth-server.js
+init-auth.js
