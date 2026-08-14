@@ -1074,39 +1074,35 @@ app.post('/accounts/delete', (req, res) => {
   }
 });
 
-// ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1] ─
-// Codex has no paste-back token flow like Claude's. `codex login --device-auth`
-// prints an auth.openai.com URL + a one-time code, then polls until the user
-// enters that code in a browser and approves — on success it writes
-// ~/.codex/auth.json and exits. We keep the process running detached, surface
-// {url, code} to the UI, and let the UI poll /codex/auth/status. State is kept
-// separate from the Claude authProc so the two sign-in flows never clobber.
-let cxProc = null, cxBuf = '', cxUrl = '', cxCode = '', cxDone = false, cxResult = null, cxName = 'peter';
+// ── Codex (ChatGPT) re-authentication via browser OAuth [CODEX_BROWSER_AUTH_V2] ─
+// The device-code flow (`codex login --device-auth`) yields a REDUCED-scope token
+// (missing api.connectors.read/invoke) that stalls codex_apps/connector calls and
+// hangs every turn. The full browser flow (`codex login`) requests those scopes and
+// redirects to http://localhost:1455/auth/callback on THIS host. We surface the auth
+// URL, let the user sign in in any browser, and paste back the localhost redirect URL
+// they land on; we relay it to codex's local callback server to finish the exchange
+// (full scopes). Same paste-back shape as the Claude flow; state kept separate.
+let cxProc = null, cxBuf = '', cxUrl = '', cxDone = false, cxResult = null, cxName = 'peter';
 function killCodexAuth() {
   if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
   cxProc = null;
 }
-function parseCodexDevice(buf) {
-  const lines = stripAnsiSeq(buf).replace(/\r/g, '\n').split('\n').map(l => l.trim());
-  let url = '', code = '';
-  for (const ln of lines) {
-    if (!url) { const m = ln.match(/https:\/\/auth\.openai\.com\/\S+/); if (m) url = m[0]; }
-    if (!code) { const m = ln.match(/^[A-Z0-9]{3,6}-[A-Z0-9]{3,6}$/); if (m) code = m[0]; }
-  }
-  return { url, code };
+function parseCodexAuthUrl(buf) {
+  const s = stripAnsiSeq(buf).replace(/\r/g, '\n');
+  const m = s.match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?\S+/);
+  return m ? m[0].replace(/["'\)\]\s]+$/, '') : '';
 }
 app.post('/codex/auth/start', (req, res) => {
   try {
     killCodexAuth();
-    cxBuf = ''; cxUrl = ''; cxCode = ''; cxDone = false; cxResult = null;
+    cxBuf = ''; cxUrl = ''; cxDone = false; cxResult = null;
     cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
-    const env = { ...process.env }; delete env.DISPLAY;
-    cxProc = spawn('script', ['-qfc', 'stty cols 400 rows 60; codex login --device-auth', '/dev/null'],
-      { env, cwd: os.homedir(), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
-    const onData = d => {
-      cxBuf += d.toString('utf8');
-      if (!cxUrl || !cxCode) { const p = parseCodexDevice(cxBuf); if (p.url) cxUrl = p.url; if (p.code) cxCode = p.code; }
-    };
+    // Full browser flow (NOT --device-auth): grants api.connectors.* scopes. Starts a
+    // local callback server on 127.0.0.1:1455 and prints the auth URL. BROWSER=/bin/true
+    // + no DISPLAY stop codex trying to spawn a local GUI browser.
+    const env = { ...process.env, BROWSER: '/bin/true' }; delete env.DISPLAY;
+    cxProc = spawn('codex', ['login'], { env, cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const onData = d => { cxBuf += d.toString('utf8'); if (!cxUrl) { const u = parseCodexAuthUrl(cxBuf); if (u) cxUrl = u; } };
     cxProc.stdout.on('data', onData);
     cxProc.stderr.on('data', onData);
     cxProc.on('exit', () => {
@@ -1116,25 +1112,41 @@ app.post('/codex/auth/start', (req, res) => {
       if (ok) {
         try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
         try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
-        cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' \u2014 saved as \u201c' + cxName + '\u201d.' };
+        cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' — saved as “' + cxName + '”.' };
       } else {
         const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(s => s.trim()).filter(Boolean);
         const fail = [...clean].reverse().find(l => /fail|error|invalid|expired|denied|cancel|timed? ?out/i.test(l));
-        cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' \u2014 ' + fail : '.') };
+        cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : '.') };
       }
       cxProc = null;
     });
     let settled = false; const t0 = Date.now();
     const iv = setInterval(() => {
       if (settled) return;
-      if (cxUrl && cxCode) { settled = true; clearInterval(iv); res.json({ ok: true, url: cxUrl, code: cxCode }); }
-      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the device code.' }); }
+      if (cxUrl) { settled = true; clearInterval(iv); res.json({ ok: true, url: cxUrl }); }
+      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in URL.' }); }
     }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Relay the pasted localhost:1455 redirect URL to codex's local callback server so the
+// running `codex login` finishes the token exchange, writes auth.json and exits (the
+// on-exit handler above turns that into a saved account).
+app.post('/codex/auth/complete', (req, res) => {
+  try {
+    if (!cxProc) return res.status(400).json({ ok: false, error: 'No sign-in in progress — click Start again.' });
+    const raw = String((req.body && req.body.url) || '').trim();
+    let relayPath = '';
+    try { const u = new URL(raw); if (u.port === '1455' || u.hostname === 'localhost' || u.hostname === '127.0.0.1') relayPath = u.pathname + u.search; } catch {}
+    if (!relayPath) { const m = raw.match(/(?:^|[?&])code=[^\s#]+/); if (m) relayPath = '/auth/callback?' + raw.replace(/^[?]/, ''); }
+    if (!/[?&]code=/.test(relayPath)) return res.status(400).json({ ok: false, error: 'That is not the localhost:1455 sign-in URL (no code found). Copy the whole address the browser landed on.' });
+    const req2 = require('http').get({ host: '127.0.0.1', port: 1455, path: relayPath, timeout: 10000 }, resp => { resp.resume(); res.json({ ok: true, relayed: true, status: resp.statusCode || 0 }); });
+    req2.on('timeout', () => { req2.destroy(); });
+    req2.on('error', e => { if (!res.headersSent) res.status(502).json({ ok: false, error: 'Could not reach the local sign-in server: ' + e.message }); });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get('/codex/auth/status', (req, res) => {
   if (cxDone) return res.json({ ok: true, done: true, result: cxResult || { ok: false, message: 'Unknown.' } });
-  res.json({ ok: true, done: false, running: !!cxProc });
+  res.json({ ok: true, done: false, running: !!cxProc, haveUrl: !!cxUrl });
 });
 app.post('/codex/auth/cancel', (req, res) => { killCodexAuth(); res.json({ ok: true }); });
 

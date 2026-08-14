@@ -2469,25 +2469,27 @@
 
   // ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1]
   function openCodexAuth(name) {
+    /* CODEX_BROWSER_AUTH_V2: full browser-OAuth flow (grants api.connectors.* scopes);
+       user pastes back the localhost:1455 redirect URL, backend relays it to codex. */
     document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
     const ov = document.createElement('div');
     ov.className = 'cauth-overlay';
     ov.innerHTML = `
       <div class="cauth-modal">
-        <div class="cauth-head"><span>\u21bb Re-authenticate Codex \u2014 ${name}</span><button class="cauth-x" title="Close">\u2715</button></div>
+        <div class="cauth-head"><span>↻ Re-authenticate Codex — ${name}</span><button class="cauth-x" title="Close">✕</button></div>
         <div class="cauth-body">
-          <p class="cauth-intro">Refresh this Codex (ChatGPT) login. Click start, open the link in the browser, sign in, then enter the one-time code shown below. This window updates automatically when it completes.</p>
+          <p class="cauth-intro">Refresh this Codex (ChatGPT) login with full scopes. Click start, open the link, sign in &amp; approve. Your browser will then try to open a <code>localhost:1455</code> page that won’t load — copy that whole address and paste it below.</p>
           <button class="cauth-btn" id="cxauth-start">Start sign-in</button>
           <div id="cxauth-step2" class="cauth-hidden">
             <p><b>1.</b> Open this link and sign in with ChatGPT:</p>
             <div class="cauth-linkrow">
-              <a id="cxauth-link" target="_blank" rel="noopener">Open device sign-in \u2197</a>
+              <a id="cxauth-link" target="_blank" rel="noopener">Open ChatGPT sign-in ↗</a>
               <button class="cauth-btn cauth-sm" id="cxauth-copy">Copy link</button>
             </div>
-            <p><b>2.</b> Enter this one-time code <span style="opacity:.6">(expires in 15 min)</span>:</p>
+            <p><b>2.</b> After approving, paste the <code>localhost:1455</code> address your browser lands on:</p>
             <div class="cauth-linkrow">
-              <code id="cxauth-code" style="font-size:20px;font-weight:700;letter-spacing:2px;user-select:all;padding:2px 6px"></code>
-              <button class="cauth-btn cauth-sm" id="cxauth-copycode">Copy code</button>
+              <input id="cxauth-url" type="text" placeholder="http://localhost:1455/auth/callback?code=…" autocomplete="off" spellcheck="false" style="flex:1;min-width:0" />
+              <button class="cauth-btn cauth-sm" id="cxauth-submit">Finish</button>
             </div>
           </div>
           <div id="cxauth-msg" class="cauth-msg"></div>
@@ -2501,30 +2503,46 @@
     ov.querySelector('.cauth-x').addEventListener('click', close);
     ov.addEventListener('click', e => { if (e.target === ov) close(); });
     const startBtn = ov.querySelector('#cxauth-start');
+    const startPoll = () => {
+      if (pollTimer) return;
+      pollTimer = setInterval(async () => {
+        try {
+          const s = await fetch(`${API_BASE}/codex/auth/status`); const sd = await s.json();
+          if (sd.done) {
+            clearInterval(pollTimer); pollTimer = null;
+            const rr = sd.result || {};
+            if (rr.ok) { setMsg('✓ ' + (rr.message || 'Re-authenticated.'), 'ok'); setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage(); if (typeof updateTitlebar === 'function') updateTitlebar(); }, 2200); }
+            else setMsg(rr.message || 'Sign-in did not complete.', 'err');
+          } else if (!sd.running) { clearInterval(pollTimer); pollTimer = null; setMsg('Sign-in process ended — try again.', 'err'); }
+        } catch (_) {}
+      }, 2500);
+    };
     startBtn.addEventListener('click', async () => {
-      startBtn.disabled = true; setMsg('Starting sign-in\u2026', 'info');
+      startBtn.disabled = true; setMsg('Starting sign-in…', 'info');
       try {
         const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
         const d = await r.json();
-        if (!r.ok || !d.url || !d.code) throw new Error(d.error || 'Could not start sign-in.');
+        if (!r.ok || !d.url) throw new Error(d.error || 'Could not start sign-in.');
         ov.querySelector('#cxauth-link').href = d.url;
-        ov.querySelector('#cxauth-code').textContent = d.code;
         ov.querySelector('#cxauth-step2').classList.remove('cauth-hidden');
         startBtn.classList.add('cauth-hidden');
-        setMsg('Waiting for you to approve in the browser\u2026', 'info');
+        setMsg('Sign in, approve, then paste the localhost address below.', 'info');
         ov.querySelector('#cxauth-copy').addEventListener('click', () => navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => {}));
-        ov.querySelector('#cxauth-copycode').addEventListener('click', () => navigator.clipboard.writeText(d.code).then(() => setMsg('Code copied.', 'info'), () => {}));
-        pollTimer = setInterval(async () => {
+        const submit = ov.querySelector('#cxauth-submit');
+        const urlInp = ov.querySelector('#cxauth-url');
+        const doSubmit = async () => {
+          const val = (urlInp.value || '').trim();
+          if (!/code=/.test(val)) { setMsg('Paste the full localhost:1455 address (it contains code=…).', 'err'); return; }
+          submit.disabled = true; setMsg('Finishing sign-in…', 'info');
           try {
-            const s = await fetch(`${API_BASE}/codex/auth/status`); const sd = await s.json();
-            if (sd.done) {
-              clearInterval(pollTimer); pollTimer = null;
-              const rr = sd.result || {};
-              if (rr.ok) { setMsg('\u2713 ' + (rr.message || 'Re-authenticated.'), 'ok'); setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage(); if (typeof updateTitlebar === 'function') updateTitlebar(); }, 2200); }
-              else setMsg(rr.message || 'Sign-in did not complete.', 'err');
-            } else if (!sd.running) { clearInterval(pollTimer); pollTimer = null; setMsg('Sign-in process ended \u2014 try again.', 'err'); }
-          } catch (_) {}
-        }, 2500);
+            const cr = await fetch(`${API_BASE}/codex/auth/complete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: val }) });
+            const cd = await cr.json();
+            if (!cr.ok) throw new Error(cd.error || 'Could not finish sign-in.');
+            setMsg('Completing…', 'info'); startPoll();
+          } catch (e) { submit.disabled = false; setMsg(e.message, 'err'); }
+        };
+        submit.addEventListener('click', doSubmit);
+        urlInp.addEventListener('keydown', e => { if (e.key === 'Enter') doSubmit(); });
       } catch (e) { startBtn.disabled = false; setMsg(e.message, 'err'); }
     });
   }
