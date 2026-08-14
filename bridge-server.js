@@ -2178,7 +2178,7 @@ function makeSession(key) {
     const args = ['exec'];
     if (S.threadId) args.push('resume', S.threadId);
     const _mcpUrl = S._codexMcpUrl();
-    args.push('--json', '--dangerously-bypass-hook-trust', text);
+    args.push('--json', '--skip-git-repo-check', '--dangerously-bypass-hook-trust', text);
     const env = { ...process.env };
     if (!env.HOME) env.HOME = os.homedir();
     // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
