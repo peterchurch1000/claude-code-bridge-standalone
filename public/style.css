@@ -412,7 +412,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .task-badge.task-badge-untyped { opacity: 0.6; }
 /* Question dot + status chip share the status column, right-aligned. */
 .task-status-cell { display: flex; align-items: center; justify-content: flex-end; gap: 3px; min-width: 0; }
-.task-status-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; cursor: pointer; box-shadow: 0 0 0 1px rgba(0,0,0,0.25); }
+.task-status-dot { flex: none; width: 11px; height: 11px; border-radius: 50%; cursor: pointer; box-shadow: 0 0 0 1px rgba(0,0,0,0.25); }
 .task-status-dot.q-pending  { background: var(--red);   animation: qdot-pulse 1.6s ease-in-out infinite; }
 .task-status-dot.q-answered { background: var(--green); }
 @keyframes qdot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
@@ -505,6 +505,32 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .tc-cancel:hover { color: var(--text); border-color: var(--text-dim); }
 .tc-ok { background: var(--red); border-color: var(--red); color: #fff; font-weight: 600; }
 .tc-ok:hover { filter: brightness(1.1); }
+
+/* ── Task-details modal: modern inputs & buttons (was default-browser chrome) ── */
+.task-details textarea,
+.task-details input[type="text"],
+.task-details input:not([type]) {
+  background: var(--bg-msg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 8px 10px; font-size: 13px; font-family: inherit;
+  line-height: 1.4; box-sizing: border-box; transition: border-color .15s; width: 100%;
+}
+.task-details textarea:focus,
+.task-details input:focus { outline: none; border-color: var(--accent); }
+.task-details textarea::placeholder,
+.task-details input::placeholder { color: var(--text-dim); }
+.task-details .tc-ok,
+.task-details .tc-cancel,
+.task-details .q-run {
+  font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px; padding: 7px 14px;
+  transition: filter .15s, border-color .15s, color .15s;
+}
+.task-details .tc-ok  { background: var(--accent); border-color: var(--accent); color: #fff; }
+.task-details .tc-ok:hover  { filter: brightness(1.1); }
+.task-details .q-run  { background: var(--green); border-color: var(--green); color: #fff; }
+.task-details .q-run:hover  { filter: brightness(1.1); }
+.task-details .tc-cancel { background: none; color: var(--text-dim); font-weight: 500; }
+.task-details .tc-cancel:hover { color: var(--text); border-color: var(--text-dim); }
 
 /* ── Settings panel overlay ── */
 #settings-panel {

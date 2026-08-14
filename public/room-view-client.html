@@ -124,6 +124,44 @@
   // (relay re-activates + re-casts the room => a fresh full paint).
   window.__rfbReconnect = function () { try { if (ws) ws.close(); } catch (e) {} };
 
+  // Mobile soft-keyboard bridge. The parent (app.js) raises the OS keyboard via a
+  // hidden field and forwards each keystroke here as an X11 keysym. Printable
+  // keysyms → Input.insertText (k:'text'); named keys (Backspace/Enter/arrows…) →
+  // a keyDown+keyUp pair the relay maps to Input.dispatchKeyEvent. Without this the
+  // parent's __rfbSendKey call throws (swallowed) and Android typing does nothing.
+  const KBD_KEYMAP = {
+    0xff08: { key: 'Backspace', code: 'Backspace', vk: 8 },
+    0xff09: { key: 'Tab',       code: 'Tab',       vk: 9 },
+    0xff0d: { key: 'Enter',     code: 'Enter',     vk: 13 },
+    0xff1b: { key: 'Escape',    code: 'Escape',    vk: 27 },
+    0xffff: { key: 'Delete',    code: 'Delete',    vk: 46 },
+    0xff50: { key: 'Home',      code: 'Home',      vk: 36 },
+    0xff51: { key: 'ArrowLeft', code: 'ArrowLeft', vk: 37 },
+    0xff52: { key: 'ArrowUp',   code: 'ArrowUp',   vk: 38 },
+    0xff53: { key: 'ArrowRight',code: 'ArrowRight',vk: 39 },
+    0xff54: { key: 'ArrowDown', code: 'ArrowDown', vk: 40 },
+    0xff55: { key: 'PageUp',    code: 'PageUp',    vk: 33 },
+    0xff56: { key: 'PageDown',  code: 'PageDown',  vk: 34 },
+    0xff57: { key: 'End',       code: 'End',       vk: 35 },
+  };
+  window.__rfbSendKey = function (ks, down) {
+    const sp = KBD_KEYMAP[ks];
+    if (sp) {
+      cv.focus();
+      if (down === undefined) {
+        sendJSON({ k: 'key', type: 'keyDown', key: sp.key, code: sp.code, vk: sp.vk, modifiers: 0 });
+        sendJSON({ k: 'key', type: 'keyUp',   key: sp.key, code: sp.code, vk: sp.vk, modifiers: 0 });
+      } else {
+        sendJSON({ k: 'key', type: down ? 'keyDown' : 'keyUp', key: sp.key, code: sp.code, vk: sp.vk, modifiers: 0 });
+      }
+      return;
+    }
+    if (down === false) return;               // release of a printable char: nothing to insert
+    let ch;
+    try { ch = ks >= 0x01000000 ? String.fromCodePoint(ks - 0x01000000) : String.fromCharCode(ks); } catch (e) { ch = ''; }
+    if (ch) sendJSON({ k: 'text', text: ch });
+  };
+
   const img = new Image();
   let painting = false, queued = null;
   function drawFrame(m) {

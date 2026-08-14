@@ -1074,6 +1074,70 @@ app.post('/accounts/delete', (req, res) => {
   }
 });
 
+// ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1] ─
+// Codex has no paste-back token flow like Claude's. `codex login --device-auth`
+// prints an auth.openai.com URL + a one-time code, then polls until the user
+// enters that code in a browser and approves — on success it writes
+// ~/.codex/auth.json and exits. We keep the process running detached, surface
+// {url, code} to the UI, and let the UI poll /codex/auth/status. State is kept
+// separate from the Claude authProc so the two sign-in flows never clobber.
+let cxProc = null, cxBuf = '', cxUrl = '', cxCode = '', cxDone = false, cxResult = null, cxName = 'peter';
+function killCodexAuth() {
+  if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
+  cxProc = null;
+}
+function parseCodexDevice(buf) {
+  const lines = stripAnsiSeq(buf).replace(/\r/g, '\n').split('\n').map(l => l.trim());
+  let url = '', code = '';
+  for (const ln of lines) {
+    if (!url) { const m = ln.match(/https:\/\/auth\.openai\.com\/\S+/); if (m) url = m[0]; }
+    if (!code) { const m = ln.match(/^[A-Z0-9]{3,6}-[A-Z0-9]{3,6}$/); if (m) code = m[0]; }
+  }
+  return { url, code };
+}
+app.post('/codex/auth/start', (req, res) => {
+  try {
+    killCodexAuth();
+    cxBuf = ''; cxUrl = ''; cxCode = ''; cxDone = false; cxResult = null;
+    cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
+    const env = { ...process.env }; delete env.DISPLAY;
+    cxProc = spawn('script', ['-qfc', 'stty cols 400 rows 60; codex login --device-auth', '/dev/null'],
+      { env, cwd: os.homedir(), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const onData = d => {
+      cxBuf += d.toString('utf8');
+      if (!cxUrl || !cxCode) { const p = parseCodexDevice(cxBuf); if (p.url) cxUrl = p.url; if (p.code) cxCode = p.code; }
+    };
+    cxProc.stdout.on('data', onData);
+    cxProc.stderr.on('data', onData);
+    cxProc.on('exit', () => {
+      cxDone = true;
+      let ok = false, email = '';
+      try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
+      if (ok) {
+        try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
+        try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+        cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' \u2014 saved as \u201c' + cxName + '\u201d.' };
+      } else {
+        const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(s => s.trim()).filter(Boolean);
+        const fail = [...clean].reverse().find(l => /fail|error|invalid|expired|denied|cancel|timed? ?out/i.test(l));
+        cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' \u2014 ' + fail : '.') };
+      }
+      cxProc = null;
+    });
+    let settled = false; const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (settled) return;
+      if (cxUrl && cxCode) { settled = true; clearInterval(iv); res.json({ ok: true, url: cxUrl, code: cxCode }); }
+      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the device code.' }); }
+    }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/codex/auth/status', (req, res) => {
+  if (cxDone) return res.json({ ok: true, done: true, result: cxResult || { ok: false, message: 'Unknown.' } });
+  res.json({ ok: true, done: false, running: !!cxProc });
+});
+app.post('/codex/auth/cancel', (req, res) => { killCodexAuth(); res.json({ ok: true }); });
+
 // ── Global session search ──────────────────────────────────────────────────
 // Full-text search across EVERY session's message history (transcripts are the
 // complete record; chat.db fills gaps). Returns matching sessions with hit count

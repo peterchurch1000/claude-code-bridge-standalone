@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=4&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=5&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {
@@ -2467,6 +2467,68 @@
     ov.querySelector('#cauth-code').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
   }
 
+  // ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1]
+  function openCodexAuth(name) {
+    document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
+    const ov = document.createElement('div');
+    ov.className = 'cauth-overlay';
+    ov.innerHTML = `
+      <div class="cauth-modal">
+        <div class="cauth-head"><span>\u21bb Re-authenticate Codex \u2014 ${name}</span><button class="cauth-x" title="Close">\u2715</button></div>
+        <div class="cauth-body">
+          <p class="cauth-intro">Refresh this Codex (ChatGPT) login. Click start, open the link in the browser, sign in, then enter the one-time code shown below. This window updates automatically when it completes.</p>
+          <button class="cauth-btn" id="cxauth-start">Start sign-in</button>
+          <div id="cxauth-step2" class="cauth-hidden">
+            <p><b>1.</b> Open this link and sign in with ChatGPT:</p>
+            <div class="cauth-linkrow">
+              <a id="cxauth-link" target="_blank" rel="noopener">Open device sign-in \u2197</a>
+              <button class="cauth-btn cauth-sm" id="cxauth-copy">Copy link</button>
+            </div>
+            <p><b>2.</b> Enter this one-time code <span style="opacity:.6">(expires in 15 min)</span>:</p>
+            <div class="cauth-linkrow">
+              <code id="cxauth-code" style="font-size:20px;font-weight:700;letter-spacing:2px;user-select:all;padding:2px 6px"></code>
+              <button class="cauth-btn cauth-sm" id="cxauth-copycode">Copy code</button>
+            </div>
+          </div>
+          <div id="cxauth-msg" class="cauth-msg"></div>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    const msg = ov.querySelector('#cxauth-msg');
+    const setMsg = (t, kind) => { msg.textContent = t || ''; msg.className = 'cauth-msg' + (kind ? ' cauth-' + kind : ''); };
+    let pollTimer = null;
+    const close = () => { if (pollTimer) clearInterval(pollTimer); try { fetch(`${API_BASE}/codex/auth/cancel`, { method: 'POST' }); } catch (_) {} ov.remove(); };
+    ov.querySelector('.cauth-x').addEventListener('click', close);
+    ov.addEventListener('click', e => { if (e.target === ov) close(); });
+    const startBtn = ov.querySelector('#cxauth-start');
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true; setMsg('Starting sign-in\u2026', 'info');
+      try {
+        const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+        const d = await r.json();
+        if (!r.ok || !d.url || !d.code) throw new Error(d.error || 'Could not start sign-in.');
+        ov.querySelector('#cxauth-link').href = d.url;
+        ov.querySelector('#cxauth-code').textContent = d.code;
+        ov.querySelector('#cxauth-step2').classList.remove('cauth-hidden');
+        startBtn.classList.add('cauth-hidden');
+        setMsg('Waiting for you to approve in the browser\u2026', 'info');
+        ov.querySelector('#cxauth-copy').addEventListener('click', () => navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => {}));
+        ov.querySelector('#cxauth-copycode').addEventListener('click', () => navigator.clipboard.writeText(d.code).then(() => setMsg('Code copied.', 'info'), () => {}));
+        pollTimer = setInterval(async () => {
+          try {
+            const s = await fetch(`${API_BASE}/codex/auth/status`); const sd = await s.json();
+            if (sd.done) {
+              clearInterval(pollTimer); pollTimer = null;
+              const rr = sd.result || {};
+              if (rr.ok) { setMsg('\u2713 ' + (rr.message || 'Re-authenticated.'), 'ok'); setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage(); if (typeof updateTitlebar === 'function') updateTitlebar(); }, 2200); }
+              else setMsg(rr.message || 'Sign-in did not complete.', 'err');
+            } else if (!sd.running) { clearInterval(pollTimer); pollTimer = null; setMsg('Sign-in process ended \u2014 try again.', 'err'); }
+          } catch (_) {}
+        }, 2500);
+      } catch (e) { startBtn.disabled = false; setMsg(e.message, 'err'); }
+    });
+  }
+
   // ── Account switcher (rotate between saved Claude accounts) ───────────────
   const btnSwitchAccount = document.getElementById('btn-switch-account');
   if (btnSwitchAccount) {
@@ -2575,6 +2637,11 @@
             const del = document.createElement('span'); del.className = 'acct-edit acct-del'; del.textContent = '🗑'; del.title = 'Delete this saved account';
             del.addEventListener('click', e => { e.stopPropagation(); doDelete(a.name, a.type, isActive); });
             top.appendChild(del);
+          } else {
+            /* CODEX_DEVICE_AUTH_V1: Codex rows get a re-auth button (no delete — one login) */
+            const reauth = document.createElement('span'); reauth.className = 'acct-edit acct-reauth'; reauth.textContent = '\u21bb'; reauth.title = 'Re-authenticate this Codex login';
+            reauth.addEventListener('click', e => { e.stopPropagation(); ov.remove(); openCodexAuth(a.name); });
+            top.appendChild(reauth);
           }
           const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = a.email || '';
           b.appendChild(top); b.appendChild(em);
@@ -2661,9 +2728,9 @@
 
   // Organiser task "type" shown on the badge (in place of status).
   const typeClass  = t => 't-' + String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  const SHORT_TYPE = { 'ai': 'AI', 'task to block': 'BLOCK', 'communication': 'COMMS',
-    'idea/concept': 'IDEA', 'analysis': 'ANALYSIS', 'meeting item': 'MEETING' };
-  const shortType = t => { const k = String(t || '').trim().toLowerCase(); return SHORT_TYPE[k] || String(t || '').trim(); };
+  const SHORT_TYPE = { 'ai': 'AI', 'task to block': 'BLK', 'communication': 'COM',
+    'idea/concept': 'IDE', 'analysis': 'ANA', 'meeting item': 'MTG' };
+  const shortType = t => { const k = String(t || '').trim().toLowerCase(); return (SHORT_TYPE[k] || String(t || '').trim()).slice(0, 3); };
 
   const STATUS_RANK = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3,
     'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
@@ -2889,14 +2956,35 @@
   function openTaskDetails(t) {
     const base = `${API_BASE}/tasks/${encodeURIComponent(t.file)}`;
     const ov = document.createElement('div'); ov.className = 'task-confirm-overlay'; ov.style.zIndex = '100000';
-    const box = document.createElement('div'); box.className = 'task-confirm';
+    const box = document.createElement('div'); box.className = 'task-confirm task-details';
     box.style.cssText = 'max-width:720px;width:92%;max-height:88vh;display:flex;flex-direction:column;text-align:left;gap:12px';
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px';
     const ttl = document.createElement('div'); ttl.textContent = t.title || t.file;
     ttl.style.cssText = 'font-weight:600;font-size:14px;word-break:break-word';
     const x = document.createElement('button'); x.textContent = '✕'; x.className = 'tc-cancel'; x.style.flex = '0 0 auto';
-    head.appendChild(ttl); head.appendChild(x);
+    // Jump straight to this task's live room (autonomy per-task room = full
+    // running context up to the last turn; falls back to any linked chat thread).
+    const roomLink = document.createElement('a');
+    roomLink.textContent = '↗ Live room';
+    roomLink.style.cssText = 'flex:0 0 auto;font-size:12px;font-weight:600;color:var(--accent);cursor:pointer;text-decoration:none;white-space:nowrap';
+    roomLink.title = "Open this task's live room (full running context)";
+    roomLink.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const label = roomLink.textContent; roomLink.textContent = '…';
+      let sid = '';
+      try {
+        const d = await (await fetch(`${API_BASE}/sessions`, { cache: 'no-store' })).json();
+        const list = (d && d.sessions) || [];
+        const match = list.find(s => { const m = String(s.taskRoom || '').match(/^(?:task-)+(\d+)-/); return m && String(m[1]) === String(t.id); });
+        sid = (match && match.id) || (t.session || '');
+      } catch (_) {}
+      roomLink.textContent = label;
+      if (!sid) { showToast('No live room yet for this task', 'info'); return; }
+      close();
+      switchToSession(sid);
+    });
+    head.appendChild(ttl); head.appendChild(roomLink); head.appendChild(x);
     const bodyWrap = document.createElement('div');
     bodyWrap.style.cssText = 'overflow:auto;display:flex;flex-direction:column;gap:16px;flex:1 1 auto';
     box.appendChild(head); box.appendChild(bodyWrap); ov.appendChild(box); document.body.appendChild(ov);
@@ -2919,7 +3007,7 @@
       const box = el('div', 'display:flex;gap:6px;margin-top:8px'); box.className = 'q-answerbox';
       const ta = el('textarea', 'flex:1 1 auto;font-family:inherit;font-size:13px;line-height:1.4;padding:8px 10px;min-height:96px;resize:vertical'); ta.placeholder = 'Type your answer…'; if (q.answer) ta.value = q.answer;
       const btn = el('button', 'flex:0 0 auto', 'Submit'); btn.className = 'tc-ok';
-      const btnRun = el('button', 'flex:0 0 auto', 'Submit & Run'); btnRun.className = 'tc-ok'; btnRun.title = 'Save the answer and run this task now if any Claude quota is free';
+      const btnRun = el('button', 'flex:0 0 auto', 'Submit & Run'); btnRun.className = 'q-run'; btnRun.title = 'Save the answer and run this task now if any Claude quota is free';
       const submit = async (run) => {
         const v = ta.value.trim(); if (!v) return;
         btn.disabled = btnRun.disabled = true;
@@ -2945,7 +3033,9 @@
       };
       btn.onclick = () => submit(false);
       btnRun.onclick = () => submit(true);
-      box.appendChild(ta); box.appendChild(btn); box.appendChild(btnRun); row.appendChild(box);
+      const btnCol = el('div', 'display:flex;flex-direction:column;gap:6px;flex:0 0 auto');
+      btnCol.appendChild(btn); btnCol.appendChild(btnRun);
+      box.appendChild(ta); box.appendChild(btnCol); row.appendChild(box);
     }
     async function renderQuestions(){
       qSec.innerHTML = ''; qSec.appendChild(secTitle('Questions'));
