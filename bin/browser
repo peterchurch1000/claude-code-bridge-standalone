@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+// browser — drive the per-room Chrome via the bridge Playwright shim over HTTP.
+// Uses ONLY http (no MCP client), so it works from Codex's shell tool (never deferred).
+// URL comes from env CODEX_BROWSER_MCP_URL (bridge sets this per-room when spawning codex).
+'use strict';
+const http = require('http');
+const { URL } = require('url');
+
+const MCP_URL = process.env.CODEX_BROWSER_MCP_URL;
+if (!MCP_URL) { console.error('browser: CODEX_BROWSER_MCP_URL not set'); process.exit(2); }
+
+function call(name, args) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args || {} } });
+    const u = new URL(MCP_URL);
+    const req = http.request({
+      hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'POST',
+      headers: { 'content-type': 'application/json', 'accept': 'application/json, text/event-stream', 'content-length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        // shim replies as SSE: lines "event: message" / "data: {json}"
+        const line = data.split('\n').find(l => l.startsWith('data:'));
+        if (!line) return reject(new Error('bad response: ' + data.slice(0, 200)));
+        let msg; try { msg = JSON.parse(line.slice(5).trim()); } catch (e) { return reject(new Error('parse: ' + data.slice(0, 200))); }
+        if (msg.error) return reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        const c = msg.result && msg.result.content;
+        if (Array.isArray(c)) resolve(c.map(x => x.text != null ? x.text : JSON.stringify(x)).join('\n'));
+        else resolve(JSON.stringify(msg.result));
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(60000, () => req.destroy(new Error('timeout')));
+    req.end(body);
+  });
+}
+
+const [sub, ...rest] = process.argv.slice(2);
+const argstr = rest.join(' ');
+function flag(name) { const i = rest.indexOf('--' + name); return i >= 0; }
+
+async function main() {
+  let name, args;
+  switch (sub) {
+    case 'navigate': case 'goto': name = 'browser_navigate'; args = { url: rest[0] }; break;
+    case 'snapshot': case 'snap': name = 'browser_snapshot'; args = {}; break;
+    case 'click': name = 'browser_click'; args = { ref: rest[0], element: rest.slice(1).join(' ') || rest[0] }; break;
+    case 'type': name = 'browser_type'; args = { ref: rest[0], element: rest[0], text: rest.filter(a => !a.startsWith('--'))[1] || '', submit: flag('submit') }; break;
+    case 'key': name = 'browser_press_key'; args = { key: rest[0] }; break;
+    case 'tabs': name = 'browser_tabs'; args = { action: rest[0] || 'list', index: rest[1] != null && !isNaN(+rest[1]) ? +rest[1] : undefined, url: rest[0] === 'new' ? rest[1] : undefined }; break;
+    case 'screenshot': name = 'browser_take_screenshot'; args = rest[0] ? { filename: rest[0] } : {}; break;
+    case 'wait': name = 'browser_wait_for'; args = { text: argstr }; break;
+    case 'eval': name = 'browser_evaluate'; args = { function: argstr }; break;
+    case 'back': name = 'browser_navigate_back'; args = {}; break;
+    case 'raw': name = rest[0]; try { args = JSON.parse(rest.slice(1).join(' ') || '{}'); } catch (e) { console.error('bad json'); process.exit(2); } break;
+    default:
+      console.error('usage: browser <navigate|snapshot|click|type|key|tabs|screenshot|wait|eval|back|raw> ...'); process.exit(2);
+  }
+  try { console.log(await call(name, args)); } catch (e) { console.error('browser error: ' + e.message); process.exit(1); }
+}
+main();
