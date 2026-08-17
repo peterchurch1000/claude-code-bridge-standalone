@@ -2593,7 +2593,8 @@
       if (s < 86400) return Math.round(s / 3600) + 'h ago';
       return Math.round(s / 86400) + 'd ago';
     };
-    function addAccountRow() {
+    // "Add Claude account" — appended at the end of the Claude (code) group.
+    function addClaudeAddRow() {
       const add = document.createElement('button');
       add.className = 'acct-item acct-add';
       const nm = document.createElement('span'); nm.className = 'acct-name'; nm.textContent = '➕ Add Claude account';
@@ -2601,8 +2602,10 @@
       add.appendChild(nm); add.appendChild(em);
       add.addEventListener('click', () => { ov.remove(); openClaudeAuth(); });
       listEl.appendChild(add);
-      // Codex (ChatGPT) sign-in — opens the browser-OAuth flow, prompting for a
-      // name tag first, and saves the result as a NEW Codex account.
+    }
+    // "Add Codex account" — opens the browser-OAuth flow, prompting for a name tag
+    // first, and saves the result as a NEW Codex account. Appended after the Codex group.
+    function addCodexAddRow() {
       const addc = document.createElement('button');
       addc.className = 'acct-item acct-add';
       const cnm = document.createElement('span'); cnm.className = 'acct-name'; cnm.textContent = '➕ Add Codex account';
@@ -2646,16 +2649,17 @@
         if (!d.accounts || !d.accounts.length) {
           const p = document.createElement('p'); p.className = 'cauth-intro';
           p.textContent = 'No saved accounts yet — add one below.';
-          listEl.appendChild(p); addAccountRow(); return;
+          listEl.appendChild(p); addClaudeAddRow(); addCodexAddRow(); return;
         }
         const _hasCodex = d.accounts.some(a => a.type === 'codex');
         listEl._codexHeaderDone = false;
+        let claudeAddDone = false;
         if (_hasCodex) { const _hc = document.createElement('div'); _hc.className = 'acct-group-label'; _hc.textContent = 'Code accounts'; listEl.appendChild(_hc); }
         d.accounts.forEach(a => {
           const isCodex = a.type === 'codex';
           const _eng = effectiveEngine();
           const isActive = isCodex ? (_eng === 'codex' && !!a.active) : (_eng !== 'codex' && !!(a.email && d.active && a.email === d.active));
-          if (isCodex && !listEl._codexHeaderDone) { listEl._codexHeaderDone = true; const _h = document.createElement('div'); _h.className = 'acct-group-label'; _h.textContent = 'Codex accounts'; listEl.appendChild(_h); }
+          if (isCodex && !listEl._codexHeaderDone) { listEl._codexHeaderDone = true; if (!claudeAddDone) { claudeAddDone = true; addClaudeAddRow(); } const _h = document.createElement('div'); _h.className = 'acct-group-label'; _h.textContent = 'Codex accounts'; listEl.appendChild(_h); }
           const b = document.createElement('button');
           b.className = 'acct-item' + (isActive ? ' acct-active' : '') + (isCodex ? ' acct-codex' : '');
           const top = document.createElement('span'); top.className = 'acct-top';
@@ -2702,7 +2706,10 @@
           b.addEventListener('click', () => { if (isActive) return; doSwitch(a.name, a.type); });
           listEl.appendChild(b);
         });
-        addAccountRow();
+        // Claude add-row sits at the end of the Claude group; if there were no Codex
+        // accounts the group boundary was never hit, so add it now. Codex add-row last.
+        if (!claudeAddDone) { claudeAddDone = true; addClaudeAddRow(); }
+        addCodexAddRow();
       } catch (e) { setMsg(e.message, 'err'); }
     }
     // Reset-aware usage: once a window's reset time has passed it has rolled
