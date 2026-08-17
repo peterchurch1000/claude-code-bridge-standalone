@@ -1145,9 +1145,28 @@ app.post('/accounts/delete', (req, res) => {
 // they land on; we relay it to codex's local callback server to finish the exchange
 // (full scopes). Same paste-back shape as the Claude flow; state kept separate.
 let cxProc = null, cxBuf = '', cxUrl = '', cxDone = false, cxResult = null, cxName = 'peter';
+let cxStartAuthMtime = 0, cxFinalized = false;
 function killCodexAuth() {
   if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
   cxProc = null;
+}
+// Turn a completed `codex login` into a saved account + success result. Runs at most
+// once per sign-in (cxFinalized guard) whether triggered by the process exiting OR by
+// /complete's auth.json watcher (codex 0.144.x writes the token but may not exit).
+function finalizeCodexAuth() {
+  if (cxFinalized) return;
+  cxFinalized = true; cxDone = true;
+  let ok = false, email = '';
+  try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
+  if (ok) {
+    try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
+    try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+    cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' — saved as “' + cxName + '”.' };
+  } else {
+    const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(x => x.trim()).filter(Boolean);
+    const fail = [...clean].reverse().find(l => /fail|error|invalid|expired|denied|cancel|timed? ?out/i.test(l));
+    cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : '.') };
+  }
 }
 function parseCodexAuthUrl(buf) {
   const s = stripAnsiSeq(buf).replace(/\r/g, '\n');
@@ -1157,7 +1176,8 @@ function parseCodexAuthUrl(buf) {
 app.post('/codex/auth/start', (req, res) => {
   try {
     killCodexAuth();
-    cxBuf = ''; cxUrl = ''; cxDone = false; cxResult = null;
+    cxBuf = ''; cxUrl = ''; cxDone = false; cxResult = null; cxFinalized = false;
+    try { cxStartAuthMtime = fs.statSync(CODEX_AUTH).mtimeMs; } catch { cxStartAuthMtime = 0; }
     cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
     // Full browser flow (NOT --device-auth): grants api.connectors.* scopes. Starts a
     // local callback server on 127.0.0.1:1455 and prints the auth URL. BROWSER=/bin/true
@@ -1167,21 +1187,7 @@ app.post('/codex/auth/start', (req, res) => {
     const onData = d => { cxBuf += d.toString('utf8'); if (!cxUrl) { const u = parseCodexAuthUrl(cxBuf); if (u) cxUrl = u; } };
     cxProc.stdout.on('data', onData);
     cxProc.stderr.on('data', onData);
-    cxProc.on('exit', () => {
-      cxDone = true;
-      let ok = false, email = '';
-      try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
-      if (ok) {
-        try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
-        try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
-        cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' — saved as “' + cxName + '”.' };
-      } else {
-        const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(s => s.trim()).filter(Boolean);
-        const fail = [...clean].reverse().find(l => /fail|error|invalid|expired|denied|cancel|timed? ?out/i.test(l));
-        cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : '.') };
-      }
-      cxProc = null;
-    });
+    cxProc.on('exit', () => { finalizeCodexAuth(); cxProc = null; });
     let settled = false; const t0 = Date.now();
     const iv = setInterval(() => {
       if (settled) return;
@@ -1201,7 +1207,21 @@ app.post('/codex/auth/complete', (req, res) => {
     try { const u = new URL(raw); if (u.port === '1455' || u.hostname === 'localhost' || u.hostname === '127.0.0.1') relayPath = u.pathname + u.search; } catch {}
     if (!relayPath) { const m = raw.match(/(?:^|[?&])code=[^\s#]+/); if (m) relayPath = '/auth/callback?' + raw.replace(/^[?]/, ''); }
     if (!/[?&]code=/.test(relayPath)) return res.status(400).json({ ok: false, error: 'That is not the localhost:1455 sign-in URL (no code found). Copy the whole address the browser landed on.' });
-    const req2 = require('http').get({ host: '127.0.0.1', port: 1455, path: relayPath, timeout: 10000 }, resp => { resp.resume(); res.json({ ok: true, relayed: true, status: resp.statusCode || 0 }); });
+    const req2 = require('http').get({ host: '127.0.0.1', port: 1455, path: relayPath, timeout: 10000 }, resp => {
+      resp.resume(); res.json({ ok: true, relayed: true, status: resp.statusCode || 0 });
+      // codex 0.144.x writes auth.json on a successful exchange but may NOT exit (keeps the
+      // 1455 server open), so the on-exit finalizer never fires and the UI hangs on
+      // "Completing…". Watch auth.json for the fresh token and finalize deterministically.
+      let tries = 0;
+      const w = setInterval(() => {
+        if (cxFinalized) { clearInterval(w); return; }
+        let mt = 0, ok = false;
+        try { mt = fs.statSync(CODEX_AUTH).mtimeMs; } catch {}
+        try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); } catch {}
+        if (ok && mt > cxStartAuthMtime) { clearInterval(w); finalizeCodexAuth(); killCodexAuth(); }
+        else if (++tries > 60) { clearInterval(w); killCodexAuth(); finalizeCodexAuth(); }
+      }, 500);
+    });
     req2.on('timeout', () => { req2.destroy(); });
     req2.on('error', e => { if (!res.headersSent) res.status(502).json({ ok: false, error: 'Could not reach the local sign-in server: ' + e.message }); });
   } catch (e) { res.status(500).json({ error: e.message }); }
