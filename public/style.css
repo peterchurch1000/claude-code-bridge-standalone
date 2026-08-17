@@ -269,7 +269,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 /* ── Tasks panel (toggleable) ── */
 .tasks-panel-hidden { display: none !important; }
 .tasks-panel-visible {
-  width: 17vw; min-width: 230px; max-width: 345px;
+  width: 24vw; min-width: 300px; max-width: 480px;
   background: #11161f; border-right: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
   order: -1; /* render to the left of #chat-panel */

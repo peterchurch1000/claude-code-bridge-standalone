@@ -164,6 +164,34 @@ const BRIDGE_TASK_API = (process.env.BRIDGE_TASK_API || 'http://127.0.0.1:8000/a
 function bridgeTaskJwt() {
   try { return fs.readFileSync(BRIDGE_TASK_JWT_FILE, 'utf8').trim(); } catch { return ''; }
 }
+// [PENDING_DRAFT_BADGE_V1] Fold autonomy-loop outbox drafts into the task list.
+// The loop queues email drafts + WhatsApp-to-self messages under
+// ~/.claude/autonomy/outbox/{drafts,whatsapp}/<id>.json (task_key = task file minus
+// .md). Drained items move to a done/ subfolder, so anything still in the top-level
+// folder whose status is not "done" is awaiting Peter. Each task gets a
+// `pending_draft` field ('', 'email', 'whatsapp', 'both') the panel renders as a glyph.
+const OUTBOX_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'autonomy', 'outbox');
+function pendingDraftsByTask() {
+  const map = {};
+  const scan = (kind, sub) => {
+    let files = [];
+    try { files = fs.readdirSync(path.join(OUTBOX_DIR, sub)).filter(f => f.endsWith('.json')); } catch { return; }
+    for (const f of files) {
+      try {
+        const o = JSON.parse(fs.readFileSync(path.join(OUTBOX_DIR, sub, f), 'utf8'));
+        if (!o || !o.task_key) continue;
+        if (String(o.status || '').toLowerCase() === 'done') continue;
+        const key = (String(o.task_key).match(/^(task-\d+)/) || [])[1];
+        if (!key) continue;
+        (map[key] = map[key] || {})[kind] = true;
+      } catch {}
+    }
+  };
+  scan('email', 'drafts');
+  scan('whatsapp', 'whatsapp');
+  return map;
+}
+
 // [RUN_NOW_V1] Submit & Run: fire ONE immediate autonomy turn on this task so a
 // freshly-answered question is acted on within ~1 min instead of waiting for the
 // 15-min usage-pacing cron. Registered BEFORE the /tasks proxy so it is not
@@ -201,6 +229,21 @@ app.use('/tasks', async (req, res, next) => {
     const up = await fetch(target, opts);
     const text = await up.text();
     const ct = up.headers.get('content-type');
+    // [PENDING_DRAFT_BADGE_V1] Annotate the task list with outbox draft flags.
+    if (method === 'GET' && sub === '' && up.ok && ct && ct.includes('application/json')) {
+      try {
+        const data = JSON.parse(text);
+        if (data && Array.isArray(data.tasks)) {
+          const dmap = pendingDraftsByTask();
+          for (const t of data.tasks) {
+            const p = dmap[(String(t.file || '').match(/^(task-\d+)/) || [])[1]];
+            t.pending_draft = p ? (p.email && p.whatsapp ? 'both' : (p.email ? 'email' : 'whatsapp')) : '';
+          }
+          res.status(up.status).set('Content-Type', ct);
+          return res.send(JSON.stringify(data));
+        }
+      } catch {}
+    }
     res.status(up.status);
     if (ct) res.set('Content-Type', ct);
     return res.send(text);
@@ -1052,6 +1095,25 @@ app.post('/accounts/rename', (req, res) => {
 app.post('/accounts/delete', (req, res) => {
   const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
   if (!name) return res.status(400).json({ ok: false, error: 'Missing account name.' });
+  // Codex account: a saved login is a single `<name>.auth.json` snapshot in
+  // CODEX_ACCT_DIR. Route here when the caller says type:'codex' or the name is a
+  // known Codex snapshot. Refuse to delete the login this pane is actively running.
+  const wantType = String((req.body && req.body.type) || '').toLowerCase();
+  let isCodex = wantType === 'codex';
+  if (!isCodex && wantType !== 'code') { try { isCodex = fs.existsSync(path.join(CODEX_ACCT_DIR, name + '.auth.json')); } catch {} }
+  if (isCodex) {
+    try {
+      const f = path.join(CODEX_ACCT_DIR, name + '.auth.json');
+      if (!fs.existsSync(f)) return res.status(404).json({ ok: false, error: `No Codex account named "${name}".` });
+      let activeId = ''; try { activeId = codexAcctId(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+      let thisId = '';   try { thisId   = codexAcctId(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch {}
+      if (activeId && thisId && activeId === thisId && currentEngine() === 'codex')
+        return res.status(409).json({ ok: false, error: 'That is the Codex login this pane is running on — switch to another account first, then delete it.' });
+      fs.unlinkSync(f);
+      const codex = listCodexAccounts();
+      return res.json({ ok: true, message: `Deleted Codex account "${name}".`, removed: 1, ...listAccounts(), codexAccounts: codex.accounts });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  }
   try {
     const acctFile = path.join(ACCT_DIR, name + '.account.json');
     if (!fs.existsSync(acctFile))

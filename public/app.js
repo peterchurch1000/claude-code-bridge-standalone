@@ -2468,17 +2468,20 @@
   }
 
   // ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1]
-  function openCodexAuth(name) {
+  function openCodexAuth(name, isNew) {
     /* CODEX_BROWSER_AUTH_V2: full browser-OAuth flow (grants api.connectors.* scopes);
-       user pastes back the localhost:1455 redirect URL, backend relays it to codex. */
+       user pastes back the localhost:1455 redirect URL, backend relays it to codex.
+       isNew=true → prompt for a name tag and save the result as a NEW Codex account. */
     document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
     const ov = document.createElement('div');
     ov.className = 'cauth-overlay';
     ov.innerHTML = `
       <div class="cauth-modal">
-        <div class="cauth-head"><span>↻ Re-authenticate Codex — ${name}</span><button class="cauth-x" title="Close">✕</button></div>
+        <div class="cauth-head"><span>${isNew ? '➕ Add Codex account' : '↻ Re-authenticate Codex — ' + name}</span><button class="cauth-x" title="Close">✕</button></div>
         <div class="cauth-body">
-          <p class="cauth-intro">Refresh this Codex (ChatGPT) login with full scopes. Click start, open the link, sign in &amp; approve. Your browser will then try to open a <code>localhost:1455</code> page that won’t load — copy that whole address and paste it below.</p>
+          <p class="cauth-intro">${isNew ? 'Sign a <b>new</b> ChatGPT (Codex) account in with full scopes.' : 'Refresh this Codex (ChatGPT) login with full scopes.'} Click start, open the link, sign in &amp; approve. Your browser will then try to open a <code>localhost:1455</code> page that won’t load — copy that whole address and paste it below.</p>
+          ${isNew ? `<p style="margin:0 0 4px"><b>Name this login</b> (a short tag to identify it):</p>
+          <input id="cxauth-name" type="text" placeholder="e.g. tamara" maxlength="24" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;margin-bottom:8px" value="${name || ''}" />` : ''}
           <button class="cauth-btn" id="cxauth-start">Start sign-in</button>
           <div id="cxauth-step2" class="cauth-hidden">
             <p><b>1.</b> Open this link and sign in with ChatGPT:</p>
@@ -2518,9 +2521,15 @@
       }, 2500);
     };
     startBtn.addEventListener('click', async () => {
+      let useName = name;
+      if (isNew) {
+        const ni = ov.querySelector('#cxauth-name');
+        useName = ((ni && ni.value) || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
+        if (!useName) { setMsg('Enter a name tag first.', 'err'); if (ni) ni.focus(); return; }
+      }
       startBtn.disabled = true; setMsg('Starting sign-in…', 'info');
       try {
-        const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+        const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: useName }) });
         const d = await r.json();
         if (!r.ok || !d.url) throw new Error(d.error || 'Could not start sign-in.');
         ov.querySelector('#cxauth-link').href = d.url;
@@ -2587,11 +2596,20 @@
     function addAccountRow() {
       const add = document.createElement('button');
       add.className = 'acct-item acct-add';
-      const nm = document.createElement('span'); nm.className = 'acct-name'; nm.textContent = '➕ Add account';
+      const nm = document.createElement('span'); nm.className = 'acct-name'; nm.textContent = '➕ Add Claude account';
       const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = 'sign in to a new Claude account';
       add.appendChild(nm); add.appendChild(em);
       add.addEventListener('click', () => { ov.remove(); openClaudeAuth(); });
       listEl.appendChild(add);
+      // Codex (ChatGPT) sign-in — opens the browser-OAuth flow, prompting for a
+      // name tag first, and saves the result as a NEW Codex account.
+      const addc = document.createElement('button');
+      addc.className = 'acct-item acct-add';
+      const cnm = document.createElement('span'); cnm.className = 'acct-name'; cnm.textContent = '➕ Add Codex account';
+      const cem = document.createElement('span'); cem.className = 'acct-email'; cem.textContent = 'sign in to a new ChatGPT (Codex) account';
+      addc.appendChild(cnm); addc.appendChild(cem);
+      addc.addEventListener('click', () => { ov.remove(); openCodexAuth('', true); });
+      listEl.appendChild(addc);
     }
     function startRename(nmSpan, oldName) {
       const inp = document.createElement('input');
@@ -2660,6 +2678,9 @@
             const reauth = document.createElement('span'); reauth.className = 'acct-edit acct-reauth'; reauth.textContent = '\u21bb'; reauth.title = 'Re-authenticate this Codex login';
             reauth.addEventListener('click', e => { e.stopPropagation(); ov.remove(); openCodexAuth(a.name); });
             top.appendChild(reauth);
+            const del = document.createElement('span'); del.className = 'acct-edit acct-del'; del.textContent = '\u{1F5D1}'; del.title = 'Delete this saved Codex login';
+            del.addEventListener('click', e => { e.stopPropagation(); doDelete(a.name, a.type, isActive); });
+            top.appendChild(del);
           }
           const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = a.email || '';
           b.appendChild(top); b.appendChild(em);
@@ -3322,6 +3343,24 @@
     // Red dot = a question awaits your answer; green = your question was answered.
     const statusCell = document.createElement('span');
     statusCell.className = 'task-status-cell';
+    // [PENDING_DRAFT_BADGE_V1] The autonomous loop queued an email/WhatsApp draft
+    // for this task: show a glyph in the status slot (in place of the question dot).
+    const pdraft = String(t.pending_draft || '');
+    if (pdraft) {
+      (pdraft === 'both' ? ['whatsapp', 'email'] : [pdraft]).forEach(k => {
+        const g = document.createElement('span');
+        g.className = 'task-draft-badge draft-' + k;
+        g.style.cssText = 'flex:none;display:inline-flex;align-items:center;line-height:1;cursor:pointer;color:' + (k === 'whatsapp' ? '#25D366' : 'var(--accent, #6ea8fe)');
+        g.innerHTML = k === 'whatsapp'
+          ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.9c0 1.76.46 3.45 1.34 4.95L2 22l5.28-1.38a9.9 9.9 0 0 0 4.76 1.21h.004c5.46 0 9.9-4.45 9.9-9.9C21.95 6.45 17.5 2 12.04 2Zm5.8 14.16c-.24.68-1.2 1.25-1.98 1.42-.53.11-1.22.2-3.56-.77-2.99-1.24-4.92-4.29-5.07-4.49-.15-.2-1.22-1.62-1.22-3.09s.77-2.19 1.05-2.49c.27-.3.59-.37.79-.37.2 0 .39 0 .56.01.18.01.42-.07.66.5.24.58.82 2.02.89 2.16.07.15.12.32.02.52-.1.2-.15.32-.3.5-.15.18-.31.4-.44.53-.15.15-.3.31-.13.6.17.29.76 1.25 1.63 2.02 1.12.99 2.07 1.3 2.36 1.45.29.15.46.13.63-.08.17-.2.72-.84.91-1.13.19-.29.39-.24.66-.15.27.1 1.7.8 1.99.95.29.15.48.22.55.34.07.12.07.68-.17 1.36Z"/></svg>'
+          : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>';
+        g.title = k === 'whatsapp'
+          ? 'The autonomous loop drafted a WhatsApp message for this task — open to review'
+          : 'The autonomous loop drafted an email for this task — open to review and send';
+        g.addEventListener('click', (e) => { e.stopPropagation(); openTaskDetails(t); });
+        statusCell.appendChild(g);
+      });
+    }
     const nOpenQ = Number(t.open_questions) || 0;
     const nAnsQ = Number(t.answered_questions) || 0;
     if (nOpenQ > 0 || nAnsQ > 0) {
