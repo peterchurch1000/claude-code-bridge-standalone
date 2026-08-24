@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=5&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=6&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {
@@ -1808,8 +1808,11 @@
   }
 
   btnSend.onclick = sendMessage;
+  // On touch/mobile devices Enter should insert a newline (send via the button),
+  // since there's no Shift key to reach for. On desktop keep Enter-to-send.
+  const enterInsertsNewline = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
   inputEl.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    if (e.key === 'Enter' && !e.shiftKey && !enterInsertsNewline) { e.preventDefault(); sendMessage(); }
   });
   inputEl.addEventListener('input', () => {
     inputEl.style.height = 'auto';
@@ -2074,7 +2077,16 @@
       }
       // Build one session row element (identical for normal + autonomy task rooms).
       const makeRow = (s) => {
-        sessionNameById[s.id] = s.name || s.preview || '';
+        let _taskLabel = '';
+        if (s.taskRoom) {
+          const _m = String(s.taskRoom).match(/^(?:task-)+(\d+)-(.+)$/);
+          if (_m) _taskLabel = '#' + _m[1] + ' · ' + _m[2].replace(/-/g, ' ');
+          else _taskLabel = String(s.taskRoom).replace(/^(?:task-)+/, '').replace(/-/g, ' ');
+        }
+        // Header/title lookup must prefer the task label over the raw first-message
+        // preview, or a task room with no server-side name shows the autonomy prompt
+        // ("You are running ONE turn…") as its name instead of the task name.
+        sessionNameById[s.id] = s.name || _taskLabel || s.preview || '';
         const row = document.createElement('div');
         row.className = 'sess-row';
         const btn = document.createElement('button');
@@ -2089,12 +2101,6 @@
         time.appendChild(sid);
         const preview = document.createElement('span');
         preview.className = 'sess-preview';
-        let _taskLabel = '';
-        if (s.taskRoom) {
-          const _mtr = String(s.taskRoom).match(/^(?:task-)+(\d+)-(.+)$/);
-          if (_mtr) _taskLabel = '#' + _mtr[1] + ' \u00b7 ' + _mtr[2].replace(/-/g, ' ');
-          else _taskLabel = String(s.taskRoom).replace(/^(?:task-)+/, '').replace(/-/g, ' ');
-        }
         preview.textContent = s.name || _taskLabel || s.preview || '(empty)';
         btn.appendChild(time);
         btn.appendChild(preview);
@@ -2352,14 +2358,70 @@
       settingsDropdown.classList.add('hidden');
       btnSettings.classList.remove('active');
       settingsPanel.classList.remove('hidden');
-      if (settingsBody) {
-        settingsBody.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Settings coming soon.</p>';
-      }
+      if (settingsBody) renderInfraHealth(settingsBody);
     });
+  }
+
+  // ── Settings > Infra Health ───────────────────────────────────────────────
+  // Daily 04:00 BA health check (browser wedge/orphans/leaks + autonomy loop).
+  // Reads /infra-health (status.json snapshot + history.jsonl log). All-clear
+  // days register here too, so this is the standing log Peter asked for.
+  async function renderInfraHealth(host) {
+    host.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Loading infra health…</p>';
+    let data = null;
+    try { data = await (await fetch(API_BASE + '/infra-health', { cache: 'no-store' })).json(); } catch {}
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    const when = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return esc(iso); } };
+    if (!data || !data.status) {
+      host.innerHTML = '<h3 style="margin:0 0 8px;font-size:14px;">Infra Health</h3>'
+        + '<p style="color:var(--text-dim);font-size:12px;">No health check has run yet. It runs daily at 04:00 (Buenos Aires); results will appear here.</p>';
+      return;
+    }
+    const st = data.status;
+    const overallOk = st.overall === 'ok';
+    const rows = (st.checks || []).map((c) =>
+      '<div style="display:flex;gap:8px;padding:6px 0;border-top:1px solid var(--border,#2a2a2a);">'
+      + '<span style="font-size:14px;">' + (c.ok ? '✅' : '⚠️') + '</span>'
+      + '<div style="flex:1;min-width:0;">'
+      + '<div style="font-size:13px;color:var(--text,#eee);">' + esc(c.label) + '</div>'
+      + '<div style="font-size:11px;color:var(--text-dim);word-break:break-word;">' + esc(c.detail) + '</div>'
+      + '</div></div>'
+    ).join('');
+    const hist = (data.history || []).map((h) => {
+      const ok = h.overall === 'ok';
+      return '<div style="display:flex;gap:8px;font-size:11px;padding:3px 0;color:var(--text-dim);">'
+        + '<span>' + (ok ? '✅' : '⚠️') + '</span>'
+        + '<span style="flex:1;">' + when(h.iso) + '</span>'
+        + '<span>' + (ok ? 'all clear' : (h.issues + ' issue' + (h.issues === 1 ? '' : 's'))) + '</span>'
+        + '</div>';
+    }).join('');
+    host.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin:0 0 4px;">'
+      + '<h3 style="margin:0;font-size:14px;flex:1;">Infra Health</h3>'
+      + '<span style="font-size:12px;padding:2px 8px;border-radius:10px;background:' + (overallOk ? 'rgba(40,160,80,.18);color:#4ade80' : 'rgba(200,80,40,.18);color:#f87171') + ';">'
+      + (overallOk ? 'All clear' : (st.issue_count + ' issue' + (st.issue_count === 1 ? '' : 's'))) + '</span>'
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;">Last run ' + when(st.last_run) + (st.stacks ? ' · stacks ' + esc(st.stacks) : '') + '</div>'
+      + rows
+      + (hist ? '<div style="margin-top:14px;font-size:12px;color:var(--text-dim);font-weight:600;">Recent runs</div>' + hist : '')
+      + '<div style="margin-top:6px;"><button id="ih-refresh" style="font-size:11px;padding:3px 10px;cursor:pointer;">Refresh</button></div>';
+    const rb = document.getElementById('ih-refresh');
+    if (rb) rb.addEventListener('click', () => renderInfraHealth(host));
   }
   if (btnCloseSettings) {
     btnCloseSettings.addEventListener('click', () => {
       settingsPanel && settingsPanel.classList.add('hidden');
+    });
+  }
+
+  // Infra Health menu item -> open the settings panel showing the health checks.
+  const btnInfraHealth = $('btn-infra-health');
+  if (btnInfraHealth && settingsPanel) {
+    btnInfraHealth.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      settingsPanel.classList.remove('hidden');
+      if (settingsBody) renderInfraHealth(settingsBody);
     });
   }
 
@@ -2783,6 +2845,12 @@
   const rankOf = s => (STATUS_RANK[s] ?? 5);
   const todayStr = () => new Date().toISOString().slice(0, 10);
   const isFuture = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && d > todayStr();
+  // Idea/Concept-type tasks are hidden from the default "pending" view (task 241).
+  const isIdeaConcept = t => ['idea/concept', 'idea', 'concept'].includes(String(t || '').trim().toLowerCase());
+  // Status-dot state for a task row: 'red' = a question awaits Peter's answer,
+  // 'green' = question(s) all answered, 'none' = no questions. Drives the Dot filter.
+  const dotState = t => (Number(t.open_questions) || 0) > 0 ? 'red'
+                      : (Number(t.answered_questions) || 0) > 0 ? 'green' : 'none';
 
   const TS_KEY = 'taskloop.tasks.v1';
   function loadTaskState() {
@@ -2791,7 +2859,7 @@
     return {
       sort:   s.sort || '',
       dir:    s.dir === 'desc' ? 'desc' : 'asc',
-      date:   ['pending','today','past','no-date','all'].includes(s.date) ? s.date : 'pending',
+      date:   ['pending','pending-exc','today','past','no-date','all'].includes(s.date) ? s.date : 'pending',
       status: Array.isArray(s.status) ? s.status : [],
       area:   Array.isArray(s.area) ? s.area : [],
       type:   Array.isArray(s.type) ? s.type : [],
@@ -2809,7 +2877,10 @@
     let list = tasks.slice();
     const today = todayStr();
     switch (taskState.date) {
-      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled)); break;
+      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && !isIdeaConcept(t.type)); break;
+      // Like 'pending' but hides tasks whose only outstanding flag is an already-answered
+      // (green-dot) question — i.e. shows pending tasks with a red or no dot. [PENDING_EXC]
+      case 'pending-exc': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && !isIdeaConcept(t.type) && dotState(t) !== 'green'); break;
       case 'today':   list = list.filter(t => t.scheduled === today); break;
       case 'past':    list = list.filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') && t.scheduled < today); break;
       case 'no-date': list = list.filter(t => !t.scheduled); break;
@@ -3466,7 +3537,7 @@
     const label = sel.length === 1 ? labelFn(sel[0]) : base + ' (' + sel.length + ')';
     btn.textContent = label + ' \u25be';
   }
-  const DATE_OPTS = [['pending','Pending'],['today','Today'],['past','Past'],['no-date','No Date'],['all','All']];
+  const DATE_OPTS = [['pending-exc','Pending, exc. 🟢'],['pending','Pending'],['today','Today'],['past','Past'],['no-date','No Date'],['all','All']];
   function buildDateMenu() {
     const menu = $('tf-date-menu');
     if (menu) {
