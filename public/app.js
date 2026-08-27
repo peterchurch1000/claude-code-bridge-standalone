@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=7&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=8&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {

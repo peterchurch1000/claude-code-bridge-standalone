@@ -84,7 +84,10 @@
     if (isBridge) {
       const parts = location.pathname.split('/').filter(Boolean);
       const prefix = parts.length > 1 ? '/' + parts[0] : '';
-      let p = prefix + '/roomview?room=' + encodeURIComponent(roomId);
+      // Tunnel over the already-proxied /ws path (nginx has no /roomview upgrade
+      // location, so a bare /roomview WS 404s); the bridge routes /ws?roomview=1 to
+      // the room-view relay, so this reaches the relay with no nginx change.
+      let p = prefix + '/ws?roomview=1&room=' + encodeURIComponent(roomId);
       if (target) p += '&target=' + encodeURIComponent(target);
       return proto + '://' + location.host + p;
     }

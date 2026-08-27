@@ -1734,7 +1734,15 @@ const wssRoomView = new WebSocketServer({ noServer: true, perMessageDeflate: fal
 server.on('upgrade', (req, socket, head) => {
   const pathname = (req.url || '').split('?')[0];
   if (pathname === '/ws') {
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+    // The per-room live viewer tunnels over /ws (marked ?roomview=1) because nginx
+    // only upgrades <user>/ws + /websockify - there is no /roomview upgrade location,
+    // so a bare /roomview WS 404s at the proxy. Route those to the room-view relay;
+    // all other /ws upgrades are the normal chat socket.
+    if (/[?&]roomview=1(?:&|$)/.test(req.url || '')) {
+      wssRoomView.handleUpgrade(req, socket, head, ws => wssRoomView.emit('connection', ws, req));
+    } else {
+      wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+    }
   } else if (pathname === '/websockify') {
     wssProxy.handleUpgrade(req, socket, head, ws => wssProxy.emit('connection', ws, req));
   } else if (pathname === '/roomview') {
