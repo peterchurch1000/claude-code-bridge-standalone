@@ -108,12 +108,25 @@
     ws.onerror = () => { setStatus('error', 'error'); };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.t === 'frame') { hideWaiting(); drawFrame(m); }
+      if (m.t === 'frame') { gotFrame = true; hideWaiting(); drawFrame(m); }
       else if (m.t === 'meta') renderMeta(m);
-      else if (m.t === 'hello') { hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); }
+      else if (m.t === 'hello') { hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); requestKeyframes(); }
       else if (m.t === 'waiting') showWaiting();
       else if (m.t === 'error') setStatus('err: ' + m.msg, 'error');
     };
+  }
+  // Pull a fresh paint the moment we're live, then keep asking until a frame lands.
+  // Beats the static/idle-page black-canvas race without waiting on a page change.
+  let gotFrame = false, kfTries = 0, kfTimer = null;
+  function requestKeyframes() {
+    gotFrame = false; kfTries = 0;
+    if (kfTimer) clearInterval(kfTimer);
+    const ask = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ req: 'keyframe' })); };
+    ask();
+    kfTimer = setInterval(() => {
+      if (gotFrame || kfTries++ >= 8) { clearInterval(kfTimer); kfTimer = null; return; }
+      ask();
+    }, 500);
   }
   function scheduleReconnect() {
     if (reconnectTimer) return;
@@ -368,6 +381,18 @@
 
   connect();
 })();
+</script>
+<script>
+window.addEventListener('message', function(e){
+  if (!e || !e.data || e.data.type !== 'ccb-room-bg') return;
+  var c = e.data.color || '';
+  try { document.body.style.background = c || '#202124'; } catch(_){}
+  var w = document.getElementById('wrap'); if (w) w.style.background = c || '#000';
+  var wa = document.getElementById('waiting'); if (wa) wa.style.background = c || '#202124';
+});
+function __ccbReqBg(){ try { window.parent && window.parent.postMessage({ type: 'ccb-room-bg-req' }, '*'); } catch(_){} }
+__ccbReqBg();
+window.addEventListener('load', __ccbReqBg);
 </script>
 </body>
 </html>

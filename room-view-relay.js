@@ -600,6 +600,18 @@ async function sendKeyframe(room, vw) {
   } catch {}
 }
 
+// [KEYFRAME_BURST_V1] A single join keyframe can lose the race with a slow client
+// canvas (iframe still laying out) or an idle/static page that emits no further
+// screencast frames. Fire several cheap captureScreenshot keyframes over ~2s so
+// the viewer is guaranteed a paint; each is guarded by readyState so a closed
+// viewer costs nothing.
+function keyframeBurst(room, vw) {
+  sendKeyframe(room, vw);
+  [250, 700, 1500, 2500].forEach(ms => setTimeout(() => {
+    if (vw.readyState === 1 && room.viewers.has(vw)) sendKeyframe(room, vw);
+  }, ms));
+}
+
 const wss = new WebSocket.Server({ server, path: undefined });
 wss.on('connection', async (vw, req) => {
   const u = new URL(req.url, 'http://x');
@@ -626,13 +638,14 @@ wss.on('connection', async (vw, req) => {
     // Guarantee this viewer sees the current screen immediately, even if the room was
     // already casting (its startScreencast keyframe went to an earlier viewer) or the
     // page is static and won't emit another frame on its own.
-    sendKeyframe(room, vw);
+    keyframeBurst(room, vw);
     startFollowLoop();
     log('viewer joined', roomId, 'total', room.viewers.size);
   }
 
   vw.on('message', (raw) => {
     let ev; try { ev = JSON.parse(raw); } catch { return; }
+    if (ev.req === 'keyframe') { if (!room.waiting) sendKeyframe(room, vw); return; }
     if (ev.k) handleInput(room, ev);
   });
   vw.on('close', () => {

@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=6&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=7&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {
@@ -542,12 +542,25 @@
   let currentRoomId = PINNED_ROOM || currentSessionId || localStorage.getItem(ROOM_KEY) || newDraftRoomId();
   let roomEpoch = 0;   // bumps on every room change; guards async history repaints
   if (!PINNED_ROOM) localStorage.setItem(ROOM_KEY, currentRoomId);
+  try { setTimeout(() => applyRoomBg(currentRoomId), 0); } catch {}
   // Engine model: a pane-wide GLOBAL engine (set by account switching; read from the
   // server's /accounts `engine`) is the default every room follows. A room may be
   // PINNED via its titlebar selector to override the global for that room only.
   const OVR_KEY = rid => 'bridge_engine_override::' + rid;
   function roomOverride(rid) { try { const v = localStorage.getItem(OVR_KEY(rid || currentRoomId)); return (v === 'claude' || v === 'codex') ? v : 'global'; } catch { return 'global'; } }
   function setRoomOverride(mode, rid) { try { const k = OVR_KEY(rid || currentRoomId); if (mode === 'claude' || mode === 'codex') localStorage.setItem(k, mode); else localStorage.removeItem(k); } catch {} }
+
+  // ── Per-room background colour ─────────────────────────────────────────────
+  const ROOMBG_KEY = rid => 'ccb-roombg::' + (rid || currentRoomId);
+  function getRoomBg(rid) { try { return localStorage.getItem(ROOMBG_KEY(rid)) || ''; } catch { return ''; } }
+  function setRoomBg(color, rid) { try { const k = ROOMBG_KEY(rid); if (color) localStorage.setItem(k, color); else localStorage.removeItem(k); } catch {} }
+  function applyRoomBg(rid) {
+    const c = getRoomBg(rid || currentRoomId);
+    if (c) document.documentElement.style.setProperty('--room-bg', c);
+    else document.documentElement.style.removeProperty('--room-bg');
+    try { const f = document.getElementById('vnc-frame'); f && f.contentWindow && f.contentWindow.postMessage({ type: 'ccb-room-bg', color: c || '' }, '*'); } catch {}
+  }
+  window.addEventListener('message', e => { if (e && e.data && e.data.type === 'ccb-room-bg-req') applyRoomBg(currentRoomId); });
   let globalEngine = 'claude', codexEnabled = false;
   function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
   function applyEngineMeta(d) { if (!d) return; globalEngine = (d.engine === 'codex') ? 'codex' : 'claude'; codexEnabled = !!d.codexEnabled; if (typeof updateTitlebar === 'function') updateTitlebar(); }
@@ -951,6 +964,7 @@
         // to that durable id so a reload rejoins THIS exact room/conversation.
         if (PINNED_ROOM && PINNED_ROOM.startsWith('draft-')) {
           try { setRoomOverride(roomOverride(currentRoomId), msg.id); localStorage.removeItem(OVR_KEY(currentRoomId)); } catch {}
+          try { const _bg = getRoomBg(currentRoomId); if (_bg) { setRoomBg(_bg, msg.id); setRoomBg('', currentRoomId); } applyRoomBg(msg.id); } catch {}
           if (pendingRoomName) {
             const _pn = pendingRoomName;
             sessionNameById[msg.id] = _pn;
@@ -1847,6 +1861,7 @@
       const nm = (id && sessionNameById[id]) || pendingRoomName || 'New room';
       nameEl.textContent = nm; nameEl.title = nm;
       nameEl.style.minWidth = Math.min(20, (nm||'').length) + 'ch';
+      try { document.title = (nm && nm !== 'New room') ? (nm + ' \u2014 Claude Code Bridge') : 'Claude Code Bridge'; } catch (e) {} /* TASK335_TAB_TITLE */
     }
     if (idEl) { idEl.textContent = id ? id.slice(0, 8) : '\u2014'; idEl.title = id || ''; }
     if (taskEl) {
@@ -1937,6 +1952,7 @@
     roomEpoch++;
     PINNED_ROOM   = roomKey;
     currentRoomId = roomKey;
+    applyRoomBg(roomKey);
     SESSION_KEY   = 'bridge_session_id::' + roomKey;
     try { const u = new URL(location.href); u.searchParams.set('room', roomKey); history.replaceState(null, '', u); } catch {}
     if (_PRB || _RV) setVncRoom(roomKey);   // switch the live panel to this room's browser
@@ -1987,6 +2003,7 @@
     if (name === PINNED_ROOM) { showToast('Already on room: ' + name, 'info'); return; }
     PINNED_ROOM = name;
     currentRoomId = name;
+    applyRoomBg(name);
     roomEpoch++;
     SESSION_KEY = 'bridge_session_id::' + name;            // re-point session namespace
     const u = new URL(location.href); u.searchParams.set('room', name);
@@ -2425,6 +2442,52 @@
     });
   }
 
+  // ── Settings > Meeting Flags (manage the reusable preset flag list) ────────
+  async function renderFlagPresets(host) {
+    host.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Loading meeting flags…</p>';
+    await loadFlagPresets();
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const draw = () => {
+      const rows = flagPresets.length
+        ? flagPresets.map(l => '<div class="fp-row"><span class="fp-flag">\uD83D\uDEA9 ' + esc(l) + '</span><button class="fp-del" data-label="' + esc(l) + '" title="Remove from list">\u2715</button></div>').join('')
+        : '<p style="color:var(--text-dim);font-size:12px;margin:0;">No flags yet \u2014 add one below.</p>';
+      host.innerHTML =
+        '<h3 style="margin:0 0 4px;font-size:14px;">Meeting Flags</h3>'
+        + '<p style="font-size:11px;color:var(--text-dim);margin:0 0 10px;line-height:1.4;">Reusable flags for tagging a task to raise at a meeting or with a person / mentor. Manage the master list here; on any task use the \u22ee menu \u2192 \uD83D\uDEA9 Flag for meeting to pick from it.</p>'
+        + '<div class="fp-list">' + rows + '</div>'
+        + '<div class="fp-add"><input id="fp-input" type="text" maxlength="64" placeholder="New flag (e.g. Luciano, Mentor, Board)\u2026"><button id="fp-add-btn">\uFF0B Add</button></div>';
+      const input = host.querySelector('#fp-input');
+      const addBtn = host.querySelector('#fp-add-btn');
+      const doAdd = async () => {
+        const v = (input.value || '').replace(/[\r\n,]+/g, ' ').trim();
+        if (!v) return;
+        addBtn.disabled = true;
+        const r = await addFlagPreset(v);
+        addBtn.disabled = false;
+        if (r && r.error) { showToast('Add failed: ' + r.error, 'error'); return; }
+        input.value = ''; draw();
+      };
+      addBtn.addEventListener('click', doAdd);
+      input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } });
+      host.querySelectorAll('.fp-del').forEach(b => b.addEventListener('click', async () => {
+        b.disabled = true;
+        await removeFlagPreset(b.dataset.label);
+        draw();
+      }));
+      input.focus();
+    };
+    draw();
+  }
+  const btnMeetingFlags = $('btn-meeting-flags');
+  if (btnMeetingFlags && settingsPanel) {
+    btnMeetingFlags.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      settingsPanel.classList.remove('hidden');
+      if (settingsBody) renderFlagPresets(settingsBody);
+    });
+  }
+
   // ── Light / dark theme toggle ─────────────────────────────────────────────
   const btnTheme = document.getElementById('btn-theme');
   if (btnTheme) {
@@ -2440,6 +2503,71 @@
       btnSettings && btnSettings.classList.remove('active');
     });
   }
+
+  // ── Per-room background colour picker ──────────────────────────────────────
+  (function () {
+    const btn = document.getElementById('st-color');
+    const pop = document.getElementById('color-pop');
+    if (!btn || !pop) return;
+    const PRESETS = ['', '#0f1117', '#12171e', '#1a1030', '#0f1e17', '#231016', '#1e1a0d', '#101a26', '#241a10'];
+    const RECENTS_KEY = 'ccb-roombg-recents';   // local cache; server is source of truth so recents sync across browsers
+    const isHex = c => /^#[0-9a-fA-F]{6}$/.test(c || '');
+    let recentsCache = [];
+    try { recentsCache = (JSON.parse(localStorage.getItem(RECENTS_KEY) || '[]') || []).filter(isHex); } catch {}
+    function getRecents() { return recentsCache.slice(); }
+    function persistRecents() {
+      try { localStorage.setItem(RECENTS_KEY, JSON.stringify(recentsCache)); } catch {}
+      try { fetch(`${API_BASE}/roombg/recents`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ colors: recentsCache }) }); } catch {}
+    }
+    function loadRecents() {
+      return fetch(`${API_BASE}/roombg/recents`, { cache: 'no-store' })
+        .then(r => r.ok ? r.json() : null)
+        .then(a => { if (Array.isArray(a)) { recentsCache = a.filter(isHex).slice(0, 12); try { localStorage.setItem(RECENTS_KEY, JSON.stringify(recentsCache)); } catch {} } })
+        .catch(() => {});
+    }
+    function pushRecent(c) {
+      if (!isHex(c)) return;
+      c = c.toLowerCase();
+      recentsCache = [c].concat(recentsCache.filter(x => x.toLowerCase() !== c)).slice(0, 12);
+      persistRecents();
+    }
+    loadRecents();
+    function choose(c) { setRoomBg(c, currentRoomId); applyRoomBg(currentRoomId); pushRecent(c); render(); }
+    function swatch(c, cur) {
+      const s = document.createElement('button');
+      s.className = 'sw' + (((c || '').toLowerCase() === cur || (!c && !cur)) ? ' sel' : '');
+      s.title = c || 'Default (theme)';
+      s.style.background = c || 'transparent';
+      if (!c) s.textContent = '\u2300';
+      s.onclick = () => choose(c);
+      return s;
+    }
+    function render() {
+      const cur = (getRoomBg(currentRoomId) || '').toLowerCase();
+      pop.innerHTML = '';
+      PRESETS.forEach(c => pop.appendChild(swatch(c, cur)));
+      const ci = document.createElement('input');
+      ci.type = 'color'; ci.className = 'sw-custom'; ci.title = 'Custom colour';
+      ci.value = isHex(cur) ? cur : '#101826';
+      ci.oninput = () => { setRoomBg(ci.value, currentRoomId); applyRoomBg(currentRoomId); };
+      ci.onchange = () => { pushRecent(ci.value); render(); };
+      pop.appendChild(ci);
+      const recents = getRecents().filter(c => PRESETS.indexOf(c) === -1);
+      if (recents.length) {
+        const sep = document.createElement('div');
+        sep.className = 'sw-sep'; sep.textContent = 'Recent';
+        pop.appendChild(sep);
+        recents.forEach(c => pop.appendChild(swatch(c, cur)));
+      }
+    }
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const opening = pop.classList.contains('hidden');
+      render(); pop.classList.toggle('hidden');
+      if (opening) loadRecents().then(render);
+    });
+    document.addEventListener('click', e => { if (!pop.classList.contains('hidden') && !pop.contains(e.target) && e.target !== btn) pop.classList.add('hidden'); });
+  })();
 
   // ── Claude Code re-authentication (per-user, self-service) ────────────────
   const btnClaudeAuth = document.getElementById('btn-claude-auth');
@@ -2865,11 +2993,13 @@
       type:   Array.isArray(s.type) ? s.type : [],
       person: Array.isArray(s.person) ? s.person : [],
       project:Array.isArray(s.project) ? s.project : [],
+      flags:  Array.isArray(s.flags) ? s.flags : [],
     };
   }
   let taskState  = loadTaskState();
   let taskSearch = '';
   let lastTasks  = [];
+  let flagPresets = [];
 
   function saveTaskState() { try { localStorage.setItem(TS_KEY, JSON.stringify(taskState)); } catch (_) {} }
 
@@ -2891,6 +3021,7 @@
     if (taskState.type.length)    list = list.filter(t => taskState.type.includes(t.type || '__none__'));
     if (taskState.person.length)  list = list.filter(t => taskState.person.includes(t.person || '__none__'));
     if (taskState.project.length) list = list.filter(t => taskState.project.includes(t.project || '__none__'));
+    if (taskState.flags.length)   list = list.filter(t => { const tf = Array.isArray(t.flags) ? t.flags : []; return taskState.flags.some(f => f === '__none__' ? tf.length === 0 : tf.includes(f)); });
     const q = taskSearch.trim().toLowerCase();
     if (q) list = list.filter(t => (t.title || '').toLowerCase().includes(q));
     if (taskState.sort) {
@@ -2916,6 +3047,30 @@
       if (res.ok && data.ok) loadTasks(); else showToast('Update failed: ' + (data.error || res.status), 'error');
     } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
   }
+  async function loadFlagPresets() {
+    try {
+      const res = await fetch(API_BASE + '/tasks/flag-presets', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.presets)) flagPresets = data.presets;
+    } catch (_) {}
+  }
+  async function addFlagPreset(label) {
+    try {
+      const res = await fetch(API_BASE + '/tasks/flag-presets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label }) });
+      const data = await res.json();
+      if (res.ok && Array.isArray(data.presets)) flagPresets = data.presets;
+      return data;
+    } catch (e) { return { error: e.message }; }
+  }
+  async function removeFlagPreset(label) {
+    try {
+      const res = await fetch(API_BASE + '/tasks/flag-presets?label=' + encodeURIComponent(label), { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok && Array.isArray(data.presets)) flagPresets = data.presets;
+      return data;
+    } catch (e) { return { error: e.message }; }
+  }
   async function reorderTask(file, move) {
     try {
       const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/reorder`, {
@@ -2939,6 +3094,19 @@
     const d = new Date(); d.setDate(d.getDate() + days);
     updateTaskFields(t.file, { scheduled: d.toISOString().slice(0, 10) });
     showToast('Scheduled forward ' + days + ' day' + (days > 1 ? 's' : ''), 'info');
+  }
+  function scheduleTaskDate(t) {
+    const inp = document.createElement('input');
+    inp.type = 'date';
+    inp.value = /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') ? t.scheduled : new Date().toISOString().slice(0, 10);
+    inp.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+    document.body.appendChild(inp);
+    inp.addEventListener('change', () => {
+      if (inp.value) { updateTaskFields(t.file, { scheduled: inp.value }); showToast('Scheduled for ' + inp.value, 'info'); }
+      inp.remove();
+    });
+    inp.addEventListener('blur', () => setTimeout(() => { if (inp.isConnected) inp.remove(); }, 200));
+    setTimeout(() => { try { inp.showPicker(); } catch (e) { inp.focus(); inp.click(); } }, 0);
   }
   // Priority levels in the picker (0 = highest, above P1). Keep in sync with the
   // DB CHECK constraint and the Organiser selector.
@@ -3002,6 +3170,39 @@
     document.body.appendChild(menu);
     setTimeout(() => document.addEventListener('click', onDoc, true), 0);
   }
+  function editProject(t) {
+    document.querySelectorAll('.task-menu, .area-picker, .project-picker').forEach(m => m.remove());
+    const projects = Array.from(new Set((lastTasks || []).map(x => x.project).filter(Boolean)))
+      .sort((a, b) => String(a).localeCompare(String(b)));
+    const menu = document.createElement('div');
+    menu.className = 'task-menu project-picker';
+    menu.style.cssText = 'position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:10000;max-height:64vh;overflow-y:auto';
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const item = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); close(); fn(); });
+      menu.appendChild(b);
+    };
+    const head = document.createElement('div');
+    head.className = 'task-menu-sep';
+    head.textContent = 'Set project';
+    head.style.cssText = 'padding:4px 12px;opacity:.55;font-size:11px';
+    menu.appendChild(head);
+    for (const p of projects) {
+      item((p === t.project ? '\u25cf ' : '\u00a0\u00a0\u00a0') + p, () => updateTaskFields(t.file, { project: p }));
+    }
+    const sepEl = document.createElement('div'); sepEl.className = 'task-menu-sep'; menu.appendChild(sepEl);
+    item('\u270e Custom\u2026', () => {
+      const v = prompt('Project for "' + t.title + '":', t.project || '');
+      if (v !== null) updateTaskFields(t.file, { project: v.trim() });
+    });
+    if (t.project) item('\u2717 Clear project', () => updateTaskFields(t.file, { project: '' }), 'danger');
+    document.body.appendChild(menu);
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+  }
   function editPriority(t) {
     const v = prompt('Priority 0–4 (blank to clear):', t.priority || '');
     if (v === null) return;
@@ -3018,6 +3219,53 @@
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) })
       .then(r => r.json()).then(d => { if (d.ok) loadTasks(); else showToast('Rename failed: ' + (d.error || ''), 'error'); })
       .catch(e => showToast('Rename failed: ' + e.message, 'error'));
+  }
+
+  function editFlags(t) {
+    document.querySelectorAll('.task-menu, .area-picker, .flag-picker').forEach(m => m.remove());
+    const known = new Set(flagPresets);
+    const cur = new Set(Array.isArray(t.flags) ? t.flags : []);
+    cur.forEach(f => known.add(f));
+    const menu = document.createElement('div');
+    menu.className = 'task-menu flag-picker';
+    menu.addEventListener('click', (e) => e.stopPropagation());
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const head = document.createElement('div'); head.className = 'task-menu-head'; head.textContent = 'Flag for meeting / person'; menu.appendChild(head);
+    const scroll = document.createElement('div'); scroll.className = 'flag-scroll'; menu.appendChild(scroll);
+    const esc = v => (window.CSS && CSS.escape) ? CSS.escape(v) : v;
+    const drawRow = (name) => {
+      const row = document.createElement('label'); row.className = 'flag-opt';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = cur.has(name); cb.dataset.flag = name;
+      cb.addEventListener('change', () => { cb.checked ? cur.add(name) : cur.delete(name); });
+      row.appendChild(cb); row.appendChild(document.createTextNode(' 🚩 ' + name));
+      scroll.appendChild(row);
+    };
+    Array.from(known).sort().forEach(drawRow);
+    if (!known.size) { const em = document.createElement('div'); em.className = 'flag-empty'; em.textContent = 'No flags yet — add one below.'; scroll.appendChild(em); }
+    const addWrap = document.createElement('div'); addWrap.className = 'flag-add';
+    const inp = document.createElement('input'); inp.type = 'text'; inp.placeholder = 'New flag (e.g. Luciano, Mentor)…';
+    const addBtn = document.createElement('button'); addBtn.type = 'button'; addBtn.textContent = '＋';
+    const addNew = () => {
+      const v = inp.value.replace(/[\r\n,]+/g, ' ').trim(); if (!v) return;
+      if (!known.has(v)) { known.add(v); const empty = scroll.querySelector('.flag-empty'); if (empty) empty.remove(); drawRow(v); }
+      cur.add(v); addFlagPreset(v);
+      const box = scroll.querySelector('input[data-flag="' + esc(v) + '"]'); if (box) box.checked = true;
+      inp.value = ''; inp.focus();
+    };
+    addBtn.addEventListener('click', (e) => { e.stopPropagation(); addNew(); });
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addNew(); } });
+    addWrap.appendChild(inp); addWrap.appendChild(addBtn); menu.appendChild(addWrap);
+    const act = document.createElement('div'); act.className = 'flag-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'tc-cancel'; cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', (e) => { e.stopPropagation(); close(); });
+    const save = document.createElement('button'); save.type = 'button'; save.className = 'tf-ok'; save.textContent = 'Save';
+    save.addEventListener('click', (e) => { e.stopPropagation(); close(); updateTaskFields(t.file, { flags: Array.from(cur) }); });
+    act.appendChild(cancel); act.appendChild(save); menu.appendChild(act);
+    document.body.appendChild(menu);
+    menu.style.position = 'fixed'; menu.style.left = '50%'; menu.style.top = '50%'; menu.style.transform = 'translate(-50%,-50%)'; menu.style.zIndex = '100001';
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+    inp.focus();
   }
 
   // ── Per-row ⋮ action menu ──
@@ -3046,6 +3294,8 @@
     if (t.status === 'blocked') item('↻ Resume',       () => setTaskStatus(t, 'approved'));
     item('✎ Rename…',       () => renameTask(t));
     item('⊞ Set area…',    () => editArea(t));
+    item('🗂 Set project…', () => editProject(t));
+    item('🚩 Flag for meeting…', () => editFlags(t));
     item('⚑ Set priority…', () => editPriority(t));
     item(t.requires_desktop ? '🖥 Requires desktop ✓' : '🖥 Requires desktop', () => toggleRequiresDesktop(t));
     item(isQueued(t) ? '🟢 Queued ✓' : '🟢 Mark queued', () => toggleQueued(t));
@@ -3056,6 +3306,7 @@
     item('⏰ Schedule forward 7 days', () => deferTask(t, 7));
     item('⏰ Schedule forward 15 days', () => deferTask(t, 15));
     item('⏰ Schedule forward 30 days', () => deferTask(t, 30));
+    item('📅 Schedule forward to date…', () => scheduleTaskDate(t));
     sep();
     if (t.status === 'done') item('↺ Reopen', () => setTaskStatus(t, 'new'));
     else                     item('✓ Completed', () => setTaskStatus(t, 'done'));
@@ -3125,10 +3376,13 @@
       const ta = el('textarea', 'flex:1 1 auto;font-family:inherit;font-size:13px;line-height:1.4;padding:8px 10px;min-height:96px;resize:vertical'); ta.placeholder = 'Type your answer…'; if (q.answer) ta.value = q.answer;
       const btn = el('button', 'flex:0 0 auto', 'Submit'); btn.className = 'tc-ok';
       const btnRun = el('button', 'flex:0 0 auto', 'Submit & Run'); btnRun.className = 'q-run'; btnRun.title = 'Save the answer and run this task now if any Claude quota is free';
-      const submit = async (run) => {
-        const v = ta.value.trim(); if (!v) return;
-        btn.disabled = btnRun.disabled = true;
-        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = false; return; }
+      const btnApprove = el('button', 'flex:0 0 auto', 'Approve'); btnApprove.className = 'q-approve'; btnApprove.title = 'Approve: submits the exact word APPROVE (what the autonomy broker needs) and runs it now';
+      const submit = async (opts) => {
+        opts = opts || {};
+        const v = opts.approve ? 'APPROVE' : ta.value.trim();
+        if (!v) return;
+        btn.disabled = btnRun.disabled = btnApprove.disabled = true;
+        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = btnApprove.disabled = false; return; }
         // Reflect the answer on the row dot at once (don't wait for the list poll), then close.
         if (q.status !== 'answered') {
           const o = Math.max(0, (Number(t.open_questions) || 0) - 1);
@@ -3145,13 +3399,21 @@
         }
         // [RUN_NOW_V1] kick an immediate autonomy turn on this task (server-side
         // no-op if no account has spare quota or the loop is not armed).
-        if (run) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
-        close();
+        if (opts.approve && t.status === 'planned') { try { await jsend(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, 'POST', { status: 'approved' }); } catch (e) {} }
+        if (opts.run || opts.approve) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
+        // Several questions can be pending at once — refresh the list in place and keep
+        // the modal open until every one is answered; only auto-close on the last.
+        await renderQuestions();
+        if (!qSec.querySelector('.q-answerbox')) close();
       };
-      btn.onclick = () => submit(false);
-      btnRun.onclick = () => submit(true);
+      btn.onclick = () => submit();
+      btnRun.onclick = () => submit({ run: true });
+      btnApprove.onclick = () => submit({ approve: true });
       const btnCol = el('div', 'display:flex;flex-direction:column;gap:6px;flex:0 0 auto');
       btnCol.appendChild(btn); btnCol.appendChild(btnRun);
+      // Only offer Approve when the question is an approval request — the broker
+      // always includes the literal token APPROVE (e.g. "Reply APPROVE to run").
+      if (/\bAPPROVE\b/.test(q.question || '')) btnCol.appendChild(btnApprove);
       box.appendChild(ta); box.appendChild(btnCol); row.appendChild(box);
     }
     async function renderQuestions(){
@@ -3404,6 +3666,8 @@
     title.className = 'task-title-cell';
     title.textContent = t.title;
     if (t.session) { const c = document.createElement('span'); c.className = 'task-chat-dot'; c.textContent = ' 💬'; c.title = 'Has a chat thread'; title.appendChild(c); }
+    const _tf = Array.isArray(t.flags) ? t.flags : [];
+    if (_tf.length) { const fc = document.createElement('span'); fc.className = 'task-flags'; _tf.forEach(f => { const chip = document.createElement('span'); chip.className = 'task-flag'; chip.textContent = '🚩 ' + f; chip.title = 'Flagged for ' + f; fc.appendChild(chip); }); title.appendChild(fc); }
 
     const badge = document.createElement('span');
     if (String(t.type || '').trim()) {
@@ -3584,12 +3848,16 @@
       sel => { taskState.person = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All People');
     if (!menuOpen('tf-project-menu')) renderCheckMenu($('tf-project-menu'), optsFor('project'), taskState.project,
       sel => { taskState.project = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Projects');
+    const flagOpts = (() => { const set = new Set(flagPresets); tasks.forEach(t => (Array.isArray(t.flags) ? t.flags : []).forEach(f => f && set.add(f))); const arr = Array.from(set).sort(); return arr.concat(tasks.some(t => !(Array.isArray(t.flags) && t.flags.length)) ? ['__none__'] : []); })();
+    if (!menuOpen('tf-flag-menu')) renderCheckMenu($('tf-flag-menu'), flagOpts, taskState.flags,
+      sel => { taskState.flags = sel; saveTaskState(); renderTasks(lastTasks); }, v => v === '__none__' ? '(no flag)' : ('🚩 ' + v), 'All Flags');
     buildDateMenu();
     setFilterBtn($('tf-status'), taskState.status, 'Status', prettyStatus);
     setFilterBtn($('tf-area'), taskState.area, 'Area', noneLabel);
     setFilterBtn($('tf-type'), taskState.type, 'Type', noneLabel);
     setFilterBtn($('tf-person'), taskState.person, 'Person', noneLabel);
     setFilterBtn($('tf-project'), taskState.project, 'Project', noneLabel);
+    setFilterBtn($('tf-flag'), taskState.flags, 'Flag', v => v === '__none__' ? '(no flag)' : v);
   }
 
   // ── Sort-header arrows ──
@@ -3626,6 +3894,7 @@
     wireDropdown('tf-type', 'tf-type-menu');
     wireDropdown('tf-person', 'tf-person-menu');
     wireDropdown('tf-project', 'tf-project-menu');
+    wireDropdown('tf-flag', 'tf-flag-menu');
     buildDateMenu();
     document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
       th.addEventListener('click', () => {
@@ -3659,6 +3928,7 @@
       const data = await res.json();
       lastTasks = data.tasks || [];
       renderTasks(lastTasks);
+      loadFlagPresets();
     } catch (_) {}
   }
 

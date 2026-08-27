@@ -31,7 +31,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
   width: 24vw;
   min-width: 340px;
   max-width: 470px;
-  background: var(--bg-panel);
+  background: var(--room-bg, var(--bg-panel));
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -84,9 +84,10 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #session-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 #session-list::-webkit-scrollbar { width: 4px; }
 #session-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-#session-footer { flex: 0 0 auto; }
+#session-footer { flex: 0 0 auto; max-height: 40vh; overflow-y: auto; }
 #session-footer .sess-new { border-bottom: none; border-top: 1px solid var(--border); }
 #task-rooms-box { max-height: 200px; overflow-y: auto; }
+#archived-rooms-box { max-height: 200px; overflow-y: auto; }
 #settings-dropdown #btn-logout { color: var(--red); }
 #session-search {
   flex: 0 0 auto; margin: 6px 6px 4px; padding: 6px 8px; font-size: 12px;
@@ -270,7 +271,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .tasks-panel-hidden { display: none !important; }
 .tasks-panel-visible {
   width: 24vw; min-width: 300px; max-width: 480px;
-  background: #11161f; border-right: 1px solid var(--border);
+  background: var(--room-bg, #11161f); border-right: 1px solid var(--border);
   display: flex; flex-direction: column; overflow: hidden; flex-shrink: 0;
   order: -1; /* render to the left of #chat-panel */
 }
@@ -520,6 +521,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .task-details input::placeholder { color: var(--text-dim); }
 .task-details .tc-ok,
 .task-details .tc-cancel,
+.task-details .q-approve,
 .task-details .q-run {
   font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
   border: 1px solid var(--border); border-radius: 6px; padding: 7px 14px;
@@ -529,6 +531,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .task-details .tc-ok:hover  { filter: brightness(1.1); }
 .task-details .q-run  { background: var(--green); border-color: var(--green); color: #fff; }
 .task-details .q-run:hover  { filter: brightness(1.1); }
+.task-details .q-approve  { background: #16a34a; border-color: #16a34a; color: #fff; }
+.task-details .q-approve:hover  { filter: brightness(1.1); }
 .task-details .tc-cancel { background: none; color: var(--text-dim); font-weight: 500; }
 .task-details .tc-cancel:hover { color: var(--text); border-color: var(--text-dim); }
 
@@ -795,7 +799,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #divider:hover, #divider.dragging { background: var(--accent); }
 
 /* ── Browser panel ── */
-#browser-panel { flex: 1; position: relative; overflow: hidden; background: #000; min-width: 0; }
+#browser-panel { flex: 1; position: relative; overflow: hidden; background: var(--room-bg, #000); min-width: 0; }
 
 #vnc-frame { width: 100%; height: 100%; border: none; display: block; }
 
@@ -1117,3 +1121,47 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
 .st-engine { margin-left: 6px; font-size: 11px; line-height: 1.4; padding: 1px 4px; border-radius: 6px; border: 1px solid var(--border, #3a3a3a); background: transparent; color: inherit; cursor: pointer; opacity: .75; }
 .st-engine:hover { opacity: 1; }
 .st-engine.eng-codex { border-color: rgba(16,163,127,.6); color: #10a37f; }
+
+
+/* ── Per-room background colour picker ─────────────────────────────────────── */
+#session-titlebar { position: relative; }
+.st-color { flex: 0 0 auto; cursor: pointer; opacity: .55; font-size: .9em; padding: 0 2px; border-radius: 4px; }
+.st-color:hover { opacity: 1; }
+#color-pop { position: absolute; top: 100%; right: 8px; margin-top: 4px; z-index: 60;
+  display: flex; flex-wrap: wrap; gap: 6px; width: 156px; padding: 8px;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+#color-pop.hidden { display: none; }
+#color-pop .sw { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--border);
+  cursor: pointer; color: var(--text-dim); font-size: 14px; line-height: 24px; text-align: center; padding: 0; }
+#color-pop .sw.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
+#color-pop .sw-sep { flex: 0 0 100%; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; margin: 4px 0 -2px; }
+#color-pop .sw-custom { width: 26px; height: 26px; padding: 0; border: 1px solid var(--border);
+  border-radius: 6px; background: none; cursor: pointer; }
+
+
+/* ── Task meeting flags ── */
+.task-flags { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 6px; vertical-align: middle; }
+.task-flag { font-size: 10px; line-height: 1.5; padding: 0 6px; border-radius: 999px; white-space: nowrap;
+  background: rgba(255,80,80,.15); color: #ff8f8f; border: 1px solid rgba(255,80,80,.35); }
+.flag-picker { min-width: 240px; max-width: 300px; padding: 8px; }
+.task-menu-head { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; padding: 2px 6px 6px; }
+.flag-scroll { max-height: 220px; overflow: auto; display: flex; flex-direction: column; gap: 2px; }
+.flag-opt { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+.flag-opt:hover { background: rgba(255,255,255,.06); }
+.flag-empty { font-size: 12px; opacity: .5; padding: 6px; }
+.flag-add { display: flex; gap: 6px; margin-top: 8px; }
+.flag-add input { flex: 1 1 auto; font-size: 13px; padding: 5px 8px; }
+.flag-add button { flex: 0 0 auto; padding: 0 10px; cursor: pointer; }
+.flag-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; }
+
+/* Settings > Meeting Flags manager */
+.fp-list { display:flex; flex-direction:column; gap:6px; margin-bottom:12px; }
+.fp-row { display:flex; align-items:center; gap:8px; padding:6px 8px; border:1px solid rgba(255,80,80,.28); background:rgba(255,80,80,.08); border-radius:8px; }
+.fp-flag { flex:1; font-size:13px; color:#ff9a9a; }
+.fp-del { background:transparent; border:none; color:var(--text-dim,#999); cursor:pointer; font-size:13px; padding:2px 6px; border-radius:6px; }
+.fp-del:hover { background:rgba(255,80,80,.2); color:#ff8f8f; }
+.fp-add { display:flex; gap:6px; }
+.fp-add input { flex:1; padding:6px 8px; font-size:13px; border-radius:8px; border:1px solid var(--border,#333); background:var(--bg,#151515); color:var(--text,#eee); }
+.fp-add button { padding:6px 12px; font-size:13px; border-radius:8px; border:1px solid var(--border,#333); background:var(--accent,#3b82f6); color:#fff; cursor:pointer; white-space:nowrap; }
+.fp-add button:disabled { opacity:.5; cursor:default; }

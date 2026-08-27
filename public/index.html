@@ -6,7 +6,7 @@
   <title>Claude Code Bridge</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <script src="config.js"></script>
-  <link rel="stylesheet" href="style.css?v=qstyle-20260813" />
+  <link rel="stylesheet" href="style.css?v=recents-20260826-012434" />
   <script>try{var t=localStorage.getItem('ccb-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
 </head>
 <body>
@@ -47,6 +47,7 @@
           <div id="settings-dropdown" class="hidden">
             <a href="connectors.html" id="btn-connectors" title="MCP Connectors">⚡ Connectors</a>
             <button id="btn-infra-health" title="Daily browser & loop health checks">🩺 Infra Health</button>
+            <button id="btn-meeting-flags" title="Manage reusable meeting flags">🚩 Meeting Flags</button>
             <button id="btn-theme" title="Toggle light / dark theme">☀️ Light mode</button>
             <button id="btn-switch-account" title="Switch Claude account">👤 Accounts</button>
             <button id="btn-logout" title="Sign out">🚪 Sign Out</button>
@@ -58,6 +59,7 @@
     <div id="session-titlebar">
       <span id="st-name" class="st-name">New room</span>
       <span id="st-edit" class="st-edit" title="Rename room">✎</span>
+      <span id="st-color" class="st-color" title="Room background colour">🎨</span>
       <select id="st-engine" class="st-engine" title="Engine for this room" style="display:none">
         <option value="global">Global</option>
         <option value="claude">Claude</option>
@@ -65,6 +67,7 @@
       </select>
       <span id="st-task" class="st-task"></span>
       <span id="st-id" class="st-id" title="">—</span>
+      <div id="color-pop" class="hidden"></div>
     </div>
 
     <!-- Status stack: conn bar + usage + activity line (collapses into mobile dropdown) -->
@@ -200,6 +203,10 @@
           <button id="tf-project" class="tf-btn" title="Filter by project">Project ▾</button>
           <div id="tf-project-menu" class="tf-menu hidden"></div>
         </div>
+        <div class="tf-dd">
+          <button id="tf-flag" class="tf-btn" title="Filter by meeting flag">Flag ▾</button>
+          <div id="tf-flag-menu" class="tf-menu hidden"></div>
+        </div>
       </div>
       <div id="tasks-thead">
         <span class="th" data-sort="id" title="Sort by task number">#</span>
@@ -251,6 +258,6 @@
 <div id="toast-container"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="app.js?v=taskroomname-20260824"></script>
+<script src="app.js?v=flagpresets-20260827-011500"></script>
 </body>
 </html>

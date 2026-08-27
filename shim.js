@@ -42,6 +42,10 @@ let chain = Promise.resolve();
 // (that path adds the tab itself — attributing too would double-add).
 let activeRoom = null;
 let expectingNewTab = false;
+// [SHIM_ATTRIB_RECENCY_V1] Max age of activeRoom's last MCP call for it to still
+// "own" an openerless new tab. Beyond this the room is idle and the tab is almost
+// certainly foreign (e.g. an autonomy CDP drainer's ctx.newPage()), so leave it ORPHAN.
+const ATTRIB_WINDOW_MS = Number(process.env.SHIM_ATTRIB_WINDOW_MS) || 15000;
 // Global mutex: every tab create / select / forwarded call is serialised so the
 // upstream MCP's single "active tab" pointer can't be raced between rooms.
 const lock = (fn) => { const r = chain.then(fn, fn); chain = r.then(() => {}, () => {}); return r; };
@@ -76,7 +80,7 @@ async function connectCDP() {
       if (m.method === 'Target.targetCreated')     addTarget(m.params.targetInfo);
       else if (m.method === 'Target.targetInfoChanged') addTarget(m.params.targetInfo);
       else if (m.method === 'Target.targetDestroyed')   removeTarget(m.params.targetId);
-      else if (m.method === 'Target.targetCrashed')      removeTarget(m.params.targetId);
+      else if (m.method === 'Target.targetCrashed')      onTargetCrashed(m.params.targetId);
     });
     cdpWs.on('close', () => { log('CDP socket closed — reconnecting'); cdpReady = null; pageTargets = []; setTimeout(ensureCDP, 1000); });
   });
@@ -102,7 +106,57 @@ function addTarget(ti) {
 //      rel=noopener links, Gmail compose-in-window, OAuth redirects — NO openerId);
 //  (c) neither        -> genuine ORPHAN (logged, left for the monitor/reaper).
 // Skipped while an explicit browser_tabs 'new' is in flight (that path owns the tab).
+/* ---------- [SHIM_OWNERSHIP_PERSIST_V1] room->tab-URL ownership persistence ----------
+   The in-memory `rooms` map (tab ownership) is lost on every shim respawn, so after a
+   restart every pre-existing tab is seen as new and falls to ORPHAN — then the first
+   active room claims it, STEALING a concurrent room's tab and blanking its live view.
+   Persist each room's tab URLs; on boot re-bind orphan tabs to their original room by
+   URL (during a short adoption window) so no tab is lost or hijacked. */
+const OWNERSHIP_FILE = process.env.SHIM_OWNERSHIP_FILE || require('path').join(process.env.HOME || '/home/bridge-peter', '.claude', 'shim-room-ownership.json');
+const REBIND_WINDOW_MS = parseInt(process.env.SHIM_REBIND_WINDOW_MS || '60000', 10);
+const _ownBootTs = Date.now();
+const persistedOwnerByUrl = new Map();   // url -> roomId (only URLs with a single prior owner)
+const persistedCurByRoom  = new Map();   // roomId -> its current tab's url
+try {
+  const raw = JSON.parse(require('fs').readFileSync(OWNERSHIP_FILE, 'utf8'));
+  const owners = new Map();               // url -> Set(roomId)
+  for (const [rid, o] of raw) {
+    if (o && o.cur) persistedCurByRoom.set(rid, o.cur);
+    for (const u of (o && o.urls) || []) { if (!u || u === 'about:blank') continue; if (!owners.has(u)) owners.set(u, new Set()); owners.get(u).add(rid); }
+  }
+  for (const [u, set] of owners) if (set.size === 1) persistedOwnerByUrl.set(u, [...set][0]);
+  if (persistedOwnerByUrl.size) log('loaded', persistedOwnerByUrl.size, 'persisted tab-ownership URL(s) for post-restart re-bind');
+} catch (e) {}
+function saveOwnership() {
+  try {
+    const out = [];
+    for (const [rid, rt] of rooms) {
+      if (!rt.tabs || !rt.tabs.length) continue;
+      const urls = rt.tabs.map(t => targetUrl.get(t)).filter(u => u && u !== 'about:blank');
+      if (!urls.length) continue;
+      out.push([rid, { urls, cur: (rt.current && targetUrl.get(rt.current)) || null }]);
+    }
+    require('fs').writeFileSync(OWNERSHIP_FILE, JSON.stringify(out), 'utf8');
+  } catch (e) {}
+}
+const _ownTimer = setInterval(saveOwnership, 5000); if (_ownTimer.unref) _ownTimer.unref();
 function ownedByAny(tid) { for (const [, rt] of rooms) if (rt.tabs && rt.tabs.includes(tid)) return true; return false; }
+// [SHIM_STICKY_DOMAINS_V1] Authenticated / session-bearing tabs (webmail, OAuth, WhatsApp)
+// must never be silently LRU-evicted or re-attributed to another room — losing one drops a
+// live login and forces a re-auth. Configurable via SHIM_STICKY_DOMAINS (comma list).
+const STICKY_DOMAINS = (process.env.SHIM_STICKY_DOMAINS ||
+  'mail.google.com,accounts.google.com,outlook.cloud.microsoft,outlook.office.com,outlook.office365.com,login.microsoftonline.com,web.whatsapp.com')
+  .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+function stickyDomainOf(u) { if (!u) return null; u = String(u).toLowerCase(); return STICKY_DOMAINS.find(d => u.includes(d)) || null; }
+function isStickyUrl(u) { return !!stickyDomainOf(u); }
+function sameStickyDomain(a, b) { const x = stickyDomainOf(a); return !!x && x === stickyDomainOf(b); }
+function tabIsSticky(rt, tid) { return isStickyUrl(targetUrl.get(tid) || (rt && rt.current === tid ? rt.lastUrl : null)); }
+function roomIsSticky(rt) {
+  if (!rt || !rt.tabs) return false;
+  if (isStickyUrl(rt.lastUrl)) return true;
+  for (const t of rt.tabs) if (isStickyUrl(targetUrl.get(t))) return true;
+  return false;
+}
 function attributeNewTab(ti) {
   if (ownedByAny(ti.targetId)) return;
   // (a) opener match
@@ -115,10 +169,46 @@ function attributeNewTab(ti) {
       }
     }
   }
+  // [SHIM_OWNERSHIP_PERSIST_V1] Re-bind by URL to the room that owned this tab before a
+  // restart — takes priority over active-room attribution so a resuming room can't steal
+  // a concurrent room's tab. Only within the post-boot adoption window, only for an
+  // unambiguous single-owner URL, never mid explicit 'new'. Consume the URL (re-bind one).
+  if (!expectingNewTab && (Date.now() - _ownBootTs) < REBIND_WINDOW_MS && ti.url && persistedOwnerByUrl.has(ti.url)) {
+    const rid = persistedOwnerByUrl.get(ti.url);
+    let rt = rooms.get(rid);
+    if (!rt) { rt = { tabs: [], current: null, lastUrl: null, lastUsed: 0 }; rooms.set(rid, rt); }
+    rt.tabs.push(ti.targetId);
+    if (persistedCurByRoom.get(rid) === ti.url || !rt.current) rt.current = ti.targetId;
+    rt.lastUrl = ti.url;
+    persistedOwnerByUrl.delete(ti.url);
+    log('re-bound orphan tab', ti.targetId, 'url', (ti.url || '').slice(0, 60), '-> room', rid, '(post-restart ownership)');
+    return;
+  }
   // (b) active-room attribution (skip while an explicit 'new' is being added by its handler)
   if (!expectingNewTab && activeRoom) {
     const rt = rooms.get(activeRoom);
-    if (rt && rt.current) {
+    // [SHIM_STICKY_DOMAINS_V1] A tab that arrives already on a session/auth domain must not
+    // be glued onto whatever room held the floor. Hand it to the room already on that same
+    // domain; if none (and the floor-holder isn't on it either) leave it ORPHAN, never mis-own.
+    if (isStickyUrl(ti.url)) {
+      for (const [room2, r2] of rooms) {
+        if (r2 !== rt && sameStickyDomain(r2.lastUrl, ti.url)) {
+          r2.tabs.push(ti.targetId); r2.current = ti.targetId; r2.lastUrl = ti.url;
+          log('room', room2, 'claimed sticky tab', ti.targetId, 'url', ti.url, '(domain match)');
+          return;
+        }
+      }
+      if (!(rt && sameStickyDomain(rt.lastUrl, ti.url))) {
+        log('ORPHAN sticky tab', ti.targetId, 'url', ti.url, '- floor-holder', activeRoom, 'not on this domain; not gluing');
+        return;
+      }
+    }
+    // [SHIM_ATTRIB_RECENCY_V1] Only adopt an openerless tab if this room is genuinely
+    // MID-ACTION. The deterministic CDP drainers (autonomy-*-drain.js) open tabs via
+    // ctx.newPage() straight over CDP, bypassing the shim mount, so they never refresh
+    // any room's lastUsed. Without this gate their tabs get glued onto whichever room
+    // last held the floor, hijacking its `current` and cross-contaminating its live pane.
+    if (rt && rt.current && rt.lastUsed && (Date.now() - rt.lastUsed) < ATTRIB_WINDOW_MS) {
       rt.tabs.push(ti.targetId); rt.current = ti.targetId;
       log('room', activeRoom, 'attributed new tab', ti.targetId, '(no opener) url', ti.url || '(none)', '- now', rt.tabs.length, 'tabs');
       return;
@@ -144,6 +234,29 @@ function removeTarget(id) {
   }
 }
 function ensureCDP() { if (!cdpReady) cdpReady = connectCDP().catch(e => { cdpReady = null; log('CDP connect failed:', e.message); }); return cdpReady; }
+
+// CDP-close a page target directly over the DevTools HTTP endpoint. This works even
+// while Playwright's browser_tabs is wedged on a poisoned tab, so it's the lever for
+// evicting a bad tab WITHOUT restarting the whole browser stack.
+async function cdpCloseTarget(id) {
+  try { await fetch(`${CDP_URL}/json/close/${id}`); return true; } catch { return false; }
+}
+// [SHIM_CRASH_AUTOCLOSE_V1] A crashed renderer is NOT destroyed — Chrome keeps the
+// page target alive as a zombie, so Playwright's browser_tabs re-attaches to it and
+// blocks for its full 30s timeout on EVERY call (the poisoned-tab wedge). CDP
+// /json/close still reaps it, so close it the instant we see the crash — before it can
+// wedge browser_tabs — then drop our tracking. Never close the last remaining page
+// (that would kill the window); the watchdog's renderer sweep is the backstop for that
+// rare case. See [[wedge-poisoned-duplicate-tab]].
+function onTargetCrashed(id) {
+  if (pageTargets.length > 1) {
+    log('target crashed', id, '- CDP-closing zombie tab before it wedges browser_tabs');
+    cdpCloseTarget(id).catch(() => {});
+  } else {
+    log('target crashed', id, '- last page, leaving for watchdog sweep');
+  }
+  removeTarget(id);
+}
 
 // Add-only reconcile of pageTargets against Chrome's authoritative /json list.
 // The CDP websocket can drop a Target.targetCreated during churn, leaving a real
@@ -225,7 +338,28 @@ async function resyncOrder() {
     return true;
   } catch (e) { log('resyncOrder failed:', String(e && e.message || e)); return false; }
 }
-async function reinit() { closeUpStream(); upstreamSid = null; toolsCache = null; orderDirty = true; await ensureUpstream(); await resyncOrder(); }
+// ── REINIT STORM self-heal ───────────────────────────────────────────────
+// A Chrome OOM-restart flaps the upstream MCP; up() then 404s -> 'session expired'
+// -> reinit(), which can become a fast doom loop that keeps wiping per-room tab
+// tracking (relay shows a blank pane). The watchdog only catches HANGS, not this
+// fast-error storm, so it used to spin for hours until a manual shim restart.
+// Detect the storm and exit(0); the supervisor respawns a clean shim in ~5s that
+// gets a fresh MCP session and reloads persisted aliases — ending the loop itself.
+const REINIT_STORM_MAX    = parseInt(process.env.SHIM_REINIT_STORM_MAX || '8', 10);
+const REINIT_STORM_WINDOW = parseInt(process.env.SHIM_REINIT_STORM_WINDOW_MS || '120000', 10);
+const _shimBootTs = Date.now();
+let _reinitTs = [];
+function _noteReinit() {
+  const now = Date.now();
+  if (now - _shimBootTs < 30000) return;                 // ignore startup churn
+  _reinitTs = _reinitTs.filter(t => now - t <= REINIT_STORM_WINDOW);
+  _reinitTs.push(now);
+  if (_reinitTs.length >= REINIT_STORM_MAX) {
+    log(`REINIT STORM: ${_reinitTs.length} upstream re-inits within ${Math.round(REINIT_STORM_WINDOW/1000)}s — session-expired doom loop; exiting for a clean supervisor respawn`);
+    setTimeout(() => process.exit(0), 200);              // let the log flush
+  }
+}
+async function reinit() { _noteReinit(); closeUpStream(); upstreamSid = null; toolsCache = null; orderDirty = true; await ensureUpstream(); await resyncOrder(); }
 async function withRetry(fn) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let r;
@@ -286,7 +420,9 @@ function readMaxTabs() {
   const n = parseInt(v || '8'); return Number.isFinite(n) ? n : 8;
 }
 const MAX_ROOM_TABS = readMaxTabs();
-function liveTabCount() { let n = 0; for (const rt of rooms.values()) n += (rt.tabs ? rt.tabs.length : 0); return n; }
+// [SHIM_STICKY_DOMAINS_V1] Sticky (logged-in) tabs are exempt from the cap: a handful of
+// webmail/WhatsApp sessions must not push transient task tabs into forced eviction.
+function liveTabCount() { let n = 0; for (const rt of rooms.values()) if (rt.tabs) for (const t of rt.tabs) if (!tabIsSticky(rt, t)) n++; return n; }
 async function evictIfNeeded(keepRoom) {
   if (MAX_ROOM_TABS <= 0) return;
   let guard = 0;
@@ -294,6 +430,7 @@ async function evictIfNeeded(keepRoom) {
     let vkey = null, victim = null, oldest = Infinity;
     for (const [rk, rt] of rooms) {
       if (rk === keepRoom || rk === activeRoom) continue;        // never evict requester / floor-holder
+      if (roomIsSticky(rt)) continue;                            // [SHIM_STICKY_DOMAINS_V1] never evict a live login/webmail tab
       if (!rt.tabs || !rt.tabs.length) continue;
       const lu = rt.lastUsed || 0;
       if (lu < oldest) { oldest = lu; victim = rt; vkey = rk; }
@@ -530,6 +667,7 @@ const WATCHDOG_MS      = parseInt(process.env.SHIM_WATCHDOG_MS || '30000');
 const WATCHDOG_TIMEOUT = parseInt(process.env.SHIM_WATCHDOG_TIMEOUT_MS || '20000');
 const WATCHDOG_FAILS   = parseInt(process.env.SHIM_WATCHDOG_FAILS || '2');
 const WATCHDOG_WINDOW  = parseInt(process.env.SHIM_WATCHDOG_WINDOW_MS || '180000'); // hangs count within this window, need NOT be consecutive
+const POISON_PROBE_MS  = parseInt(process.env.SHIM_POISON_PROBE_MS || '4000');      // per-tab renderer-health probe timeout (crashed renderers never answer)
 const MCP_PIDFILE      = process.env.MCP_PIDFILE || `${process.env.HOME}/.claude/bridge-mcp.pid`;
 let wdHangs = [], wdBusy = false;
 // The wedge signature is a browser op that HANGS (times out), not a fast HTTP error.
@@ -561,6 +699,44 @@ async function reapAllOrphans() {
       try { await fetch(`${CDP_URL}/json/close/${t.id}`); remaining--; log('WATCHDOG reaped orphan tab', t.id, (t.url||'').slice(0,60)); } catch {} }
   } catch {}
 }
+// [SHIM_POISON_SWEEP_V1] Probe ONE page target's renderer over its OWN CDP websocket
+// with a short timeout. A live renderer answers Runtime.evaluate near-instantly; a
+// crashed/stuck one never does. Returns true = healthy, false = poisoned (timed out or
+// errored). Uses the page's dedicated debugger ws so it does NOT touch the wedged
+// Playwright<->browser session.
+function probeRenderer(wsUrl, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false, ws;
+    const finish = (ok) => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close(); } catch {} resolve(ok); };
+    const t = setTimeout(() => finish(false), timeoutMs);
+    try {
+      ws = new WebSocket(wsUrl, { perMessageDeflate: false });
+      ws.on('open', () => { try { ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: '0', returnByValue: true } })); } catch { finish(false); } });
+      ws.on('message', () => finish(true));
+      ws.on('error', () => finish(false));
+    } catch { finish(false); }
+  });
+}
+// On a watchdog hang the cause is usually ONE poisoned tab whose crashed renderer
+// blocks browser_tabs for the full Playwright timeout. Find it by probing every page
+// target's renderer directly over CDP (works while the Playwright layer is wedged) and
+// CDP-close the unresponsive ones — recovering WITHOUT a full-stack restart. Never
+// closes the last remaining page. Returns how many tabs were closed.
+async function reapPoisonedTabs() {
+  let pages; try { pages = (await (await fetch(`${CDP_URL}/json`)).json()).filter(t => t.type === 'page'); } catch { return 0; }
+  let remaining = pages.length, closed = 0;
+  for (const p of pages) {
+    if (remaining <= 1) break;                       // never close the last page
+    if (!p.webSocketDebuggerUrl) continue;
+    if (await probeRenderer(p.webSocketDebuggerUrl, POISON_PROBE_MS)) continue;   // healthy, keep
+    if (await cdpCloseTarget(p.id)) {
+      remaining--; closed++;
+      removeTarget(p.id);                            // drop tracking + detach from its room (re-creates on next use)
+      log('WATCHDOG closed poisoned tab', p.id, (p.url||'').slice(0,60));
+    }
+  }
+  return closed;
+}
 function restartUpstream() {
   reapAllOrphans().catch(() => {});
   try { const pid = parseInt(require('fs').readFileSync(MCP_PIDFILE, 'utf8').trim());
@@ -577,7 +753,12 @@ if (WATCHDOG_MS > 0) setInterval(async () => {
       const now = Date.now();
       wdHangs = wdHangs.filter(ts => now - ts <= WATCHDOG_WINDOW); wdHangs.push(now);
       log(`WATCHDOG browser op hung (${wdHangs.length}/${WATCHDOG_FAILS} within ${Math.round(WATCHDOG_WINDOW/1000)}s)`);
-      if (wdHangs.length >= WATCHDOG_FAILS) { restartUpstream(); wdHangs = []; }
+      // Targeted recovery FIRST: a hang is almost always one poisoned tab. Close it
+      // directly via CDP (no stack restart, goal of task-327). If that clears a bad
+      // tab, reset the counter and re-probe next tick before considering an MCP kill.
+      const closed = await reapPoisonedTabs();
+      if (closed) { log('WATCHDOG poisoned-tab sweep closed', closed, 'tab(s) — no MCP restart, re-probing next tick'); wdHangs = []; }
+      else if (wdHangs.length >= WATCHDOG_FAILS) { restartUpstream(); wdHangs = []; }
     }
     // 'other' = fast session/HTTP error: neutral, neither health nor a hang.
   } finally { wdBusy = false; }

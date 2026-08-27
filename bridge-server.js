@@ -90,6 +90,37 @@ app.get('/config.js', (req, res) => {
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// ── Per-room background colour: recent-colours store (shared across this user's browsers) ──
+const ROOMBG_RECENTS_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'roombg-recents.json');
+app.get('/roombg/recents', (req, res) => {
+  try { const a = JSON.parse(fs.readFileSync(ROOMBG_RECENTS_FILE, 'utf8')); res.json(Array.isArray(a) ? a : []); }
+  catch { res.json([]); }
+});
+app.post('/roombg/recents', (req, res) => {
+  const seen = new Set();
+  const colors = ((req.body && Array.isArray(req.body.colors)) ? req.body.colors : [])
+    .filter(c => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c))
+    .map(c => c.toLowerCase())
+    .filter(c => (seen.has(c) ? false : (seen.add(c), true)))
+    .slice(0, 12);
+  try { fs.writeFileSync(ROOMBG_RECENTS_FILE, JSON.stringify(colors)); res.json({ ok: true, colors }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// [INFRA_HEALTH_V1] Serve the daily infra-health snapshot for Settings > Infra Health.
+// infra-health-check.sh (cron, 04:00 BA) writes ~/.claude/autonomy/infra-health-status.json
+// (latest per-check snapshot) + appends infra-health-history.jsonl (one line per run).
+app.get('/infra-health', (req, res) => {
+  const dir = path.join(process.env.HOME || os.homedir(), '.claude', 'autonomy');
+  let status = null, history = [];
+  try { status = JSON.parse(fs.readFileSync(path.join(dir, 'infra-health-status.json'), 'utf8')); } catch {}
+  try {
+    const lines = fs.readFileSync(path.join(dir, 'infra-health-history.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    history = lines.slice(-30).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+  } catch {}
+  res.json({ status, history });
+});
+
 // ── Task panel: list/create/update/delete tasks in ~/workspace/tasks/ ─────────
 // Each task is a markdown file with YAML-ish frontmatter. Tasks are per-user
 // because each bridge process runs with a different HOME (bridge-peter/roy/john).
@@ -1795,6 +1826,32 @@ const heartbeat = setInterval(() => {
   });
 }, PING_INTERVAL);
 wss.on('close', () => clearInterval(heartbeat));
+
+// ── Memory-bounded self-recycle (leak guard) ─────────────────────────────
+// This process slowly leaks heap over days (retained caches / session maps), and
+// Node rarely returns freed heap to the OS, so on a memory-tight box RSS climbs
+// until Chrome gets OOM-killed. Rather than chase every retained ref, bound the
+// process by memory: when RSS crosses a threshold AND no turn is mid-flight, kill
+// child procs (so none are orphaned) and exit(0). The ccbmon-bridge supervisor
+// relaunches a fresh process in ~3s; clients auto-reconnect and each room resumes
+// losslessly from its transcript (--resume). Tunable via env.
+const RSS_SOFT_MB = parseInt(process.env.BRIDGE_RSS_SOFT_MB, 10) || 900;   // recycle when fully idle (no clients)
+const RSS_HARD_MB = parseInt(process.env.BRIDGE_RSS_HARD_MB, 10) || 1400;  // recycle even with clients attached (never mid-turn)
+const _memGuard = setInterval(() => {
+  let rssMb;
+  try { rssMb = Math.round(process.memoryUsage().rss / 1048576); } catch { return; }
+  if (rssMb < RSS_SOFT_MB) return;
+  const anyProcessing = [...clientSessions.values()].some(s => s.processing || (s.pendingTurns || 0) > 0);
+  if (anyProcessing) return;                                  // never recycle mid-turn
+  const connected = wss.clients.size;
+  const reason = rssMb >= RSS_HARD_MB ? 'hard' : (connected === 0 ? 'soft-idle' : null);
+  if (!reason) return;                                        // over soft but clients attached -> wait for an idle window
+  console.log(`[Bridge] Memory-recycle (${reason}): RSS ${rssMb}MB, ${connected} client(s), ${clientSessions.size} room(s) — killing children + exiting for supervisor relaunch`);
+  for (const s of clientSessions.values()) { try { s.currentProc && s.currentProc.kill('SIGKILL'); } catch {} }
+  setTimeout(() => process.exit(0), 250);                     // let the log flush + child SIGKILLs land
+}, 60_000);
+if (_memGuard.unref) _memGuard.unref();
+
 
 // ── One client = one persistent Claude Code session ───────────────────────────
 // Claude is spawned per-turn with --resume so context persists. The Playwright
