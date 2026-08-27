@@ -138,14 +138,26 @@ async function sweepOrphanBlanks() {
     for (const r of rooms.values()) if (r.targetId) owned.add(r.targetId); // relay-owned windows
     const nowOrphan = new Set();
     const toClose = [];
+    let pageCount = 0;
     for (const t of list) {
-      if (t.type !== 'page' || t.url !== 'about:blank' || owned.has(t.id)) continue;
+      if (t.type !== 'page') continue;
+      pageCount++;
+      if (t.url !== 'about:blank' || owned.has(t.id)) continue;
       nowOrphan.add(t.id);
       if (_prevOrphans.has(t.id)) toClose.push(t.id);
     }
-    for (const id of toClose) { await cdpClose(id); nowOrphan.delete(id); }
+    // Never close Chrome's LAST page target. Closing the final tab makes Chrome
+    // exit, which drops CDP and takes every room's live view down; start-browser.sh
+    // then relaunches Chrome, the next sweep kills the fresh about:blank, and the
+    // browser flaps every ~2 min (seen on idle rooms whose only tab is about:blank).
+    // Keep at least one page alive even if it is an unowned blank.
+    let closed = 0;
+    for (const id of toClose) {
+      if (pageCount - closed <= 1) break;
+      await cdpClose(id); nowOrphan.delete(id); closed++;
+    }
     _prevOrphans = nowOrphan;
-    if (toClose.length) log('sweep: closed', toClose.length, 'orphan about:blank');
+    if (closed) log('sweep: closed', closed, 'orphan about:blank');
   } catch (e) { log('sweep err', e.message); }
 }
 
