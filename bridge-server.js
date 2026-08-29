@@ -90,6 +90,30 @@ app.get('/config.js', (req, res) => {
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// [ROOMTABS_V1] Per-room tab-health diagnostic + live screenshot for Settings > Room
+// browser health. The room-view relay binds localhost only (reachable from here, not
+// from the client), so proxy its /roomtabs (JSON) and /shot (JPEG) through the bridge.
+app.get('/roomtabs', async (req, res) => {
+  if (!ROOMVIEW_PORT) return res.json({ error: 'roomview off', tabs: [], orphans: [], multiRoom: [], counts: {} });
+  try {
+    const room = req.query.room ? String(req.query.room) : '';
+    const r = await fetch(`http://127.0.0.1:${ROOMVIEW_PORT}/roomtabs?room=${encodeURIComponent(room)}`);
+    res.set('Cache-Control', 'no-store');
+    res.status(r.status).type('application/json').send(await r.text());
+  } catch (e) { res.status(502).json({ error: String(e && e.message || e) }); }
+});
+app.get('/roomshot', (req, res) => {
+  if (!ROOMVIEW_PORT) return res.status(404).end();
+  const room = req.query.room ? String(req.query.room) : '';
+  const preq = http.get(`http://127.0.0.1:${ROOMVIEW_PORT}/shot?room=${encodeURIComponent(room)}`, (pr) => {
+    res.set('Cache-Control', 'no-store'); res.status(pr.statusCode || 200);
+    if (pr.headers['content-type']) res.set('Content-Type', pr.headers['content-type']);
+    pr.pipe(res);
+  });
+  preq.on('error', () => { try { res.status(502).end(); } catch {} });
+  preq.setTimeout(4000, () => { preq.destroy(); try { res.status(504).end(); } catch {} });
+});
+
 // ── Per-room background colour: recent-colours store (shared across this user's browsers) ──
 const ROOMBG_RECENTS_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'roombg-recents.json');
 app.get('/roombg/recents', (req, res) => {
@@ -568,6 +592,46 @@ function extractText(content) {
 // strip the tagged blocks for display — but a single user turn can carry the
 // plumbing AND a genuine instruction appended after it, so we strip the blocks
 // rather than dropping the whole message, preserving any real trailing text.
+// [XENGINE_TRANSPLANT_V1] Cross-engine context transplant helpers. A room's neutral
+// history (chatData, backed by the transcript) holds EVERY turn regardless of engine;
+// each engine natively resumes only the turns it produced. On an engine switch we seed
+// the target's first turn with the conversation so far and start it fresh.
+let XENGINE_TRANSPLANT = true;
+try { fs.accessSync(path.join(os.homedir(), '.claude', 'xengine-transplant-off')); XENGINE_TRANSPLANT = false; } catch {}
+function roomHistoryMessages(key, sessionId) {
+  const d = chatData[key];
+  let msgs = (d && Array.isArray(d.messages)) ? d.messages : [];
+  const fromT = sessionId ? transcriptToMessages(sessionId) : [];
+  if (fromT.length > msgs.length) msgs = fromT;
+  return msgs;
+}
+function renderTransplant(msgs, budget = 24000) {
+  const lines = [];
+  for (const m of msgs) {
+    const who = (m.type === 'user' || m.role === 'user') ? 'User' : 'Assistant';
+    const t = String(m.text || '').trim();
+    if (!t || t.includes('\u{1F5DC}')) continue;
+    lines.push(who + ': ' + t);
+  }
+  let body = lines.join('\n\n');
+  if (body.length > budget) body = '...(earlier context trimmed)...\n\n' + body.slice(-budget);
+  return body;
+}
+function transplantPreamble(body) {
+  return 'The text below is the PRIOR conversation in this room, handled by another '
+    + 'assistant. Silently absorb it as your own memory and continue seamlessly - do '
+    + 'not re-introduce yourself, summarise, or repeat earlier answers.\n\n'
+    + '=== CONVERSATION SO FAR ===\n' + body + '\n=== END OF PRIOR CONVERSATION ===\n\n'
+    + 'Now respond to the user next message:\n\n';
+}
+function maybeSeed(S, engine, text) {
+  if (!XENGINE_TRANSPLANT) return { text, crossed: false };
+  if (!S.lastEngine || S.lastEngine === engine) return { text, crossed: false };
+  const msgs = roomHistoryMessages(S.key, S.sessionId);
+  if (!msgs.length) return { text, crossed: false };
+  console.log('[Bridge] x-engine transplant ' + S.lastEngine + ' -> ' + engine + ': seeded ' + msgs.length + ' msgs');
+  return { text: transplantPreamble(renderTransplant(msgs)) + text, crossed: true };
+}
 function stripPlumbing(t) {
   return String(t || '')
     .replace(/<command-name>[\s\S]*?<\/command-name>/g, '')
@@ -2049,6 +2113,7 @@ function makeSession(key) {
     graceTimer: null, buffer: [], evictWhenIdle: false, lastActiveAt: Date.now(),
     ctxPct: null, ctxTokens: null, compacting: false, lastCompactAt: 0,
     engineOverride: null,   // per-room engine override: null=follow global (~/.claude/engine), else 'claude'|'codex'
+    lastEngine: null,       // [XENGINE_TRANSPLANT_V1] engine that last actually ran a turn in this room
   };
 
   // Broadcast to all connected sockets. Buffer when nobody is connected so a
@@ -2166,6 +2231,7 @@ function makeSession(key) {
     const proc = spawn('claude', args, { cwd: CLAUDE_CWD, env: claudeEnv, stdio: ['pipe', 'pipe', 'pipe'] });
     S.currentProc = proc;
     S.procEngine = 'claude';
+    S.lastEngine = 'claude';
     // Startup watchdog: must produce first output within 2 min (catches MCP init hangs).
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '⏱ Claude failed to start (MCP/init timeout) — session reset.');
 
@@ -2287,6 +2353,12 @@ function makeSession(key) {
   // written straight into its stdin — queuing/steering the running session.
   // Otherwise a fresh process is spawned (resuming the session id when we have one).
   S._sendNow = (text) => {
+    const _seed = maybeSeed(S, 'claude', text);
+    // [XENGINE_RESUME_V1] Cross INTO Claude: if this room already has a resumable
+    // Claude session, RESUME it (append this seeded turn) rather than nulling the id
+    // and forking a brand-new transcript = a duplicate room. The seed preamble still
+    // carries the other engine's turns. Only start fresh when there is nothing to resume.
+    if (_seed.crossed) { text = _seed.text; if (!S.sessionId || !sessionFileExists(S.sessionId)) S.sessionId = null; }
     // If an idle Codex proc still holds the slot, drop it so Claude spawns fresh.
     if (S.currentProc && S.procEngine === 'codex' && !S.processing) {
       try { S.currentProc.kill('SIGKILL'); } catch {}
@@ -2334,6 +2406,8 @@ function makeSession(key) {
   S._runCodexTurn = (text) => {
     S.processing = true;
     S.send({ type: 'thinking' });
+    const _seed = maybeSeed(S, 'codex', text);
+    if (_seed.crossed) { text = _seed.text; S.threadId = null; }   // [XENGINE_TRANSPLANT_V1] fresh seeded rollout
     const args = ['exec'];
     if (S.threadId) args.push('resume', S.threadId);
     const _mcpUrl = S._codexMcpUrl();
@@ -2349,6 +2423,7 @@ function makeSession(key) {
     catch (e) { S.processing = false; S.send({ type: 'error', text: 'Codex spawn failed: ' + e.message }); S.send({ type: 'done', code: -1 }); return; }
     S.currentProc = proc;
     S.procEngine = 'codex';
+    S.lastEngine = 'codex';
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '\u23F1 Codex failed to start \u2014 session reset.');
     let buf = '';
     proc.stdout.on('data', chunk => {

@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=8&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=9&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {
@@ -576,6 +576,17 @@
   let _saveTimer = null;
   function saveToStorage() {
     if (_restoring || !currentSessionId) return;
+    // [XENGINE_STALESAVE_V1] On a bare (unpinned) load, currentSessionId is seeded
+    // from the global localStorage key and can be a STALE id (e.g. a Codex thread
+    // id). Persisting the first reply-less turn under it materialises an orphan
+    // "second room". Defer: keep the message in storedMsgData and let the next save
+    // (once the reply lands and the real session id is pinned) write it to the
+    // correct room. Only skips the narrow fork case; all other saves are unchanged.
+    if (!PINNED_ROOM
+        && !String(currentSessionId).startsWith('draft-')
+        && !(storedMsgData || []).some(function (m) { return m && m.type === 'assistant'; })) {
+      return;
+    }
     clearTimeout(_saveTimer);
     _saveTimer = setTimeout(() => {
       if (ws?.readyState === WebSocket.OPEN) {
@@ -958,7 +969,15 @@
         break;
 
       case 'session_id':
-        currentSessionId = msg.id;
+        // [XENGINE_ROOMKEY_V1] Persist history under the STABLE room id, not the
+        // per-engine session id. A secondary engine (Codex) reports its own thread
+        // id here; adopting it as currentSessionId made saveToStorage() write a
+        // SECOND chatData room with the same name (the "two rooms" fork). Keep
+        // currentSessionId pinned to the room's durable id; only adopt msg.id for a
+        // draft/unpinned room (the promote/pin branches below) or when it matches.
+        if (!PINNED_ROOM || PINNED_ROOM.startsWith('draft-') || PINNED_ROOM === msg.id) {
+          currentSessionId = msg.id;
+        }
         // A brand-new room rides a temporary draft key; once Claude assigns the
         // real session id (the server re-keys the room to it too), promote the room
         // to that durable id so a reload rejoins THIS exact room/conversation.
@@ -982,11 +1001,19 @@
           if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
           if (_PRB || _RV) setVncRoom(msg.id);   // panel follows the promoted room id
         } else if (!PINNED_ROOM) {
+          // [XENGINE_ROOMID_V1] Pin the room to the FIRST session id we learn, then
+          // stop re-pointing. Previously every session_id re-pointed currentRoomId,
+          // so switching engines forked a 2nd room (Claude session id -> Codex thread
+          // id). Mirror the draft-promote branch: one stable room across engines.
+          PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
+          SESSION_KEY = 'bridge_session_id::' + msg.id;
           localStorage.setItem(ROOM_KEY, msg.id);
+          try { const u = new URL(location.href); u.searchParams.set('room', msg.id); history.replaceState(null, '', u); } catch {}
+          if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
           if (_PRB || _RV) setVncRoom(msg.id);
         }
-        localStorage.setItem(SESSION_KEY, msg.id);
+        localStorage.setItem(SESSION_KEY, currentSessionId || msg.id);
         if (window._pendingTask) { localStorage.setItem(taskKey(msg.id), window._pendingTask); window._pendingTask = null; }
         updateTitlebar();
         if (pendingTaskLink) {
@@ -2106,6 +2133,11 @@
         sessionNameById[s.id] = s.name || _taskLabel || s.preview || '';
         const row = document.createElement('div');
         row.className = 'sess-row';
+        const colorBar = document.createElement('span');
+        colorBar.className = 'sess-color';
+        const _rbg = getRoomBg(s.id);
+        if (_rbg) { colorBar.style.background = _rbg; colorBar.title = 'Room colour ' + _rbg; }
+        row.appendChild(colorBar);
         const btn = document.createElement('button');
         btn.className = 'sess-item';
         const time = document.createElement('span');
@@ -2404,13 +2436,18 @@
       + '<div style="font-size:11px;color:var(--text-dim);word-break:break-word;">' + esc(c.detail) + '</div>'
       + '</div></div>'
     ).join('');
-    const hist = (data.history || []).map((h) => {
+    const labelByKey = {}; (st.checks || []).forEach((c) => { labelByKey[c.key] = c.label; });
+    const hist = (data.history || []).map((h, i) => {
       const ok = h.overall === 'ok';
-      return '<div style="display:flex;gap:8px;font-size:11px;padding:3px 0;color:var(--text-dim);">'
-        + '<span>' + (ok ? '✅' : '⚠️') + '</span>'
+      const det = (h.checks || []).map((c) =>
+        '<div style="font-size:11px;color:var(--text-dim);padding:1px 0;">'
+        + (c.ok ? '✅' : '⚠️') + ' ' + esc(labelByKey[c.key] || c.key) + '</div>').join('');
+      return '<div class="ih-run" data-i="' + i + '" style="display:flex;gap:8px;font-size:11px;padding:3px 0;color:var(--text-dim);cursor:pointer;">'
+        + '<span class="ih-run-caret" style="width:10px;">▸</span>'
         + '<span style="flex:1;">' + when(h.iso) + '</span>'
         + '<span>' + (ok ? 'all clear' : (h.issues + ' issue' + (h.issues === 1 ? '' : 's'))) + '</span>'
-        + '</div>';
+        + '</div>'
+        + '<div class="ih-run-det" data-i="' + i + '" style="display:none;padding:0 0 6px 18px;">' + (det || '<div style="font-size:11px;color:var(--text-dim);">no per-check detail recorded</div>') + '</div>';
     }).join('');
     host.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin:0 0 4px;">'
@@ -2420,11 +2457,107 @@
       + '</div>'
       + '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;">Last run ' + when(st.last_run) + (st.stacks ? ' · stacks ' + esc(st.stacks) : '') + '</div>'
       + rows
-      + (hist ? '<div style="margin-top:14px;font-size:12px;color:var(--text-dim);font-weight:600;">Recent runs</div>' + hist : '')
+      + (st.task && st.task.number ? '<div style="margin-top:8px;font-size:12px;">' + (overallOk ? 'Tracked in ' : '⚠️ Escalated to ') + '<a href="#" id="ih-task" style="color:#60a5fa;text-decoration:none;">task #' + esc(st.task.number) + (st.task.title ? ' — ' + esc(st.task.title) : '') + '</a></div>' : '')
+      + (hist ? '<div style="margin-top:14px;font-size:12px;color:var(--text-dim);font-weight:600;">Recent runs</div><div style="font-size:10px;color:var(--text-dim);margin-bottom:2px;">(click a run to expand)</div>' + hist : '')
       + '<div style="margin-top:6px;"><button id="ih-refresh" style="font-size:11px;padding:3px 10px;cursor:pointer;">Refresh</button></div>';
     const rb = document.getElementById('ih-refresh');
     if (rb) rb.addEventListener('click', () => renderInfraHealth(host));
+    // Expandable history: click a run row to toggle its per-check detail.
+    host.querySelectorAll('.ih-run').forEach((el) => {
+      el.addEventListener('click', () => {
+        const det = host.querySelector('.ih-run-det[data-i="' + el.getAttribute('data-i') + '"]');
+        if (!det) return;
+        const open = det.style.display !== 'none';
+        det.style.display = open ? 'none' : 'block';
+        const car = el.querySelector('.ih-run-caret'); if (car) car.textContent = open ? '▸' : '▾';
+      });
+    });
+    // Task link: open the infra-health task (#360) in the Tasks panel.
+    const tl = document.getElementById('ih-task');
+    if (tl && st.task) tl.addEventListener('click', (e) => {
+      e.preventDefault();
+      const want = st.task.file || '';
+      const t = (typeof lastTasks !== 'undefined' ? lastTasks : []).find((x) => x.file === want)
+        || (typeof lastTasks !== 'undefined' ? lastTasks : []).find((x) => String(x.file || '').includes('infra-health'));
+      if (t && typeof openTaskDetails === 'function') {
+        if (tasksPanel && tasksPanel.classList.contains('tasks-panel-hidden')) {
+          tasksPanel.classList.remove('tasks-panel-hidden'); tasksPanel.classList.add('tasks-panel-visible');
+        }
+        openTaskDetails(t);
+      } else if (typeof showToast === 'function') {
+        showToast('Task #' + st.task.number + ' — open the Tasks panel to view it', 'info');
+      }
+    });
+    // [ROOMTABS_V1] Room browser health for the current room, appended below infra health.
+    const rh = document.createElement('div'); rh.id = 'roomhealth'; rh.style.marginTop = '18px';
+    rh.style.paddingTop = '14px'; rh.style.borderTop = '1px solid var(--border,#2a2a2a)';
+    host.appendChild(rh);
+    renderRoomHealth(rh);
   }
+
+  // [ROOMTABS_V1] The per-room tab-health diagnostic Peter specified: for the current
+  // room, every tab and whether it is (1) associated/owned, (2) a live Chrome tab,
+  // (3) painting in the viewer, (4) a visible chip in the strip — plus systemic
+  // violations (orphans, multi-room, reaped-but-held) and the actual painted pixels.
+  async function renderRoomHealth(host) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    const room = (typeof currentRoomId !== 'undefined' && currentRoomId) ? currentRoomId : 'default';
+    let d = null;
+    try { d = await (await fetch(`${API_BASE}/roomtabs?room=${encodeURIComponent(room)}`, { cache: 'no-store' })).json(); } catch {}
+    if (!host.isConnected) return;
+    const yn = (b) => b ? '<span style="color:#4ade80">&#10003;</span>' : '<span style="color:#f87171">&#10007;</span>';
+    const head = '<div style="display:flex;align-items:center;gap:8px;margin:0 0 6px;">'
+      + '<h3 style="margin:0;font-size:14px;flex:1;">Room browser health</h3>'
+      + '<span style="font-size:11px;color:var(--text-dim);">' + esc(String(room).slice(0, 18)) + '</span></div>';
+    if (!d || d.error) { host.innerHTML = head + '<p style="color:var(--text-dim);font-size:12px;">' + esc((d && d.error) || 'unavailable') + '</p>'; return; }
+    const rows = (d.tabs || []).map((t) => {
+      const flags = [];
+      if (t.multiRoom) flags.push('multi-room');
+      if (t.nestedBridge) flags.push('nested-bridge');
+      if (t.dead) flags.push('dead');
+      return '<tr style="border-top:1px solid var(--border,#2a2a2a);">'
+        + '<td style="padding:4px 6px;font-size:11px;">' + (t.isCurrent ? '&#9654; ' : '') + esc((t.title || t.short)).slice(0, 30)
+        + '<div style="color:var(--text-dim);font-size:10px;font-family:monospace;">id ' + esc(t.short || t.targetId) + '</div>'
+        + '<div style="color:var(--text-dim);font-size:10px;word-break:break-all;">' + esc(t.url).slice(0, 48) + '</div>'
+        + (flags.length ? '<div style="color:#f87171;font-size:10px;">' + esc(flags.join(' · ')) + '</div>' : '') + '</td>'
+        + '<td style="text-align:center;">' + yn(t.associated) + '</td>'
+        + '<td style="text-align:center;">' + yn(t.live) + '</td>'
+        + '<td style="text-align:center;">' + yn(t.painting) + '</td>'
+        + '<td style="text-align:center;">' + yn(t.inStrip) + '</td></tr>';
+    }).join('');
+    const c = d.counts || {};
+    const viol = (d.orphans && d.orphans.length ? '<div style="color:#f87171;font-size:11px;margin-top:6px;">' + d.orphans.length + ' orphan tab(s) alive in Chrome, owned by no room (MCP-invisible)</div>' : '')
+      + (d.multiRoom && d.multiRoom.length ? '<div style="color:#f87171;font-size:11px;">' + d.multiRoom.length + ' tab(s) connected to &gt;1 room</div>' : '')
+      + (d.reaped && d.reaped.length ? '<div style="color:var(--text-dim);font-size:11px;margin-top:4px;">' + d.reaped.length + ' stale tab(s) reaped &mdash; URL held in room memory for reopen</div>' : '');
+    const allGood = !(d.orphans && d.orphans.length) && !(d.multiRoom && d.multiRoom.length) && (d.tabs || []).every((t) => t.live) && d.painting;
+    const bodyHtml = head
+      + '<div style="font-size:11px;margin-bottom:6px;">'
+      + '<span style="padding:2px 8px;border-radius:10px;background:' + (allGood ? 'rgba(40,160,80,.18);color:#4ade80' : 'rgba(200,140,40,.18);color:#fbbf24') + ';">' + (allGood ? 'healthy' : 'needs attention') + '</span>'
+      + '<span style="color:var(--text-dim);margin-left:8px;">painting: ' + (d.painting ? 'yes' : 'no') + ' · viewers ' + (d.viewers || 0) + ' · ' + (c.roomTabs || 0) + ' tabs · ' + (c.orphan || 0) + ' orphan · ' + (c.multiRoom || 0) + ' multi</span></div>'
+      + (rows ? '<table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr style="color:var(--text-dim);font-size:10px;"><th style="text-align:left;padding:0 6px;">tab</th><th>assoc</th><th>live</th><th>paint</th><th>strip</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<p style="color:var(--text-dim);font-size:12px;">No tabs in this room.</p>')
+      + viol
+      + '<div style="margin-top:8px;"><div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;">Currently painted (' + esc(String(d.viewing || '').slice(0, 12)) + '):</div></div>';
+    // Persistent structure: rebuild only the text body; keep the <img> element alive so
+    // the old frame stays visible until the new JPEG has fully decoded (no flap).
+    let body = host.querySelector('#rh-body');
+    let shot = host.querySelector('#rh-shot');
+    if (!body || !shot) {
+      host.innerHTML = '<div id="rh-body"></div>'
+        + '<img id="rh-shot" style="max-width:100%;margin-top:6px;border:1px solid var(--border,#2a2a2a);border-radius:4px;background:#111;min-height:40px;display:none;"/>';
+      body = host.querySelector('#rh-body');
+      shot = host.querySelector('#rh-shot');
+    }
+    body.innerHTML = bodyHtml; // shot is a sibling of body, so it survives this
+    // preload the next frame; swap src only once it has loaded so pixels persist
+    const nextUrl = API_BASE + '/roomshot?room=' + encodeURIComponent(room) + '&t=' + Date.now();
+    const pre = new Image();
+    pre.onload = () => { if (shot.isConnected) { shot.src = nextUrl; shot.style.display = ''; } };
+    pre.onerror = () => { /* keep the last good frame; don't blank */ };
+    pre.src = nextUrl;
+    if (host._t) clearTimeout(host._t);
+    host._t = setTimeout(() => { const panel = document.getElementById('settings-panel'); if (host.isConnected && panel && !panel.classList.contains('hidden')) renderRoomHealth(host); }, 3000);
+  }
+
   if (btnCloseSettings) {
     btnCloseSettings.addEventListener('click', () => {
       settingsPanel && settingsPanel.classList.add('hidden');
