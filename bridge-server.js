@@ -859,13 +859,13 @@ function autoNameRoom(S) {
     const id = S.sessionId;
     if (!id) { console.log('[autoname] skip: no sessionId on room'); return; }
     if (sessionNames[id]) return;                       // named already (manual or prior auto)
-    S._nameTurns = (S._nameTurns || 0) + 1;
-    if (S._nameTurns > 2) return;                       // only the 1st or 2nd instruction
     if (S._naming) return;                              // a generation is already in flight
+    if ((S._nameTurns || 0) >= 2) return;               // only the 1st or 2nd instruction
     try { if (readAutonomyRooms().get(id)) return; } catch {}   // leave task rooms alone
     const file = path.join(transcriptsDir(), id + '.jsonl');
     const first = firstUserInstruction(file);
-    if (!first || first.length < 4) { console.log('[autoname] skip', id.slice(0, 8), 'no first message yet (turn ' + S._nameTurns + ')'); return; }
+    if (!first || first.length < 4) { console.log('[autoname] skip', id.slice(0, 8), 'no first message yet'); return; }
+    S._nameTurns = (S._nameTurns || 0) + 1;
     S._naming = true;
     console.log('[autoname] naming room', id.slice(0, 8), 'turn', S._nameTurns);
     const prompt = 'Give a 3 or 4 word Title Case label for this task. '
@@ -2444,7 +2444,7 @@ function makeSession(key) {
 
       clearPending(S.key);   // in-process close (claude exited/crashed) — UI got done, so no blip-replay
       S.pendingTurns = 0; S.inFlight = [];
-      if (wasProcessing) S.send({ type: 'done', code });   // unblock UI if it died mid-turn
+      if (wasProcessing) { S.send({ type: 'done', code }); try { autoNameRoom(S); } catch (e) {} }   /* AUTONAME_CLOSE_V1: title even if the turn was killed */
       S.evictIfReady();
     });
 
@@ -2557,7 +2557,8 @@ function makeSession(key) {
       S.send({ type: 'done', code: code || 0 });
       const q = S.codexQueue || [];
       if (q.length) { const next = q.shift(); setTimeout(() => S._runCodexTurn(next), 50); }
-      else if (S.evictIfReady) S.evictIfReady();
+      else { try { autoNameRoom(S); } catch (e) {}   /* AUTONAME_CODEX_V1 */
+             if (S.evictIfReady) S.evictIfReady(); }
     });
   };
   S._sendCodex = (text) => {

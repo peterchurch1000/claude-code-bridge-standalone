@@ -751,11 +751,32 @@ async function buildChromeTabHealth() {
     cdpFetch('/json/list').catch(() => []),
     shimAllRooms(),
   ]);
+  // [TABHEALTH_DRAFT_RESOLVE_V1] A room is born on a draft-<clientId>-<rnd> key and is
+  // re-keyed to its real session-id on first turn, but tab OWNERSHIP can stay pinned to the
+  // draft key (and the shim's aliasOf points session->draft), so a fully promoted,
+  // transcript-backed room was displaying as a scary "draft-c-…". Invert the alias so we
+  // show the real session-id. Sources: the persisted shim alias file (pairs [session,draft])
+  // and the live shimRooms inverse (a session room whose aliasOf is a draft key).
   const canonOf = (rid) => (shimRooms[rid] && shimRooms[rid].aliasOf) ? shimRooms[rid].aliasOf : rid;
-  const owner = new Map();       // targetId -> Set(canonical roomId)
+  const draftToSession = new Map();
+  try {
+    const ALIAS_FILE = process.env.SHIM_ALIAS_FILE || require('path').join(process.env.SHIM_HOME || '/home/bridge-peter', '.claude', 'shim-room-aliases.json');
+    for (const [session, draft] of JSON.parse(require('fs').readFileSync(ALIAS_FILE, 'utf8'))) {
+      if (session && draft && String(draft).startsWith('draft-')) draftToSession.set(draft, session);
+    }
+  } catch (e) {}
+  for (const [rid, rt] of Object.entries(shimRooms)) {   // live inverse: session room aliased to a draft
+    if (rt && rt.aliasOf && String(rt.aliasOf).startsWith('draft-') && !String(rid).startsWith('draft-')) draftToSession.set(rt.aliasOf, rid);
+  }
+  const resolveRoom = (rid) => {
+    let r = canonOf(rid);                                 // collapse alias rooms to their canonical id
+    if (String(r).startsWith('draft-') && draftToSession.has(r)) r = draftToSession.get(r);  // then draft -> real session
+    return r;
+  };
+  const owner = new Map();       // targetId -> Set(display roomId)
   const currentOf = new Set();   // targetIds that are some room's current
   for (const [rid, rt] of Object.entries(shimRooms)) {
-    const canon = canonOf(rid);
+    const canon = resolveRoom(rid);
     for (const tid of (rt.tabs || [])) { if (!owner.has(tid)) owner.set(tid, new Set()); owner.get(tid).add(canon); }
     if (rt.current) currentOf.add(rt.current);
   }
