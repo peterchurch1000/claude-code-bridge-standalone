@@ -2160,6 +2160,7 @@
     newWinBtn.setAttribute('aria-label', 'New room in a new window');
     newWinBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
     newWinBtn.style.flex = '0 0 auto';
+    newWinBtn.style.width = 'auto';   /* NEWROOM_SPACE_V1: don't inherit .sess-new width:100% */
     newWinBtn.style.display = 'inline-flex';
     newWinBtn.style.alignItems = 'center';
     newWinBtn.style.justifyContent = 'center';
@@ -2179,6 +2180,7 @@
     newRow.style.display = 'flex';
     newRow.style.gap = '4px';
     newBtn.style.flex = '1 1 auto';
+    newBtn.style.whiteSpace = 'nowrap';   /* NEWROOM_SPACE_V1: keep + New room on one line */
     newRow.appendChild(newBtn);
     newRow.appendChild(newWinBtn);
     sessionList.appendChild(newRow);
