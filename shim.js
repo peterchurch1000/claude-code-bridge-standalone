@@ -46,6 +46,29 @@ let expectingNewTab = false;
 // "own" an openerless new tab. Beyond this the room is idle and the tab is almost
 // certainly foreign (e.g. an autonomy CDP drainer's ctx.newPage()), so leave it ORPHAN.
 const ATTRIB_WINDOW_MS = Number(process.env.SHIM_ATTRIB_WINDOW_MS) || 15000;
+// ── [SHIM_RECONCILE_V1] self-healing tab<->room reconciler ────────────────
+// Enforces the three invariants Peter requires:
+//  (1) lossless reap  — a tab idle > STALE_TAB_MS is closed for efficiency, but its URL
+//      is first saved into the room's memory ref (rt.reaped, persisted) so it can be
+//      reopened intact.
+//  (2) chip membership — every live tab the MCP can drive in a room lives in that room's
+//      owned set (== the live-viewer tab strip). Orphan tabs a room SPAWNED (opener is
+//      one of its tabs) are adopted right after the call that created them, and the
+//      room's `current` is kept on a live, non-bridge tab so the pane paints something real.
+//  (3) one tab -> one room — a targetId never sits in two rooms' sets (dedupe keeps the
+//      most-recently-used room). Alias twins (draft<->session) are the SAME logical room,
+//      resolved via roomAlias, and are NOT counted as a violation.
+// Flag: SHIM_RECONCILE env or ~/.claude/shim-reconciler (default ON; write '0' to disable).
+function reconcileEnabled() {
+  let v = process.env.SHIM_RECONCILE;
+  if (v == null || v === '') { try { v = require('fs').readFileSync(require('path').join(process.env.HOME || '', '.claude', 'shim-reconciler'), 'utf8').trim(); } catch { v = ''; } }
+  return v !== '0';
+}
+let RECONCILE = reconcileEnabled();
+{ const _rt = setInterval(() => { RECONCILE = reconcileEnabled(); }, 30000); if (_rt.unref) _rt.unref(); }
+const STALE_TAB_MS = parseInt(process.env.SHIM_STALE_TAB_MS || String(4 * 3600 * 1000), 10);
+const tabTouch = new Map();                 // targetId -> last time a room selected/drove it
+const persistedReapedByRoom = new Map();    // roomId -> [{url,at}] restored from ownership file
 // Global mutex: every tab create / select / forwarded call is serialised so the
 // upstream MCP's single "active tab" pointer can't be raced between rooms.
 const lock = (fn) => { const r = chain.then(fn, fn); chain = r.then(() => {}, () => {}); return r; };
@@ -122,6 +145,7 @@ try {
   const owners = new Map();               // url -> Set(roomId)
   for (const [rid, o] of raw) {
     if (o && o.cur) persistedCurByRoom.set(rid, o.cur);
+    if (o && Array.isArray(o.reaped) && o.reaped.length) persistedReapedByRoom.set(rid, o.reaped);
     for (const u of (o && o.urls) || []) { if (!u || u === 'about:blank') continue; if (!owners.has(u)) owners.set(u, new Set()); owners.get(u).add(rid); }
   }
   for (const [u, set] of owners) if (set.size === 1) persistedOwnerByUrl.set(u, [...set][0]);
@@ -133,8 +157,9 @@ function saveOwnership() {
     for (const [rid, rt] of rooms) {
       if (!rt.tabs || !rt.tabs.length) continue;
       const urls = rt.tabs.map(t => targetUrl.get(t)).filter(u => u && u !== 'about:blank');
-      if (!urls.length) continue;
-      out.push([rid, { urls, cur: (rt.current && targetUrl.get(rt.current)) || null }]);
+      const reaped = (rt.reaped && rt.reaped.length) ? rt.reaped : null;
+      if (!urls.length && !reaped) continue;
+      out.push([rid, { urls, cur: (rt.current && targetUrl.get(rt.current)) || null, reaped: reaped || [] }]);
     }
     require('fs').writeFileSync(OWNERSHIP_FILE, JSON.stringify(out), 'utf8');
   } catch (e) {}
@@ -145,10 +170,11 @@ function ownedByAny(tid) { for (const [, rt] of rooms) if (rt.tabs && rt.tabs.in
 // must never be silently LRU-evicted or re-attributed to another room — losing one drops a
 // live login and forces a re-auth. Configurable via SHIM_STICKY_DOMAINS (comma list).
 const STICKY_DOMAINS = (process.env.SHIM_STICKY_DOMAINS ||
-  'mail.google.com,accounts.google.com,outlook.cloud.microsoft,outlook.office.com,outlook.office365.com,login.microsoftonline.com,web.whatsapp.com')
+  'mail.google.com,accounts.google.com,outlook.cloud.microsoft,outlook.office.com,outlook.office365.com,login.microsoftonline.com,web.whatsapp.com,pipedrive.com')
   .split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
 function stickyDomainOf(u) { if (!u) return null; u = String(u).toLowerCase(); return STICKY_DOMAINS.find(d => u.includes(d)) || null; }
 function isStickyUrl(u) { return !!stickyDomainOf(u); }
+function hostOf(u) { try { return new URL(u).hostname.toLowerCase(); } catch { return null; } }
 function sameStickyDomain(a, b) { const x = stickyDomainOf(a); return !!x && x === stickyDomainOf(b); }
 function tabIsSticky(rt, tid) { return isStickyUrl(targetUrl.get(tid) || (rt && rt.current === tid ? rt.lastUrl : null)); }
 function roomIsSticky(rt) {
@@ -209,6 +235,20 @@ function attributeNewTab(ti) {
     // any room's lastUsed. Without this gate their tabs get glued onto whichever room
     // last held the floor, hijacking its `current` and cross-contaminating its live pane.
     if (rt && rt.current && rt.lastUsed && (Date.now() - rt.lastUsed) < ATTRIB_WINDOW_MS) {
+      // [SHIM_ATTRIB_DOMAIN_GUARD_V1] Only adopt an openerless tab that shares the active
+      // room's CURRENT hostname. A cross-host openerless tab is almost always an unrelated
+      // context (a background CDP drainer, another room's page) rather than something this
+      // room spawned; gluing it hijacks the room's `current` and cross-contaminates its
+      // live pane, then SHIM_OWNERSHIP_PERSIST re-binds the bad owner on every restart,
+      // making it permanent (root cause of the adlux.pipedrive tab stuck on a Castle room).
+      // A genuine same-context spawn is same-host; a real cross-host popup carries an
+      // openerId (path a) or is sticky (handled above). Revert: SHIM_ATTRIB_DOMAIN_GUARD=0.
+      const _curUrl = targetUrl.get(rt.current) || rt.lastUrl;
+      const _ch = hostOf(_curUrl), _nh = hostOf(ti.url);
+      if (process.env.SHIM_ATTRIB_DOMAIN_GUARD !== '0' && _ch && _nh && _ch !== _nh) {
+        log('ORPHAN new tab', ti.targetId, 'url', ti.url || '(none)', '- cross-host vs active room', activeRoom, '(' + _ch + ' != ' + _nh + '); not gluing');
+        return;
+      }
       rt.tabs.push(ti.targetId); rt.current = ti.targetId;
       log('room', activeRoom, 'attributed new tab', ti.targetId, '(no opener) url', ti.url || '(none)', '- now', rt.tabs.length, 'tabs');
       return;
@@ -451,7 +491,7 @@ async function ensureRoomTab(room) {
   await ensureCDP();
   let rt = rooms.get(room);
   if (rt) { pruneRoom(rt); rt.lastUsed = Date.now(); if (rt.current) return rt; }
-  else { rt = { tabs: [], current: null, lastUrl: null, lastUsed: Date.now() }; rooms.set(room, rt); }
+  else { rt = { tabs: [], current: null, lastUrl: null, lastUsed: Date.now(), reaped: persistedReapedByRoom.get(room) || [] }; rooms.set(room, rt); }
   await evictIfNeeded(room);           // stay within the tab budget before opening a new tab
   const tid = await newTab();
   rt.tabs.push(tid); rt.current = tid;
@@ -471,6 +511,7 @@ async function selectCurrent(rt) {
   const idx = pageTargets.indexOf(rt.current);
   if (idx < 0) throw new Error('room tab vanished');
   await tool('browser_tabs', { action: 'select', index: idx });
+  tabTouch.set(rt.current, Date.now());   // [SHIM_RECONCILE_V1] per-tab recency for lossless reap
 }
 
 // Intercept browser_tabs and present a room-local view (indices 0..n within the
@@ -525,6 +566,128 @@ async function handleTabs(room, rt, args) {
   return roomTabList(rt);
 }
 
+/* ---------- [SHIM_RECONCILE_V1] reconciler ---------- */
+function isBridgeUrl(u) { u = u || ''; return u.includes('claude-bridge') && u.includes('room='); }
+// True self-mirror: a bridge page pointed at THIS room (room=<room>...). A bridge page
+// showing a DIFFERENT room is ordinary content, not a recursion — don't touch it.
+function isSelfBridgeUrl(u, room) {
+  if (!isBridgeUrl(u) || !room) return false;
+  const m = /[?&]room=([^&]+)/.exec(u);
+  if (!m) return false;
+  const tabRoom = decodeURIComponent(m[1]);
+  return tabRoom === room || tabRoom.startsWith(room) || room.startsWith(tabRoom);
+}
+// Exclusive claim: ensure a targetId lives in exactly ONE room's set (invariant 3).
+function claimTab(room, tid) {
+  for (const [rk, rt] of rooms) {
+    if (rk === room || !rt.tabs) continue;
+    if (rt.tabs.includes(tid)) {
+      rt.tabs = rt.tabs.filter(t => t !== tid);
+      if (rt.current === tid) rt.current = rt.tabs[rt.tabs.length - 1] || null;
+      log('reconcile: moved tab', tid, 'from room', rk, '->', room, '(exclusive ownership)');
+    }
+  }
+}
+// Fix any tab double-owned across two REAL rooms; keep the most-recently-used room.
+function dedupeMultiRoom() {
+  if (!RECONCILE) return;
+  const seen = new Map();
+  for (const [rk, rt] of rooms) for (const tid of (rt.tabs || [])) { if (!seen.has(tid)) seen.set(tid, []); seen.get(tid).push(rk); }
+  for (const [tid, rks] of seen) {
+    if (rks.length < 2) continue;
+    rks.sort((a, b) => (rooms.get(b).lastUsed || 0) - (rooms.get(a).lastUsed || 0));
+    for (const rk of rks.slice(1)) { const rt = rooms.get(rk); rt.tabs = rt.tabs.filter(t => t !== tid); if (rt.current === tid) rt.current = rt.tabs[rt.tabs.length - 1] || null; }
+    log('reconcile: de-duped tab', tid, 'kept in', rks[0], 'removed from', rks.slice(1).join(','));
+  }
+}
+// After a room's call: adopt orphan tabs THIS room just spawned (opener is one of its
+// tabs) so they appear as chips (invariant 2), and keep `current` on a live, non-bridge
+// tab so the pane paints something real. Throttled so it costs ~1 CDP round-trip/1.2s.
+let _lastReconcileAt = 0;
+async function reconcileAfterCall(room, rt) {
+  if (!RECONCILE || !rt) return;
+  const now = Date.now();
+  if (now - _lastReconcileAt < 1200) return;
+  _lastReconcileAt = now;
+  let tg; try { tg = await cdpSend('Target.getTargets'); } catch { return; }
+  for (const ti of (tg && tg.targetInfos) || []) {
+    if (ti.type !== 'page' || ownedByAny(ti.targetId)) continue;
+    if (ti.openerId && rt.tabs.includes(ti.openerId)) {
+      claimTab(room, ti.targetId);
+      rt.tabs.push(ti.targetId); if (ti.url != null) targetUrl.set(ti.targetId, ti.url);
+      log('reconcile: adopted spawned orphan', ti.targetId, 'opener', ti.openerId, '-> room', room);
+    }
+  }
+  if (rt.current && !pageTargets.includes(rt.current)) rt.current = rt.tabs[rt.tabs.length - 1] || null;
+  if (rt.current && isSelfBridgeUrl(targetUrl.get(rt.current), room)) {
+    const alt = rt.tabs.find(t => t !== rt.current && !isSelfBridgeUrl(targetUrl.get(t), room) && pageTargets.includes(t));
+    if (alt) {
+      rt.current = alt; log('reconcile: current was a self-mirror bridge UI in room', room, '-> switched to', alt);
+    } else {
+      // Only tab is THIS room's own bridge view (self-mirror recursion). Release it so
+      // the pane shows an honest "waiting" instead of the bridge looking at itself; the
+      // next MCP call's selectCurrent will open a real content tab.
+      const bad = rt.current;
+      rt.tabs = (rt.tabs || []).filter(t => t !== bad);
+      rt.current = null;
+      log('reconcile: released self-mirror bridge-UI only-tab', bad, 'in room', room, '-> waiting');
+    }
+  }
+}
+// Invariant 1: reap tabs idle > STALE_TAB_MS, saving each URL into the room's memory ref
+// FIRST (lossless) so it can be reopened. Never reaps the current tab, a sticky login
+// tab, or a room's only tab.
+async function reapStaleTabs() {
+  if (!RECONCILE) return;
+  const now = Date.now();
+  for (const [room, rt] of rooms) {
+    if (!rt.tabs || rt.tabs.length < 2) continue;
+    for (const tid of rt.tabs.slice()) {
+      if (tid === rt.current) continue;
+      const url = targetUrl.get(tid);
+      if (isStickyUrl(url)) continue;
+      const touched = tabTouch.get(tid) || rt.lastUsed || 0;
+      if (now - touched < STALE_TAB_MS) continue;
+      rt.reaped = rt.reaped || [];
+      if (url && url !== 'about:blank' && !rt.reaped.some(x => x.url === url)) rt.reaped.push({ url, at: now });
+      try { await cdpCloseTarget(tid); } catch {}
+      rt.tabs = rt.tabs.filter(t => t !== tid); tabTouch.delete(tid);
+      log('reconcile: lossless-reaped stale tab', tid, (url || '').slice(0, 50), '(saved to room memory)');
+    }
+  }
+  saveOwnership();
+}
+// [SHIM_REAP_BRIDGE_TABS_V1] A browser tab whose URL is the bridge chat UI is always a
+// recursion artifact: the shared Playwright Chrome only holds ROOM content tabs, while
+// the real chat runs in the user's own browser. Navigating a room's browser to any
+// claude-bridge/?room= URL (a self-mirror OR another room) loads a live bridge CLIENT
+// that registers phantom draft rooms and piles up duplicate tabs, which then confuse the
+// live-view follow-loop. So close every bridge-chat tab on sight and clear any lastUrl
+// that would let blank-recovery re-open one. Empty draft rooms then age out via DEAD_ROOM.
+async function reapBridgeTabs() {
+  if (!RECONCILE) return;
+  let tg; try { tg = await cdpSend('Target.getTargets'); } catch { return; }
+  const bridgeTabs = [];
+  for (const ti of (tg && tg.targetInfos) || []) if (ti.type === 'page' && isBridgeUrl(ti.url)) bridgeTabs.push(ti.targetId);
+  if (!bridgeTabs.length) return;
+  for (const tid of bridgeTabs) {
+    for (const [, rt] of rooms) {
+      if (rt.tabs && rt.tabs.includes(tid)) { rt.tabs = rt.tabs.filter(t => t !== tid); if (rt.current === tid) rt.current = rt.tabs[rt.tabs.length - 1] || null; }
+      if (isBridgeUrl(rt.lastUrl)) rt.lastUrl = '';
+    }
+    try { await cdpCloseTarget(tid); } catch {}
+    targetUrl.delete(tid); tabTouch.delete(tid);
+    log('reconcile: reaped bridge-chat recursion tab', tid);
+  }
+  saveOwnership();
+}
+{
+  const _t1 = setInterval(() => { if (RECONCILE) lock(async () => dedupeMultiRoom()).catch(() => {}); }, 60000);
+  const _t2 = setInterval(() => { if (RECONCILE) lock(() => reapStaleTabs()).catch(() => {}); }, 300000);
+  const _t3 = setInterval(() => { if (RECONCILE) lock(() => reapBridgeTabs()).catch(() => {}); }, 60000);
+  if (_t1.unref) _t1.unref(); if (_t2.unref) _t2.unref(); if (_t3.unref) _t3.unref();
+}
+
 /* ---------- HTTP / MCP surface ---------- */
 function sse(res, sid, obj) {
   const h = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' };
@@ -545,17 +708,18 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET') {
     if (url === '/rooms' || url.startsWith('/rooms?')) {
       const out = {};
-      for (const [r, rt] of rooms) out[r] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null };
-      for (const [alias, canon] of roomAlias) { const rt = rooms.get(canon); if (rt && !out[alias]) out[alias] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null }; }
+      for (const [r, rt] of rooms) out[r] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null, reaped: rt.reaped || [] };
+      for (const [alias, canon] of roomAlias) { const rt = rooms.get(canon); if (rt && !out[alias]) out[alias] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null, reaped: rt.reaped || [], aliasOf: canon }; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify(out));
     }
     const rm = url.match(/^\/rooms\/([^/?]+)$/);
     if (rm) {
       const rk = decodeURIComponent(rm[1]);
-      const rt = rooms.get(rk) || rooms.get(roomAlias.get(rk));
+      const canon = rooms.has(rk) ? null : roomAlias.get(rk);
+      const rt = rooms.get(rk) || rooms.get(canon);
       res.writeHead(rt ? 200 : 404, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify(rt ? { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null } : { error: 'no such room' }));
+      return res.end(JSON.stringify(rt ? { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null, reaped: rt.reaped || [], aliasOf: canon || undefined } : { error: 'no such room' }));
     }
   }
   // Promotion alias (draft id -> real session id): POST /admin/rekey/<old>/<new>.
@@ -568,6 +732,24 @@ const server = http.createServer((req, res) => {
     saveAliases();
     log('alias', decodeURIComponent(rkm[2]), '->', decodeURIComponent(rkm[1]));
     res.writeHead(200); return res.end('ok');
+  }
+  // Admin detach: POST /admin/detach/<room>. Release a mis-attributed tab from a room
+  // WITHOUT closing it (the tab may be a legit login owned by another context). Clears
+  // the room's tabs/current/lastUrl and drops its accumulated draft->session aliases so
+  // the pane shows an honest "waiting" and blank-recovery won't re-open the wrong URL.
+  const detm = url.match(/^\/admin\/detach\/([^/?]+)$/);
+  if (detm && req.method === 'POST') {
+    const room = decodeURIComponent(detm[1]);
+    lock(async () => {
+      const canon = rooms.has(room) ? room : (roomAlias.get(room) || room);
+      const rt = rooms.get(canon);
+      if (rt) { rt.tabs = []; rt.current = null; rt.lastUrl = ''; rt.reaped = []; }
+      let _ac = false; for (const [a, c] of roomAlias) if (c === canon || a === canon) { roomAlias.delete(a); _ac = true; }
+      if (_ac) saveAliases();
+      saveOwnership();
+      log('room', canon, 'detached (tab released, not closed)');
+    });
+    res.writeHead(200); return res.end('detached');
   }
   // Admin room-close (bridge calls this on room teardown): POST /admin/close/<room>.
   // Frees the room mapping and closes its tab.
@@ -612,7 +794,7 @@ const server = http.createServer((req, res) => {
         // about:blank tabs (one per per-task room). A tab is created on demand by
         // the first real browser tools/call (-> ensureRoomTab). Register only the
         // room shell so /rooms + the live viewer know it exists.
-        if (!rooms.has(room)) rooms.set(room, { tabs: [], current: null, lastUrl: null, lastUsed: Date.now() });
+        if (!rooms.has(room)) rooms.set(room, { tabs: [], current: null, lastUrl: null, lastUsed: Date.now(), reaped: persistedReapedByRoom.get(room) || [] });
         const pv = (msg.params && msg.params.protocolVersion) || '2025-06-18';   // echo client's version
         return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, result: { protocolVersion: pv, capabilities: { tools: {} }, serverInfo: { name: 'shim-per-room', version: '1' } } });
       }
@@ -638,7 +820,9 @@ const server = http.createServer((req, res) => {
           if (nm === 'browser_navigate' && a && a.url) rt.lastUrl = a.url;
           // Plain forwarded calls (navigate/click/evaluate/...) are safe to re-run,
           // so retry just the select+forward if the session dies mid-call.
-          return withRetry(async () => { await selectCurrent(rt); return tool(nm, a); });
+          const _res = await withRetry(async () => { await selectCurrent(rt); return tool(nm, a); });
+          await reconcileAfterCall(room, rt).catch(() => {});   // [SHIM_RECONCILE_V1] chip membership + paintable current
+          return _res;
         });
         // Pass upstream result OR error straight through (don't swallow tool errors).
         if (out && out.error) return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: out.error });

@@ -653,6 +653,38 @@
     contextBanner = null;
   }
 
+  // [COMPACT_NUDGE_V1] Each compaction is a LOSSY summarisation, so a room that has
+  // compacted several times is bleeding older context ("doesn't remember two chats
+  // ago"). The bridge auto-compacts at ~100k tokens, so a long-lived room shreds
+  // itself repeatedly. Count compactions per room; past a threshold, nudge a new one.
+  const COMPACT_NUDGE_AT = 3;
+  const compactKey = (rid) => 'ccb-compactions::' + (rid || currentRoomId);
+  function compactCount(rid) { try { return parseInt(localStorage.getItem(compactKey(rid)) || '0', 10) || 0; } catch { return 0; } }
+  let compactNudgeEl = null;
+  function hideCompactNudge() { if (compactNudgeEl) { compactNudgeEl.remove(); compactNudgeEl = null; } }
+  function showCompactNudge(n) {
+    if (compactNudgeEl) { const s = compactNudgeEl.querySelector('.cn-n'); if (s) s.textContent = n; return; }
+    compactNudgeEl = document.createElement('div');
+    compactNudgeEl.className = 'ctx-warning';
+    compactNudgeEl.innerHTML =
+      '<span>\uD83E\uDDF9 This room has compacted <strong class="cn-n">' + n + '</strong> times \u2014 older context is being summarised away. Start a fresh room to keep full context.</span>' +
+      '<button class="cn-new">+ New room</button>' +
+      '<button class="cn-dismiss">Dismiss</button>';
+    compactNudgeEl.querySelector('.cn-new').onclick = () => { hideCompactNudge(); if (typeof newRoom === 'function') newRoom(); };
+    compactNudgeEl.querySelector('.cn-dismiss').onclick = hideCompactNudge;
+    messagesEl.parentNode.insertBefore(compactNudgeEl, messagesEl);
+  }
+  function noteCompaction() {
+    const n = compactCount(currentRoomId) + 1;
+    try { localStorage.setItem(compactKey(currentRoomId), String(n)); } catch {}
+    if (n >= COMPACT_NUDGE_AT) showCompactNudge(n);
+  }
+  function refreshCompactNudge(rid) {
+    hideCompactNudge();
+    const n = compactCount(rid);
+    if (n >= COMPACT_NUDGE_AT) showCompactNudge(n);
+  }
+
   // ── DOM helpers ────────────────────────────────────────────────────────────
   function appendMsg(role, text) {
     removeThinking();
@@ -897,6 +929,7 @@
 
       case 'status':
         setStatus(msg.text || '');
+        if (/auto-compacting|compacting to free space/i.test(msg.text || '')) noteCompaction();
         break;
 
       // A message sent from another device on this shared session.
@@ -948,6 +981,16 @@
         updateLastQuestion();
         break;
 
+      case 'session_named':
+        /* AUTONAME_ROOM_V1: server derived a title for a still-unnamed room */
+        if (msg.id && msg.name) {
+          sessionNameById[msg.id] = msg.name;
+          pendingRoomName = '';
+          updateTitlebar();
+          if (typeof loadSessions === 'function') loadSessions();
+        }
+        break;
+
       case 'room_status':
         // Reply to the stall-watchdog probe. If the server says this room is
         // idle but our UI is still busy, we missed the 'done' — recover the UI.
@@ -997,6 +1040,7 @@
           PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
+          localStorage.setItem(ROOM_KEY, msg.id);   // [ROOMKEY_PERSIST_V1] so a bare-URL/cold open resumes THIS room, not a fresh draft
           try { const u = new URL(location.href); u.searchParams.set('room', msg.id); history.replaceState(null, '', u); } catch {}
           if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
           if (_PRB || _RV) setVncRoom(msg.id);   // panel follows the promoted room id
@@ -1990,6 +2034,7 @@
     lastToolEl = null;
     setBusy(false);
     hideContextWarning();
+    refreshCompactNudge(roomKey);
     storedMsgData        = [];
     lastAssistantDataIdx = -1;
     lastToolDataIdx      = -1;
@@ -2108,7 +2153,35 @@
     newBtn.className = 'sess-new';
     newBtn.textContent = '+ New room';
     newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newRoom(); };
-    sessionList.appendChild(newBtn);
+    // NEWWIN_ROOM_V1 — start a fresh room in a new browser WINDOW (not a tab).
+    const newWinBtn = document.createElement('button');
+    newWinBtn.className = 'sess-new sess-new-win';
+    newWinBtn.title = 'New room in a new window';
+    newWinBtn.setAttribute('aria-label', 'New room in a new window');
+    newWinBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
+    newWinBtn.style.flex = '0 0 auto';
+    newWinBtn.style.display = 'inline-flex';
+    newWinBtn.style.alignItems = 'center';
+    newWinBtn.style.justifyContent = 'center';
+    newWinBtn.style.padding = '0 10px';
+    newWinBtn.onclick = () => {
+      sessionDropdown.classList.add('hidden');
+      const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
+      const u = new URL(location.href); u.searchParams.set('room', rid);
+      const w = Math.min(1100, (screen && screen.availWidth) || 1100);
+      const h = Math.min(900, (screen && screen.availHeight) || 900);
+      const win = window.open(u.href, '_blank', 'noopener,width=' + w + ',height=' + h);
+      if (!win) { try { showToast('Allow pop-ups to open a new window', 'warn'); } catch (e) {} }
+    };
+    // Put the two buttons on one row so the icon sits just after "+ New room".
+    const newRow = document.createElement('div');
+    newRow.className = 'sess-new-row';
+    newRow.style.display = 'flex';
+    newRow.style.gap = '4px';
+    newBtn.style.flex = '1 1 auto';
+    newRow.appendChild(newBtn);
+    newRow.appendChild(newWinBtn);
+    sessionList.appendChild(newRow);
     try {
       const res = await fetch(API_BASE + '/sessions', { cache: 'no-store' });
       const data = await res.json();
@@ -2437,7 +2510,8 @@
       + '</div></div>'
     ).join('');
     const labelByKey = {}; (st.checks || []).forEach((c) => { labelByKey[c.key] = c.label; });
-    const hist = (data.history || []).map((h, i) => {
+    const HIST_SHOWN = 4;
+    const histRows = (data.history || []).map((h, i) => {
       const ok = h.overall === 'ok';
       const det = (h.checks || []).map((c) =>
         '<div style="font-size:11px;color:var(--text-dim);padding:1px 0;">'
@@ -2448,7 +2522,9 @@
         + '<span>' + (ok ? 'all clear' : (h.issues + ' issue' + (h.issues === 1 ? '' : 's'))) + '</span>'
         + '</div>'
         + '<div class="ih-run-det" data-i="' + i + '" style="display:none;padding:0 0 6px 18px;">' + (det || '<div style="font-size:11px;color:var(--text-dim);">no per-check detail recorded</div>') + '</div>';
-    }).join('');
+    });
+    const hist = histRows.slice(0, HIST_SHOWN).join('');
+    const histOlder = histRows.slice(HIST_SHOWN).join('');
     host.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin:0 0 4px;">'
       + '<h3 style="margin:0;font-size:14px;flex:1;">Infra Health</h3>'
@@ -2458,7 +2534,7 @@
       + '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;">Last run ' + when(st.last_run) + (st.stacks ? ' · stacks ' + esc(st.stacks) : '') + '</div>'
       + rows
       + (st.task && st.task.number ? '<div style="margin-top:8px;font-size:12px;">' + (overallOk ? 'Tracked in ' : '⚠️ Escalated to ') + '<a href="#" id="ih-task" style="color:#60a5fa;text-decoration:none;">task #' + esc(st.task.number) + (st.task.title ? ' — ' + esc(st.task.title) : '') + '</a></div>' : '')
-      + (hist ? '<div style="margin-top:14px;font-size:12px;color:var(--text-dim);font-weight:600;">Recent runs</div><div style="font-size:10px;color:var(--text-dim);margin-bottom:2px;">(click a run to expand)</div>' + hist : '')
+      + (hist ? '<div style="margin-top:14px;font-size:12px;color:var(--text-dim);font-weight:600;">Recent runs</div><div style="font-size:10px;color:var(--text-dim);margin-bottom:2px;">(click a run to expand)</div>' + hist + (histOlder ? '<div id="ih-older" style="display:none;">' + histOlder + '</div>' + '<div id="ih-older-btn" style="font-size:11px;color:#60a5fa;cursor:pointer;padding:4px 0;user-select:none;">&#9662; Show ' + (histRows.length - HIST_SHOWN) + ' older</div>' : '') : '')
       + '<div style="margin-top:6px;"><button id="ih-refresh" style="font-size:11px;padding:3px 10px;cursor:pointer;">Refresh</button></div>';
     const rb = document.getElementById('ih-refresh');
     if (rb) rb.addEventListener('click', () => renderInfraHealth(host));
@@ -2471,6 +2547,16 @@
         det.style.display = open ? 'none' : 'block';
         const car = el.querySelector('.ih-run-caret'); if (car) car.textContent = open ? '▸' : '▾';
       });
+    });
+    // Show older: reveal runs beyond the latest 4.
+    const ob = host.querySelector('#ih-older-btn');
+    if (ob) ob.addEventListener('click', () => {
+      const box = host.querySelector('#ih-older');
+      if (!box) return;
+      const open = box.style.display !== 'none';
+      box.style.display = open ? 'none' : 'block';
+      const n = box.querySelectorAll('.ih-run').length;
+      ob.innerHTML = (open ? '&#9662; Show ' : '&#9652; Hide ') + n + ' older';
     });
     // Task link: open the infra-health task (#360) in the Tasks panel.
     const tl = document.getElementById('ih-task');
@@ -2493,6 +2579,43 @@
     rh.style.paddingTop = '14px'; rh.style.borderTop = '1px solid var(--border,#2a2a2a)';
     host.appendChild(rh);
     renderRoomHealth(rh);
+    const cth = document.createElement('div'); cth.id = 'chrometabhealth'; cth.style.marginTop = '18px';
+    cth.style.paddingTop = '14px'; cth.style.borderTop = '1px solid var(--border,#2a2a2a)';
+    host.appendChild(cth);
+    renderChromeTabHealth(cth);
+  }
+
+  // [TABHEALTH_V1] Whole-browser inventory: every open Chrome tab with its id, and either
+  // WHY it stays open in the background (sticky login / Chrome-internal) or WHICH room owns
+  // it. Sits under Room browser health in Settings; refreshes every 5s while open.
+  async function renderChromeTabHealth(host) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    let d = null;
+    try { d = await (await fetch(API_BASE + '/tabhealth', { cache: 'no-store' })).json(); } catch {}
+    if (!host.isConnected) return;
+    const head = '<h3 style="margin:0 0 6px;font-size:14px;">Chrome tab health</h3>';
+    if (!d || d.error) { host.innerHTML = head + '<p style="color:var(--text-dim);font-size:12px;">' + esc((d && d.error) || 'unavailable') + '</p>'; return; }
+    const meta = { background: { color: '#9ca3af' }, internal: { color: '#9ca3af' }, owned: { color: '#60a5fa' }, orphan: { color: '#f87171' } };
+    const rowFor = (t) => {
+      const m = meta[t.kind] || meta.owned;
+      const dot = '<span style="color:' + m.color + ';">&#9679;</span>';
+      const right = (t.kind === 'owned')
+        ? ('room <span style="font-family:monospace;color:#60a5fa;">' + esc(t.roomShort || t.room) + '</span>' + (t.isCurrent ? ' <span style="color:var(--text-dim);">&middot; current</span>' : ''))
+        : '<span style="color:' + m.color + ';">' + esc(t.reason || t.kind) + '</span>';
+      const multi = t.multiRoom ? '<div style="font-size:10px;color:#fbbf24;">also in: ' + esc(t.multiRoom.join(', ')) + '</div>' : '';
+      return '<tr style="border-top:1px solid var(--border,#2a2a2a);">'
+        + '<td style="padding:4px 6px;font-size:11px;vertical-align:top;">' + dot + ' ' + esc((t.title || t.short)).slice(0, 30)
+        + '<div style="color:var(--text-dim);font-size:10px;font-family:monospace;">id ' + esc(t.short) + '</div>'
+        + '<div style="color:var(--text-dim);font-size:10px;word-break:break-all;">' + esc(t.url).slice(0, 52) + '</div></td>'
+        + '<td style="padding:4px 6px;font-size:11px;text-align:right;vertical-align:top;">' + right + multi + '</td></tr>';
+    };
+    const rows = (d.tabs || []).map(rowFor).join('');
+    const c = d.counts || {};
+    host.innerHTML = head
+      + '<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">' + (c.total || 0) + ' tab(s) &middot; ' + (c.background || 0) + ' background &middot; ' + (c.internal || 0) + ' internal &middot; ' + (c.owned || 0) + ' room &middot; ' + (c.orphan || 0) + ' orphan</div>'
+      + (rows ? '<table style="width:100%;border-collapse:collapse;"><thead><tr style="color:var(--text-dim);font-size:10px;"><th style="text-align:left;padding:0 6px;">tab</th><th style="text-align:right;padding:0 6px;">reason / room</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<p style="color:var(--text-dim);font-size:12px;">No Chrome tabs.</p>');
+    if (host._t) clearTimeout(host._t);
+    host._t = setTimeout(() => { const panel = document.getElementById('settings-panel'); if (host.isConnected && panel && !panel.classList.contains('hidden')) renderChromeTabHealth(host); }, 5000);
   }
 
   // [ROOMTABS_V1] The per-room tab-health diagnostic Peter specified: for the current
@@ -2528,11 +2651,17 @@
     const c = d.counts || {};
     const viol = (d.orphans && d.orphans.length ? '<div style="color:#f87171;font-size:11px;margin-top:6px;">' + d.orphans.length + ' orphan tab(s) alive in Chrome, owned by no room (MCP-invisible)</div>' : '')
       + (d.multiRoom && d.multiRoom.length ? '<div style="color:#f87171;font-size:11px;">' + d.multiRoom.length + ' tab(s) connected to &gt;1 room</div>' : '')
-      + (d.reaped && d.reaped.length ? '<div style="color:var(--text-dim);font-size:11px;margin-top:4px;">' + d.reaped.length + ' stale tab(s) reaped &mdash; URL held in room memory for reopen</div>' : '');
-    const allGood = !(d.orphans && d.orphans.length) && !(d.multiRoom && d.multiRoom.length) && (d.tabs || []).every((t) => t.live) && d.painting;
+      + (d.reaped && d.reaped.length ? '<div style="color:var(--text-dim);font-size:11px;margin-top:4px;">' + d.reaped.length + ' stale tab(s) reaped &mdash; URL held in room memory for reopen</div>' : '')
+      + (d.sharedLogins && d.sharedLogins.length ? '<div style="color:var(--text-dim);font-size:11px;margin-top:4px;">' + d.sharedLogins.length + ' shared login tab(s) &mdash; kept, shared across rooms (click to peek):<div style="margin-top:2px;">' + d.sharedLogins.map((s) => '<a href="' + API_BASE + '/roomshot?target=' + encodeURIComponent(s.targetId) + '" target="_blank" rel="noopener" style="font-size:10px;color:#60a5fa;text-decoration:none;">&bull; ' + esc((s.title || s.short)).slice(0, 28) + ' <span style="font-family:monospace;color:var(--text-dim);">' + esc(s.short) + '</span></a>').join('<br>') + '</div></div>' : '');
+    const hasTabs = (d.tabs || []).length > 0;
+    const allGood = !(d.orphans && d.orphans.length) && !(d.multiRoom && d.multiRoom.length) && (d.tabs || []).every((t) => t.live);
+    // A room with no tabs and no violations is simply idle, not unhealthy. `painting`
+    // is informational (a static page legitimately paints no new frames), so it no
+    // longer gates health — it's shown separately below.
+    const idle = allGood && !hasTabs;
     const bodyHtml = head
       + '<div style="font-size:11px;margin-bottom:6px;">'
-      + '<span style="padding:2px 8px;border-radius:10px;background:' + (allGood ? 'rgba(40,160,80,.18);color:#4ade80' : 'rgba(200,140,40,.18);color:#fbbf24') + ';">' + (allGood ? 'healthy' : 'needs attention') + '</span>'
+      + '<span style="padding:2px 8px;border-radius:10px;background:' + (idle ? 'rgba(120,120,120,.18);color:#9ca3af' : (allGood ? 'rgba(40,160,80,.18);color:#4ade80' : 'rgba(200,140,40,.18);color:#fbbf24')) + ';">' + (idle ? 'idle' : (allGood ? 'healthy' : 'needs attention')) + '</span>'
       + '<span style="color:var(--text-dim);margin-left:8px;">painting: ' + (d.painting ? 'yes' : 'no') + ' · viewers ' + (d.viewers || 0) + ' · ' + (c.roomTabs || 0) + ' tabs · ' + (c.orphan || 0) + ' orphan · ' + (c.multiRoom || 0) + ' multi</span></div>'
       + (rows ? '<table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr style="color:var(--text-dim);font-size:10px;"><th style="text-align:left;padding:0 6px;">tab</th><th>assoc</th><th>live</th><th>paint</th><th>strip</th></tr></thead><tbody>' + rows + '</tbody></table>' : '<p style="color:var(--text-dim);font-size:12px;">No tabs in this room.</p>')
       + viol

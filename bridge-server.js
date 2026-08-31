@@ -102,10 +102,20 @@ app.get('/roomtabs', async (req, res) => {
     res.status(r.status).type('application/json').send(await r.text());
   } catch (e) { res.status(502).json({ error: String(e && e.message || e) }); }
 });
+app.get('/tabhealth', async (req, res) => {
+  if (!ROOMVIEW_PORT) return res.json({ error: 'roomview off', tabs: [], counts: {} });
+  try {
+    const r = await fetch(`http://127.0.0.1:${ROOMVIEW_PORT}/tabhealth`);
+    res.set('Cache-Control', 'no-store');
+    res.status(r.status).type('application/json').send(await r.text());
+  } catch (e) { res.status(502).json({ error: String(e && e.message || e) }); }
+});
 app.get('/roomshot', (req, res) => {
   if (!ROOMVIEW_PORT) return res.status(404).end();
   const room = req.query.room ? String(req.query.room) : '';
-  const preq = http.get(`http://127.0.0.1:${ROOMVIEW_PORT}/shot?room=${encodeURIComponent(room)}`, (pr) => {
+  const target = req.query.target ? String(req.query.target) : '';
+  const qs = target ? `target=${encodeURIComponent(target)}` : `room=${encodeURIComponent(room)}`;
+  const preq = http.get(`http://127.0.0.1:${ROOMVIEW_PORT}/shot?${qs}`, (pr) => {
     res.set('Cache-Control', 'no-store'); res.status(pr.statusCode || 200);
     if (pr.headers['content-type']) res.set('Content-Type', pr.headers['content-type']);
     pr.pipe(res);
@@ -475,8 +485,8 @@ app.post('/tasks/:file/title', (req, res) => {
 // ── Auto-compaction ────────────────────────────────────────────────────────────
 // Compact once token occupancy crosses the threshold; absolute token budget wins
 // over the % fallback. Set both to 0 to disable.
-const AUTO_COMPACT_TOKENS = parseInt(process.env.AUTO_COMPACT_TOKENS || '100000', 10);
-const AUTO_COMPACT_PCT = parseInt(process.env.AUTO_COMPACT_PCT || '50', 10);
+const AUTO_COMPACT_TOKENS = parseInt(process.env.AUTO_COMPACT_TOKENS || '160000', 10);
+const AUTO_COMPACT_PCT = parseInt(process.env.AUTO_COMPACT_PCT || '80', 10);
 const AUTO_COMPACT_COOLDOWN_MS = parseInt(process.env.AUTO_COMPACT_COOLDOWN_MS || '120000', 10);
 
 // ── Chat history persistence (file-based, no compilation required) ──────────
@@ -793,6 +803,58 @@ function saveSessionNames() {
   try { fs.writeFileSync(SESSION_NAMES_PATH, JSON.stringify(sessionNames, null, 2)); }
   catch (e) { console.warn(`Failed to save session names: ${e.message}`); }
 }
+// ── AUTONAME_ROOM_V1: auto-title a fresh room from its first instruction ──
+// Gated per-home: only fires when ~/.claude/bridge-autoname-on exists. Skips
+// rooms that already have a name and autonomy task rooms (they carry task labels).
+function autoNameEnabled() {
+  try { return fs.existsSync(path.join(os.homedir(), '.claude', 'bridge-autoname-on')); }
+  catch { return false; }
+}
+function autoNameRoom(S) {
+  try {
+    if (!autoNameEnabled()) return;
+    const id = S.sessionId;
+    if (!id) return;
+    if (sessionNames[id]) return;                       // named already (manual or prior auto)
+    S._nameTurns = (S._nameTurns || 0) + 1;
+    if (S._nameTurns > 2) return;                       // only the 1st or 2nd instruction
+    if (S._naming) return;                              // a generation is already in flight
+    try { if (readAutonomyRooms().get(id)) return; } catch {}   // leave task rooms alone
+    const file = path.join(transcriptsDir(), id + '.jsonl');
+    const first = firstUserText(file);
+    if (!first || first.length < 4) return;             // too vague yet — wait for turn 2
+    S._naming = true;
+    const prompt = 'Summarise this instruction as a 3-4 word title in Title Case. '
+      + 'Reply with ONLY the title: no punctuation, no quotes, no preamble.\n\nInstruction: ' + first;
+    const env = { ...process.env };
+    let out = '';
+    let proc;
+    try {
+      proc = spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
+        { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch { S._naming = false; return; }
+    proc.stdout.on('data', c => { out += c.toString(); });
+    const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 20000);
+    proc.on('error', () => { clearTimeout(killer); S._naming = false; });
+    proc.on('close', () => {
+      clearTimeout(killer);
+      S._naming = false;
+      if (sessionNames[id]) return;                     // user named it meanwhile — respect it
+      let name = (out || '').replace(/\s+/g, ' ').trim().replace(/^["'\s]+|["'\s]+$/g, '');
+      name = name.split(' ').slice(0, 5).join(' ').trim().slice(0, 60);   // guard a chatty model
+      if (!name || /^new room$/i.test(name)) {
+        // fallback: first few significant words of the instruction
+        name = first.split(' ').filter(Boolean).slice(0, 4).join(' ').slice(0, 60);
+      }
+      if (!name) return;
+      sessionNames[id] = name;
+      saveSessionNames();
+      try { S.send({ type: 'session_named', id, name }); } catch {}
+      console.log('[Bridge] auto-named room', id.slice(0, 8), '->', name);
+    });
+  } catch (e) { try { console.warn('[Bridge] autoNameRoom failed:', e.message); } catch {} }
+}
+
 app.post('/sessions/:id/name', (req, res) => {
   try {
     const name = (req.body && typeof req.body.name === 'string') ? req.body.name.trim().slice(0, 80) : '';
@@ -2299,6 +2361,7 @@ function makeSession(key) {
             S.processing = false;
             S.clearWatch();
             S.send({ type: 'done', code: 0 });
+            try { autoNameRoom(S); } catch (e) {}
             S.maybeAutoCompact();
             S.evictIfReady();
           }

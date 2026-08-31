@@ -227,6 +227,7 @@ function onUpstreamMessage(raw) {
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
+    room._lastFrameAt = Date.now();   // [ROOMTABS_V1] freshness for the "painting" column
     // Screencast metadata reports deviceWidth/Height in DEVICE pixels (CSS * dpr), but the
     // client maps clicks into CDP's CSS-pixel space using those values. When a room's page
     // has devicePixelRatio !== 1 (seen: 0.5), deviceWidth is half the CSS width, so every
@@ -569,7 +570,7 @@ const CLIENT_HTML = (() => { const fs = require('fs');
   return '<!doctype html><title>room viewer</title>client not found';
 })();
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url.startsWith('/room')) {
+  if (req.url === '/' || (req.url.startsWith('/room') && !req.url.startsWith('/roomtabs'))) {
     res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(CLIENT_HTML); return;
   }
   if (req.url === '/health') {
@@ -577,8 +578,227 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ upReady, rooms: [...rooms.keys()], cdp: CDP_PORT }));
     return;
   }
+  // [ROOMTABS_V1] Read-only per-room paint state (the "painting" truth). For each room
+  // the relay is casting: which target is composited (viewing), how many viewers, and
+  // whether a frame arrived recently (=> actually painting, not frozen).
+  if (req.url === '/state' || req.url.startsWith('/state?')) {
+    const now = Date.now();
+    const out = {};
+    for (const [rid, r] of rooms) {
+      out[rid] = {
+        viewing: r.targetId || null,
+        viewers: r.viewers ? r.viewers.size : 0,
+        casting: !!r.casting,
+        waiting: !!r.waiting,
+        pinned: !!r.pinned,
+        lastFrameAt: r._lastFrameAt || 0,
+        painting: !!(r.targetId && r._lastFrameAt && now - r._lastFrameAt < 4000),
+      };
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(out));
+    return;
+  }
+  // [TABHEALTH_V1] Global Chrome tab inventory: every open tab, with either WHY it stays
+  // open in the background (sticky login / Chrome-internal) or WHICH room owns it. Read-only.
+  if (req.url === '/tabhealth' || req.url.startsWith('/tabhealth?')) {
+    buildChromeTabHealth().then((h) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(h)); })
+      .catch((e) => { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: String(e && e.message || e) })); });
+    return;
+  }
+  // [ROOMTABS_V1] Full per-room tab-health join (shim ownership + live CDP tabs + relay
+  // paint state) with the four columns Peter asked for, plus systemic violations. This is
+  // what the bridge Settings > Room browser health panel renders. Read-only.
+  const rtm = req.url.match(/^\/roomtabs(?:\?(.*))?$/);
+  if (rtm) {
+    const room = new URLSearchParams(rtm[1] || '').get('room') || null;
+    buildRoomTabsHealth(room).then((h) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(h));
+    }).catch((e) => { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: String(e && e.message || e) })); });
+    return;
+  }
+  // [ROOMTABS_V1] The exact pixels currently painted for a room (JPEG of the viewing
+  // target) — the "can you see what's on screen" ask. captureScreenshot paints even a
+  // backgrounded tab, so it's honest about what the pane is showing.
+  const shm = req.url.match(/^\/shot(?:\?(.*))?$/);
+  if (shm) {
+    const qp = new URLSearchParams(shm[1] || '');
+    const room = qp.get('room') || null;
+    const target = qp.get('target') || null;
+    (async () => {
+      // Peek at an arbitrary tab by targetId (shared-login / unowned tabs). Attach
+      // transiently, capture one JPEG, detach - no persistent cast.
+      if (target) {
+        let sid = null;
+        try {
+          const a = await send('Target.attachToTarget', { targetId: target, flatten: true });
+          sid = a.sessionId;
+          const shot = await send('Page.captureScreenshot', { format: 'jpeg', quality: 60 }, sid);
+          if (!shot || !shot.data) { res.writeHead(404); return res.end('no frame'); }
+          const buf = Buffer.from(shot.data, 'base64');
+          res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store', 'Content-Length': buf.length });
+          res.end(buf);
+        } catch (e) { res.writeHead(500); res.end(String(e && e.message || e)); }
+        finally { if (sid) { try { await send('Target.detachFromTarget', { sessionId: sid }); } catch {} } }
+        return;
+      }
+      const r = room && rooms.get(room);
+      if (!r || !r.sessionId) { res.writeHead(404); return res.end('no cast'); }
+      try {
+        const shot = await send('Page.captureScreenshot', { format: 'jpeg', quality: 55 }, r.sessionId);
+        if (!shot || !shot.data) { res.writeHead(404); return res.end('no frame'); }
+        const buf = Buffer.from(shot.data, 'base64');
+        res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-store', 'Content-Length': buf.length });
+        res.end(buf);
+      } catch (e) { res.writeHead(500); res.end(String(e && e.message || e)); }
+    })();
+    return;
+  }
   res.writeHead(404); res.end('not found');
 });
+
+// [ROOMTABS_V1] Join shim ownership (/rooms) + live CDP tabs (/json/list) + this relay's
+// paint state into the diagnostic Peter specified. Columns per tab: associated(1),
+// live(2), painting(3), inStrip(4). Alias twins (draft<->session) collapse to one logical
+// room so they are NOT mis-flagged as multi-room. Orphans + true multi-room are surfaced.
+async function buildRoomTabsHealth(roomId) {
+  const [list, shimRooms] = await Promise.all([
+    cdpFetch('/json/list').catch(() => []),
+    shimAllRooms(),
+  ]);
+  const pages = new Map();
+  for (const t of list) if (t.type === 'page') pages.set(t.id, t);
+  const isBridge = (u) => { u = u || ''; return u.includes('claude-bridge') && u.includes('room='); };
+  // Only a bridge page pointed at THIS room is a self-mirror recursion; one showing a
+  // different room is ordinary content and must not be flagged.
+  const isSelfBridge = (u, room) => {
+    if (!isBridge(u) || !room) return false;
+    const m = /[?&]room=([^&]+)/.exec(u);
+    if (!m) return false;
+    const tr = decodeURIComponent(m[1]);
+    return tr === room || tr.startsWith(room) || room.startsWith(tr);
+  };
+  // Collapse alias keys to their canonical room so a twin isn't counted as two owners.
+  const canonOf = (rid) => (shimRooms[rid] && shimRooms[rid].aliasOf) ? shimRooms[rid].aliasOf : rid;
+  const owner = new Map();  // targetId -> Set(canonical roomId)
+  for (const [rid, rt] of Object.entries(shimRooms)) {
+    const canon = canonOf(rid);
+    for (const tid of (rt.tabs || [])) { if (!owner.has(tid)) owner.set(tid, new Set()); owner.get(tid).add(canon); }
+  }
+  const resolvedRoom = roomId && (shimRooms[roomId] ? roomId : null);
+  const rt = resolvedRoom ? shimRooms[resolvedRoom] : null;
+  const canonRoom = resolvedRoom ? canonOf(resolvedRoom) : null;
+  const relayRoom = (roomId && rooms.get(roomId)) || (canonRoom && rooms.get(canonRoom)) || null;
+  const viewing = relayRoom ? relayRoom.targetId : null;
+  const lastFrameAt = relayRoom ? (relayRoom._lastFrameAt || 0) : 0;
+  const painting = !!(viewing && lastFrameAt && Date.now() - lastFrameAt < 4000);
+  const tabs = ((rt && rt.tabs) || []).map((tid) => {
+    const p = pages.get(tid);
+    const owners = [...(owner.get(tid) || [])];
+    return {
+      targetId: tid,
+      short: String(tid).slice(0, 12),
+      title: p ? (p.title || '') : '',
+      url: p ? (p.url || '') : '',
+      isCurrent: rt.current === tid,
+      associated: true,               // (1) in the room's owned set
+      live: !!p,                      // (2) present in Chrome right now
+      painting: tid === viewing && painting, // (3) the composited, freshly-painted tab
+      inStrip: true,                  // (4) owned set == the chip strip
+      multiRoom: owners.length > 1 ? owners : null,
+      nestedBridge: p ? isSelfBridge(p.url, roomId) : false,
+      dead: !p,
+    };
+  });
+  const orphans = [];
+  const sharedLogins = [];
+  // chrome://, devtools://, about: pages aren't MCP-drivable content — Chrome manages
+  // them (e.g. the self-respawning signin-dice interceptor), so they aren't real orphans.
+  const isInternal = (u) => { u = u || ''; return u.startsWith('chrome://') || u.startsWith('devtools://') || u.startsWith('about:') || u === ''; };
+  // Sticky = webmail/OAuth/WhatsApp session tabs (mirrors shim SHIM_STICKY_DOMAINS). An
+  // unowned sticky tab is a DELIBERATELY-shared login session, not a leaked orphan.
+  const STICKY_DOMAINS = (process.env.SHIM_STICKY_DOMAINS ||
+    'mail.google.com,accounts.google.com,outlook.cloud.microsoft,outlook.office.com,outlook.office365.com,login.microsoftonline.com,web.whatsapp.com,pipedrive.com')
+    .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const isSticky = (u) => { u = String(u || '').toLowerCase(); return STICKY_DOMAINS.some((d) => u.includes(d)); };
+  for (const [tid, p] of pages) {
+    if (owner.has(tid) || isInternal(p.url)) continue;
+    const entry = { targetId: tid, short: String(tid).slice(0, 12), title: p.title || '', url: p.url || '' };
+    if (isSticky(p.url)) sharedLogins.push(entry); else orphans.push(entry);
+  }
+  const multiRoom = [];
+  for (const [tid, set] of owner) if (set.size > 1) multiRoom.push({ targetId: tid, short: String(tid).slice(0, 12), rooms: [...set] });
+  return {
+    room: roomId, canonical: canonRoom, aliasOf: (rt && rt.aliasOf) || null,
+    viewing, painting, viewers: relayRoom ? relayRoom.viewers.size : 0,
+    waiting: relayRoom ? !!relayRoom.waiting : false,
+    current: rt ? (rt.current || null) : null,
+    tabs,
+    reaped: (rt && rt.reaped) || [],
+    orphans, multiRoom, sharedLogins,
+    counts: { livePages: pages.size, owned: owner.size, orphan: orphans.length, multiRoom: multiRoom.length, roomTabs: tabs.length, sharedLogins: sharedLogins.length },
+    ts: Date.now(),
+  };
+}
+
+// [TABHEALTH_V1] Whole-browser tab inventory. Every CDP page joined with shim ownership,
+// classified as: background (sticky login kept across rooms), internal (chrome://…, Chrome
+// self-manages), owned (a room is driving it) or orphan (unowned, no room). Background &
+// internal tabs get a human reason; owned tabs report their room.
+async function buildChromeTabHealth() {
+  const [list, shimRooms] = await Promise.all([
+    cdpFetch('/json/list').catch(() => []),
+    shimAllRooms(),
+  ]);
+  const canonOf = (rid) => (shimRooms[rid] && shimRooms[rid].aliasOf) ? shimRooms[rid].aliasOf : rid;
+  const owner = new Map();       // targetId -> Set(canonical roomId)
+  const currentOf = new Set();   // targetIds that are some room's current
+  for (const [rid, rt] of Object.entries(shimRooms)) {
+    const canon = canonOf(rid);
+    for (const tid of (rt.tabs || [])) { if (!owner.has(tid)) owner.set(tid, new Set()); owner.get(tid).add(canon); }
+    if (rt.current) currentOf.add(rt.current);
+  }
+  const STICKY_DOMAINS = (process.env.SHIM_STICKY_DOMAINS ||
+    'mail.google.com,accounts.google.com,outlook.cloud.microsoft,outlook.office.com,outlook.office365.com,login.microsoftonline.com,web.whatsapp.com,pipedrive.com')
+    .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+  const isSticky = (u) => { u = String(u || '').toLowerCase(); return STICKY_DOMAINS.some((d) => u.includes(d)); };
+  const isInternal = (u) => { u = u || ''; return u.startsWith('chrome://') || u.startsWith('devtools://') || u.startsWith('about:') || u === ''; };
+  const reasonFor = (u) => {
+    u = String(u || '').toLowerCase();
+    if (u.includes('mail.google.com') || u.includes('accounts.google.com')) return 'Gmail — signed in (Castle email); non-critical — API fallback (gmail-tool)';
+    if (u.includes('outlook.') || u.includes('office365') || u.includes('login.microsoftonline')) return 'Outlook — signed in (Adlux email); non-critical — API fallback (Graph)';
+    if (u.includes('web.whatsapp.com')) return 'WhatsApp Web — CRITICAL: browser-only, no API — must stay signed in';
+    if (u.includes('pipedrive.com')) return 'Pipedrive CRM — kept signed in (whale-review)';
+    if (u.startsWith('chrome://') || u.startsWith('devtools://')) return 'Chrome internal — self-managed (not MCP-drivable)';
+    if (u.startsWith('about:') || u === '') return 'Blank / new tab';
+    return 'Background session';
+  };
+  const tabs = [];
+  for (const t of list) {
+    if (t.type !== 'page') continue;
+    const url = t.url || '';
+    const owners = [...(owner.get(t.id) || [])];
+    let kind, reason = null, room = null;
+    if (isInternal(url)) { kind = 'internal'; reason = reasonFor(url); }
+    else if (isSticky(url)) { kind = 'background'; reason = reasonFor(url); }
+    else if (owners.length) { kind = 'owned'; room = owners[0]; }
+    else { kind = 'orphan'; reason = 'Unowned — no room is driving this tab'; }
+    tabs.push({
+      targetId: t.id, short: String(t.id).slice(0, 12),
+      title: t.title || '', url,
+      kind, reason,
+      room, roomShort: room ? String(room).slice(0, 8) : null,
+      multiRoom: owners.length > 1 ? owners.map((r) => String(r).slice(0, 8)) : null,
+      isCurrent: currentOf.has(t.id),
+    });
+  }
+  const order = { background: 0, internal: 1, owned: 2, orphan: 3 };
+  tabs.sort((a, b) => (order[a.kind] - order[b.kind]) || String(a.room || '').localeCompare(String(b.room || '')) || String(a.title).localeCompare(String(b.title)));
+  const counts = { total: tabs.length, background: 0, internal: 0, owned: 0, orphan: 0 };
+  for (const t of tabs) counts[t.kind]++;
+  return { tabs, counts, ts: Date.now() };
+}
 
 // Tear a room down after its last viewer leaves (grace-delayed so quick room
 // switching does not thrash). Closes the follow-window ONLY if it is a relay-

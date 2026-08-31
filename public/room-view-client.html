@@ -104,17 +104,35 @@
   function showWaiting() { if (waitEl) waitEl.style.display = 'flex'; setStatus('waiting · ' + roomId, 'waiting'); }
   function hideWaiting() { if (waitEl) waitEl.style.display = 'none'; }
 
+  // [ROOMVIEW_LIVENESS_V1] Frames are change-driven, so a static page legitimately
+  // sends none — plain silence can't mean "dead". Instead we actively probe: every
+  // 5s ask the relay for a keyframe (forces a paint even on an idle page) and expect
+  // a frame back. Two unanswered probes in a row == a zombie/half-open WS (typically
+  // after a relay restart, where onclose never fires) → force close so the existing
+  // onclose→reconnect path re-establishes a live cast. Suppressed while the room is
+  // legitimately empty ('waiting'). Cost: one tiny message per pane per 5s.
+  let live = false, unansweredProbes = 0, livenessTimer = null;
+  function startLiveness() {
+    if (livenessTimer) return;
+    livenessTimer = setInterval(() => {
+      if (!ws || ws.readyState !== 1) return;   // not open: onclose→reconnect owns it
+      if (!live) return;                        // empty room legitimately sends no frames
+      if (unansweredProbes >= 2) { try { ws.close(); } catch (e) {} return; }  // zombie WS → recycle
+      unansweredProbes++;
+      try { ws.send(JSON.stringify({ req: 'keyframe' })); } catch (e) {}
+    }, 5000);
+  }
   function connect() {
     ws = new WebSocket(buildWsUrl());
-    ws.onopen = () => { reconnectDelay = 1000; setStatus('connected · ' + roomId, 'connecting'); };
-    ws.onclose = () => { setStatus('disconnected', 'disconnected'); scheduleReconnect(); };
+    ws.onopen = () => { reconnectDelay = 1000; unansweredProbes = 0; setStatus('connected · ' + roomId, 'connecting'); startLiveness(); };
+    ws.onclose = () => { live = false; setStatus('disconnected', 'disconnected'); scheduleReconnect(); };
     ws.onerror = () => { setStatus('error', 'error'); };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.t === 'frame') { gotFrame = true; hideWaiting(); drawFrame(m); }
+      if (m.t === 'frame') { gotFrame = true; unansweredProbes = 0; hideWaiting(); drawFrame(m); }
       else if (m.t === 'meta') renderMeta(m);
-      else if (m.t === 'hello') { hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); requestKeyframes(); }
-      else if (m.t === 'waiting') showWaiting();
+      else if (m.t === 'hello') { live = true; unansweredProbes = 0; hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); requestKeyframes(); }
+      else if (m.t === 'waiting') { live = false; showWaiting(); }
       else if (m.t === 'error') setStatus('err: ' + m.msg, 'error');
     };
   }

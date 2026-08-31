@@ -538,7 +538,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
 /* ── Settings panel overlay ── */
 #settings-panel {
-  position: fixed; top: 0; right: 0; width: 320px; max-width: 92vw; height: 100%;
+  position: fixed; top: 0; right: 0; width: 416px; max-width: 92vw; height: 100%;
   background: var(--bg-panel); border-left: 1px solid var(--border);
   z-index: 50; display: flex; flex-direction: column;
   box-shadow: -4px 0 20px rgba(0,0,0,0.4); transition: transform 0.2s;
@@ -1165,3 +1165,6 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
 .fp-add input { flex:1; padding:6px 8px; font-size:13px; border-radius:8px; border:1px solid var(--border,#333); background:var(--bg,#151515); color:var(--text,#eee); }
 .fp-add button { padding:6px 12px; font-size:13px; border-radius:8px; border:1px solid var(--border,#333); background:var(--accent,#3b82f6); color:#fff; cursor:pointer; white-space:nowrap; }
 .fp-add button:disabled { opacity:.5; cursor:default; }
+
+/* Room-list colour strip (mirrors each room's background colour) */
+.sess-color { flex: 0 0 auto; width: 12px; align-self: stretch; background: transparent; border-radius: 2px; margin-right: 2px; }
