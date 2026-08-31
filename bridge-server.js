@@ -2364,7 +2364,7 @@ function makeSession(key) {
           if (ROOMVIEW_PORT && SHIM_PORT && S.shimMountKey && S.shimMountKey !== ev.session_id) assertRoomAlias(S.shimMountKey, ev.session_id);
           // Re-key a brand-new room from its draft id to the real Claude session id
           // so a second device opening this conversation joins the *live* room.
-          if (S.key && S.key !== ev.session_id && !sessionFileExists(S.key)) {
+          if (S.key && S.key !== ev.session_id && !sessionFileExists(S.key) && String(S.key).startsWith('draft-')) {
             const _oldKey = S.key;
             const _existing = clientSessions.get(ev.session_id);
             if (_existing && _existing !== S) {
