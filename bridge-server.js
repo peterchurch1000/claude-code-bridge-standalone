@@ -803,56 +803,102 @@ function saveSessionNames() {
   try { fs.writeFileSync(SESSION_NAMES_PATH, JSON.stringify(sessionNames, null, 2)); }
   catch (e) { console.warn(`Failed to save session names: ${e.message}`); }
 }
-// ── AUTONAME_ROOM_V1: auto-title a fresh room from its first instruction ──
+// ── AUTONAME_ROOM_V2: auto-title a fresh room from its first instruction ──
 // Gated per-home: only fires when ~/.claude/bridge-autoname-on exists. Skips
 // rooms that already have a name and autonomy task rooms (they carry task labels).
 function autoNameEnabled() {
   try { return fs.existsSync(path.join(os.homedir(), '.claude', 'bridge-autoname-on')); }
   catch { return false; }
 }
+// Like firstUserText but returns more of the instruction (up to ~400 chars, cut
+// on a word boundary) so the summariser sees a whole request, not a mid-word stub.
+function firstUserInstruction(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(131072);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    for (const line of buf.slice(0, n).toString('utf8').split('\n')) {
+      if (line.indexOf('"role":"user"') === -1) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+          let t = extractText(ev.message.content);
+          if (t) {
+            t = t.replace(/\s+/g, ' ').trim();
+            if (t.length > 400) { const cut = t.slice(0, 400); t = cut.slice(0, cut.lastIndexOf(' ') + 1).trim() || cut; }
+            return t;
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return '';
+}
+// True only for something that reads like a short label, not a sentence/refusal.
+function looksLikeTitle(str) {
+  if (!str) return false;
+  const words = str.split(' ').filter(Boolean);
+  if (words.length === 0 || words.length > 6) return false;
+  if (/[.?!:;]/.test(str)) return false;                       // sentence punctuation => prose
+  if (/\b(instruction|provide|incomplete|sorry|cannot|unable|please|summar|the user|it seems|appears)\b/i.test(str)) return false;
+  return true;
+}
+// Free fallback: strip filler words and Title-Case the first few content words.
+function heuristicTitle(instr) {
+  const stop = new Set(('a an the of to in on at for and or but can could would you please i we it this that make made get show when they are is be as with my our your his her their new page cards card slightly').split(' '));
+  let words = instr.toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  let picked = words.filter(w => !stop.has(w));
+  if (picked.length < 2) picked = words;                        // instruction was all filler
+  picked = picked.slice(0, 4);
+  return picked.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ').slice(0, 60);
+}
 function autoNameRoom(S) {
   try {
     if (!autoNameEnabled()) return;
     const id = S.sessionId;
-    if (!id) return;
+    if (!id) { console.log('[autoname] skip: no sessionId on room'); return; }
     if (sessionNames[id]) return;                       // named already (manual or prior auto)
     S._nameTurns = (S._nameTurns || 0) + 1;
     if (S._nameTurns > 2) return;                       // only the 1st or 2nd instruction
     if (S._naming) return;                              // a generation is already in flight
     try { if (readAutonomyRooms().get(id)) return; } catch {}   // leave task rooms alone
     const file = path.join(transcriptsDir(), id + '.jsonl');
-    const first = firstUserText(file);
-    if (!first || first.length < 4) return;             // too vague yet — wait for turn 2
+    const first = firstUserInstruction(file);
+    if (!first || first.length < 4) { console.log('[autoname] skip', id.slice(0, 8), 'no first message yet (turn ' + S._nameTurns + ')'); return; }
     S._naming = true;
-    const prompt = 'Summarise this instruction as a 3-4 word title in Title Case. '
-      + 'Reply with ONLY the title: no punctuation, no quotes, no preamble.\n\nInstruction: ' + first;
+    console.log('[autoname] naming room', id.slice(0, 8), 'turn', S._nameTurns);
+    const prompt = 'Give a 3 or 4 word Title Case label for this task. '
+      + 'Output ONLY the label — no punctuation, quotes, or explanation. '
+      + 'If the request is cut off, infer the topic from what is present.\n\nTask: ' + first;
     const env = { ...process.env };
-    let out = '';
+    let out = '', errout = '';
     let proc;
     try {
       proc = spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
         { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch { S._naming = false; return; }
+    } catch (e) { S._naming = false; console.log('[autoname] spawn failed:', e.message); return; }
     proc.stdout.on('data', c => { out += c.toString(); });
-    const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 20000);
-    proc.on('error', () => { clearTimeout(killer); S._naming = false; });
-    proc.on('close', () => {
+    proc.stderr.on('data', c => { errout += c.toString(); });
+    const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 25000);
+    proc.on('error', (e) => { clearTimeout(killer); S._naming = false; console.log('[autoname] proc error', id.slice(0, 8), e.message); });
+    proc.on('close', (code) => {
       clearTimeout(killer);
       S._naming = false;
       if (sessionNames[id]) return;                     // user named it meanwhile — respect it
       let name = (out || '').replace(/\s+/g, ' ').trim().replace(/^["'\s]+|["'\s]+$/g, '');
-      name = name.split(' ').slice(0, 5).join(' ').trim().slice(0, 60);   // guard a chatty model
-      if (!name || /^new room$/i.test(name)) {
-        // fallback: first few significant words of the instruction
-        name = first.split(' ').filter(Boolean).slice(0, 4).join(' ').slice(0, 60);
+      if (!looksLikeTitle(name)) {
+        console.log('[autoname]', id.slice(0, 8), 'model output rejected:', JSON.stringify(name.slice(0, 60)), 'code', code, errout ? ('| err ' + errout.slice(0, 80)) : '');
+        name = heuristicTitle(first);
       }
-      if (!name) return;
+      name = name.split(' ').slice(0, 5).join(' ').trim().slice(0, 60);
+      if (!name) { console.log('[autoname]', id.slice(0, 8), 'produced empty name — giving up'); return; }
       sessionNames[id] = name;
       saveSessionNames();
       try { S.send({ type: 'session_named', id, name }); } catch {}
-      console.log('[Bridge] auto-named room', id.slice(0, 8), '->', name);
+      console.log('[autoname] named room', id.slice(0, 8), '->', name);
     });
-  } catch (e) { try { console.warn('[Bridge] autoNameRoom failed:', e.message); } catch {} }
+  } catch (e) { try { console.warn('[autoname] failed:', e.message); } catch {} }
 }
 
 app.post('/sessions/:id/name', (req, res) => {
