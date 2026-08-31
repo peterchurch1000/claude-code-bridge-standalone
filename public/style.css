@@ -331,12 +331,12 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
 #task-filter-bar { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .tf-btn {
-  background: none; border: 1px solid var(--border); color: var(--text-dim);
+  background: rgba(52, 59, 78, 0.92); border: 1px solid var(--border); color: #eef1f7;
   border-radius: 5px; padding: 3px 8px; font-size: 11px; cursor: pointer;
-  font-family: inherit; transition: color .15s, border-color .15s; white-space: nowrap;
+  font-family: inherit; transition: background .15s, color .15s, border-color .15s; white-space: nowrap;
 }
-.tf-btn:hover { color: var(--text); border-color: var(--accent); }
-.tf-btn.active { color: var(--accent); border-color: var(--accent); }
+.tf-btn:hover { background: rgba(66, 74, 96, 0.95); color: var(--text); border-color: var(--accent); }
+.tf-btn.active { background: rgba(66, 74, 96, 0.95); color: var(--accent); border-color: var(--accent); }
 .tf-dd { position: relative; }
 .tf-menu {
   position: absolute; top: calc(100% + 3px); left: 0; z-index: 30; min-width: 130px;

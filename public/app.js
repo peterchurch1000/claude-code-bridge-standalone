@@ -1205,7 +1205,9 @@
 
   async function pollUsage() {
     try {
-      const res  = await fetch(API_BASE + '/usage', { cache: 'no-store' });
+      const engine = effectiveEngine(currentRoomId);
+      const qs = '?engine=' + encodeURIComponent(engine) + '&roomId=' + encodeURIComponent(currentRoomId || '');
+      const res  = await fetch(API_BASE + '/usage' + qs, { cache: 'no-store' });
       const data = await res.json();
       if (!data.ok) return;
 
@@ -1239,11 +1241,14 @@
       if (rl.ctx_pct != null) setBar(fillCtx, pctCtx, rl.ctx_pct);
 
       // Model + email
-      if (metaModel && rl.model) metaModel.textContent = rl.model;
-      if (metaEmail && rl.email) metaEmail.textContent = rl.email;
+      if (metaModel) metaModel.textContent = rl.model || (engine === 'codex' ? 'Codex' : 'Claude');
+      if (metaEmail) metaEmail.textContent = rl.email || '';
       if (metaSep) metaSep.style.visibility = (rl.model && rl.email) ? 'visible' : 'hidden';
 
-      maybeSuggestSwitch(rl);
+      // Claude's refresh and account auto-switch remain exactly as before, but are
+      // irrelevant to a Codex room and must never fire against its metrics.
+      if (btnUsageRefresh) btnUsageRefresh.style.display = engine === 'codex' ? 'none' : '';
+      if (engine !== 'codex') maybeSuggestSwitch(rl);
     } catch { /* silent */ }
   }
 
@@ -1956,6 +1961,7 @@
         engSel.addEventListener('change', () => {
           setRoomOverride(engSel.value, currentRoomId);
           updateTitlebar();
+          pollUsage();
           if (typeof showToast === 'function') showToast('This room \u2192 ' + (engSel.value === 'global' ? 'Global engine' : engSel.value === 'codex' ? 'Codex' : 'Claude'), 'info');
         });
       }
@@ -2154,10 +2160,12 @@
     newBtn.textContent = '+ New room';
     newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newRoom(); };
     // NEWWIN_ROOM_V1 — start a fresh room in a new browser WINDOW (not a tab).
-    const newWinBtn = document.createElement('button');
+    const newWinBtn = document.createElement('a');
     newWinBtn.className = 'sess-new sess-new-win';
-    newWinBtn.title = 'New room in a new window';
-    newWinBtn.setAttribute('aria-label', 'New room in a new window');
+    newWinBtn.setAttribute('role', 'button');
+    newWinBtn.target = '_blank';
+    newWinBtn.rel = 'noopener';
+    newWinBtn.href = '#';
     newWinBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
     newWinBtn.style.flex = '0 0 auto';
     newWinBtn.style.width = 'auto';   /* NEWROOM_SPACE_V1: don't inherit .sess-new width:100% */
@@ -2165,21 +2173,26 @@
     newWinBtn.style.alignItems = 'center';
     newWinBtn.style.justifyContent = 'center';
     newWinBtn.style.padding = '0 10px';
-    newWinBtn.onclick = () => {
-      sessionDropdown.classList.add('hidden');
+    // Normal target=_blank link: a plain click opens a standard new tab.
+    newWinBtn.title = 'New room in a new tab';
+    newWinBtn.setAttribute('aria-label', 'New room in a new tab');
+    newWinBtn.style.textDecoration = 'none';
+    newWinBtn.style.cursor = 'pointer';
+    const freshNewTabHref = () => {
       const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
       const u = new URL(location.href); u.searchParams.set('room', rid);
-      const w = Math.min(1100, (screen && screen.availWidth) || 1100);
-      const h = Math.min(900, (screen && screen.availHeight) || 900);
-      const win = window.open(u.href, '_blank', 'noopener,width=' + w + ',height=' + h);
-      if (!win) { try { showToast('Allow pop-ups to open a new window', 'warn'); } catch (e) {} }
+      newWinBtn.href = u.href;
     };
+    newWinBtn.addEventListener('pointerdown', freshNewTabHref);
+    newWinBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') freshNewTabHref(); });
+    newWinBtn.addEventListener('click', () => { sessionDropdown.classList.add('hidden'); });
     // Put the two buttons on one row so the icon sits just after "+ New room".
     const newRow = document.createElement('div');
     newRow.className = 'sess-new-row';
     newRow.style.display = 'flex';
     newRow.style.gap = '4px';
-    newBtn.style.flex = '1 1 auto';
+    newBtn.style.flex = '0 0 auto';   /* NEWROOM_ICON_ADJACENT_V1: shrink to text so icon sits right after */
+    newBtn.style.width = 'auto';
     newBtn.style.whiteSpace = 'nowrap';   /* NEWROOM_SPACE_V1: keep + New room on one line */
     newRow.appendChild(newBtn);
     newRow.appendChild(newWinBtn);
@@ -3360,17 +3373,33 @@
     showToast('Scheduled forward ' + days + ' day' + (days > 1 ? 's' : ''), 'info');
   }
   function scheduleTaskDate(t) {
+    document.querySelectorAll('.task-menu, .area-picker, .date-picker').forEach(m => m.remove());
+    const menu = document.createElement('div');
+    menu.className = 'task-menu date-picker';
+    menu.addEventListener('click', (e) => e.stopPropagation());
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const head = document.createElement('div'); head.className = 'task-menu-head'; head.textContent = 'Schedule forward to date'; menu.appendChild(head);
     const inp = document.createElement('input');
     inp.type = 'date';
     inp.value = /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') ? t.scheduled : new Date().toISOString().slice(0, 10);
-    inp.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
-    document.body.appendChild(inp);
-    inp.addEventListener('change', () => {
+    inp.style.cssText = 'margin:8px;padding:6px;font-size:14px';
+    menu.appendChild(inp);
+    const act = document.createElement('div'); act.className = 'flag-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'tc-cancel'; cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', (e) => { e.stopPropagation(); close(); });
+    const save = document.createElement('button'); save.type = 'button'; save.className = 'tf-ok'; save.textContent = 'Save';
+    save.addEventListener('click', (e) => {
+      e.stopPropagation();
       if (inp.value) { updateTaskFields(t.file, { scheduled: inp.value }); showToast('Scheduled for ' + inp.value, 'info'); }
-      inp.remove();
+      close();
     });
-    inp.addEventListener('blur', () => setTimeout(() => { if (inp.isConnected) inp.remove(); }, 200));
-    setTimeout(() => { try { inp.showPicker(); } catch (e) { inp.focus(); inp.click(); } }, 0);
+    act.appendChild(cancel); act.appendChild(save); menu.appendChild(act);
+    document.body.appendChild(menu);
+    menu.style.position = 'fixed'; menu.style.left = '50%'; menu.style.top = '50%'; menu.style.transform = 'translate(-50%,-50%)'; menu.style.zIndex = '100001';
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+    inp.focus();
+    try { inp.showPicker(); } catch (e) {}
   }
   // Priority levels in the picker (0 = highest, above P1). Keep in sync with the
   // DB CHECK constraint and the Organiser selector.

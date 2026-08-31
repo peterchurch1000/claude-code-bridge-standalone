@@ -853,6 +853,19 @@ function heuristicTitle(instr) {
   picked = picked.slice(0, 4);
   return picked.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ').slice(0, 60);
 }
+// AUTONAME_ISOLATE_V1: keep the namer's own CLI transcript out of the room list.
+const AUTONAME_SCRATCH = path.join(os.homedir(), '.claude', 'autoname-scratch');
+try { fs.mkdirSync(AUTONAME_SCRATCH, { recursive: true }); } catch {}
+function purgeAutonameScratch() {
+  try {
+    const base = path.join(os.homedir(), '.claude', 'projects');
+    for (const d of fs.readdirSync(base)) {
+      if (d.indexOf('autoname-scratch') === -1) continue;
+      const dp = path.join(base, d);
+      try { for (const f of fs.readdirSync(dp)) { try { fs.unlinkSync(path.join(dp, f)); } catch {} } } catch {}
+    }
+  } catch {}
+}
 function autoNameRoom(S) {
   try {
     if (!autoNameEnabled()) return;
@@ -876,7 +889,7 @@ function autoNameRoom(S) {
     let proc;
     try {
       proc = spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
-        { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
+        { cwd: AUTONAME_SCRATCH, env, stdio: ['ignore', 'pipe', 'pipe'] });   /* AUTONAME_ISOLATE_V1 */
     } catch (e) { S._naming = false; console.log('[autoname] spawn failed:', e.message); return; }
     proc.stdout.on('data', c => { out += c.toString(); });
     proc.stderr.on('data', c => { errout += c.toString(); });
@@ -885,6 +898,7 @@ function autoNameRoom(S) {
     proc.on('close', (code) => {
       clearTimeout(killer);
       S._naming = false;
+      purgeAutonameScratch();   /* AUTONAME_ISOLATE_V1 */
       if (sessionNames[id]) return;                     // user named it meanwhile — respect it
       let name = (out || '').replace(/\s+/g, ' ').trim().replace(/^["'\s]+|["'\s]+$/g, '');
       if (!looksLikeTitle(name)) {
@@ -1702,8 +1716,60 @@ function readAccountEmail() {
   } catch { return ''; }
 }
 
+// Codex status is deliberately independent of the established Claude collector.
+// The official app-server account API exposes the same 5h/7d windows and resets.
+let codexMetricsCache = null, codexMetricsAt = 0, codexMetricsWaiters = [];
+function readCodexModel() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.codex', 'models_cache.json'), 'utf8'));
+    const models = Array.isArray(d.models) ? d.models : [];
+    const m = models.find(x => x && x.priority === 1) || models[0];
+    if (m) return { name: m.display_name || m.slug || 'Codex', window: Math.floor((m.context_window || 0) * ((m.effective_context_window_percent || 100) / 100)) };
+  } catch {}
+  return { name: 'Codex', window: 0 };
+}
+function readCodexMetrics(done) {
+  if (codexMetricsCache && Date.now() - codexMetricsAt < 25000) return done(null, codexMetricsCache);
+  codexMetricsWaiters.push(done);
+  if (codexMetricsWaiters.length > 1) return;
+  const script = path.join(os.homedir(), 'bin', 'codex-metrics.js');
+  execFile(script, [], { timeout: 10000, env: { ...process.env, HOME: os.homedir() } }, (err, stdout) => {
+    let data = null;
+    try { data = JSON.parse(stdout); } catch {}
+    if (!err && data) { codexMetricsCache = data; codexMetricsAt = Date.now(); }
+    const waiters = codexMetricsWaiters; codexMetricsWaiters = [];
+    for (const cb of waiters) cb(err || (!data && new Error('Invalid Codex metrics response')), data);
+  });
+}
+function codexUsageResponse(raw, roomId) {
+  const account = raw && raw.account || {};
+  const limits = raw && raw.rateLimits && raw.rateLimits.rateLimits || {};
+  const primary = limits.primary || {}, secondary = limits.secondary || {};
+  const model = readCodexModel();
+  const room = roomId ? clientSessions.get(roomId) : null;
+  const tokens = room && room.codexCtxTokens || null;
+  return {
+    ok: true, engine: 'codex', block: null, week: null,
+    rateLimits: {
+      five_hour_pct: primary.usedPercent ?? null,
+      five_hour_resets_at: primary.resetsAt ?? null,
+      seven_day_pct: secondary.usedPercent ?? null,
+      seven_day_resets_at: secondary.resetsAt ?? null,
+      ctx_pct: tokens && model.window ? Math.min(100, Math.round(tokens / model.window * 100)) : null,
+      ctx_tokens: tokens,
+      model: 'Codex · ' + model.name,
+      email: account.email || '', plan: account.planType || limits.planType || '',
+    }
+  };
+}
+
 // Claude token/cost usage — 5-hour block + weekly, parallel fetch
 app.get('/usage', (req, res) => {
+  if (String(req.query.engine || '').toLowerCase() === 'codex') {
+    return readCodexMetrics((err, raw) => err
+      ? res.status(502).json({ ok: false, engine: 'codex', error: err.message })
+      : res.json(codexUsageResponse(raw, String(req.query.roomId || ''))));
+  }
   let blockResult = null, weekResult = null, done = 0;
   const rateLimits = readRateLimits() || {};
   // Always force the real chat model + account email: the rate-limits.json file is
@@ -2545,6 +2611,11 @@ function makeSession(key) {
         for (const m of parseCodexEvent(ev)) {
           if (m.kind === 'session') { S.threadId = m.id; S.send({ type: 'session_id', id: m.id }); }
           else if (m.kind === 'stream') S.send({ type: 'stream', data: m.data });
+          else if (m.kind === 'result' && m.usage) {
+            // cached_input_tokens is a subset of input_tokens in Codex usage.
+            S.codexCtxTokens = Number(m.usage.input_tokens || 0);
+            S.send({ type: 'codex_usage', usage: m.usage, ctxTokens: S.codexCtxTokens });
+          }
         }
         S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
       }
