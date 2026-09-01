@@ -1,0 +1,366 @@
+// Per-room tab shim for the bridge's Playwright MCP.
+//
+// One public MCP endpoint multiplexed by URL path /mcp/<roomId>. All rooms share
+// ONE upstream Playwright MCP (one Chrome, one CDP, one port). Each room is pinned
+// to its own browser tab; a room's tool calls always run against that tab, so rooms
+// browse independently while sharing the one logged-in browser context (cookies).
+//
+// Tab identity is tracked by CDP targetId (stable across navigation and robust to
+// the human opening/closing tabs in the visible noVNC view) — NOT by list index,
+// which shifts. A raw CDP WebSocket mirrors Chrome's page-target attach order, which
+// is the same order the MCP's browser_tabs uses, so we translate targetId -> index
+// only at select time.
+//
+// Env: SHIM_PORT (listen), UPSTREAM (MCP url), CDP_URL (http://host:port).
+const http = require('http');
+const WebSocket = require('ws');
+
+const UPSTREAM  = process.env.UPSTREAM  || 'http://localhost:8951/mcp';
+const CDP_URL   = process.env.CDP_URL   || 'http://127.0.0.1:9241';
+const PORT      = parseInt(process.env.SHIM_PORT || '8961');
+
+let upstreamSid = null, toolsCache = null;
+const rooms = new Map();               // roomId -> { targetId }
+const roomAlias = new Map();           // viewer key (promoted session id) -> canonical (draft) roomId
+let chain = Promise.resolve();
+// Global mutex: every tab create / select / forwarded call is serialised so the
+// upstream MCP's single "active tab" pointer can't be raced between rooms.
+const lock = (fn) => { const r = chain.then(fn, fn); chain = r.then(() => {}, () => {}); return r; };
+const log = (...a) => console.log('[shim]', ...a);
+
+/* ---------- CDP target tracking (page-target order == MCP tab index order) ---------- */
+let pageTargets = [];                   // ordered targetIds of type 'page'
+const targetUrl = new Map();            // targetId -> last known url (for order resync)
+let cdpWs = null, cdpReady = null, cdpId = 0;
+const cdpPending = new Map();
+
+function cdpSend(method, params) {
+  const id = ++cdpId;
+  cdpWs.send(JSON.stringify({ id, method, params: params || {} }));
+  return new Promise((res, rej) => cdpPending.set(id, { res, rej }));
+}
+async function connectCDP() {
+  const r = await fetch(`${CDP_URL}/json/version`);
+  const wsUrl = (await r.json()).webSocketDebuggerUrl;
+  await new Promise((resolve, reject) => {
+    cdpWs = new WebSocket(wsUrl, { perMessageDeflate: false, maxPayload: 512 * 1024 * 1024 });
+    cdpWs.on('open', resolve);
+    cdpWs.on('error', reject);
+    cdpWs.on('message', (data) => {
+      let m; try { m = JSON.parse(data); } catch { return; }
+      if (m.id && cdpPending.has(m.id)) { const p = cdpPending.get(m.id); cdpPending.delete(m.id); return m.error ? p.rej(new Error(m.error.message)) : p.res(m.result); }
+      if (m.method === 'Target.targetCreated')     addTarget(m.params.targetInfo);
+      else if (m.method === 'Target.targetInfoChanged') addTarget(m.params.targetInfo);
+      else if (m.method === 'Target.targetDestroyed')   removeTarget(m.params.targetId);
+      else if (m.method === 'Target.targetCrashed')      removeTarget(m.params.targetId);
+    });
+    cdpWs.on('close', () => { log('CDP socket closed — reconnecting'); cdpReady = null; pageTargets = []; setTimeout(ensureCDP, 1000); });
+  });
+  // setDiscoverTargets replays targetCreated for all existing targets (seeds order).
+  await cdpSend('Target.setDiscoverTargets', { discover: true });
+  log('CDP connected;', pageTargets.length, 'page target(s)');
+}
+function addTarget(ti) {
+  if (ti.type !== 'page') { removeTarget(ti.targetId); return; }
+  if (!pageTargets.includes(ti.targetId)) pageTargets.push(ti.targetId);
+  if (ti.url != null) targetUrl.set(ti.targetId, ti.url);
+}
+function removeTarget(id) {
+  const i = pageTargets.indexOf(id); if (i >= 0) pageTargets.splice(i, 1);
+  targetUrl.delete(id);
+  for (const [room, rt] of rooms) {
+    if (rt.tabs && rt.tabs.includes(id)) {
+      rt.tabs = rt.tabs.filter(t => t !== id);
+      if (rt.current === id) rt.current = rt.tabs[rt.tabs.length - 1] || null;
+      // Keep the room entry (do NOT delete) so its lastUrl survives: a session
+      // 404 -> reinit can make Playwright close the room's page out from under
+      // us; on next use ensureRoomTab re-creates the tab and restores lastUrl.
+      // Only admin/close removes a room for good.
+      if (rt.tabs.length === 0) log('room', room, 'lost its tab externally — will re-create' + (rt.lastUrl ? ' + restore ' + rt.lastUrl : ''));
+      else log('room', room, 'a tab closed externally');
+    }
+  }
+}
+function ensureCDP() { if (!cdpReady) cdpReady = connectCDP().catch(e => { cdpReady = null; log('CDP connect failed:', e.message); }); return cdpReady; }
+
+/* ---------- upstream MCP (Streamable HTTP / SSE) ---------- */
+function parseSSE(t) { let o = null; for (const l of t.split('\n')) { const m = l.match(/^data: (.*)$/); if (m) { try { o = JSON.parse(m[1]); } catch {} } } return o; }
+async function up(body) {
+  const h = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
+  if (upstreamSid) h['Mcp-Session-Id'] = upstreamSid;
+  const r = await fetch(UPSTREAM, { method: 'POST', headers: h, body: JSON.stringify(body) });
+  if (r.status !== 200 && process.env.SHIM_DEBUG) log('up() status', r.status, 'for', body.method || (body.params && body.params.name));
+  if (r.status === 404 && upstreamSid) { closeUpStream(); upstreamSid = null; throw new Error('upstream session expired'); }
+  const sid = r.headers.get('mcp-session-id'); if (sid) upstreamSid = sid;
+  return parseSSE(await r.text());
+}
+function closeUpStream() {}
+async function ensureUpstream() {
+  if (upstreamSid) return;
+  await up({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'shim', version: '1' } } });
+  await up({ jsonrpc: '2.0', method: 'notifications/initialized' });
+  log('upstream MCP session initialised');
+}
+const tool = (name, args) => up({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method: 'tools/call', params: { name, arguments: args || {} } });
+
+// A poisoned upstream session (404) or a Playwright "page closed" error is
+// recoverable: drop the session, re-initialise, and re-run the operation once.
+// Handles the human closing (in the visible noVNC view) the very tab the MCP is
+// bound to. Catches both thrown errors and JSON-RPC error results.
+const isTransient = (s) => /session expired|has been closed|Target page|Session closed|browser has disconnected|not found|Invalid session/i.test(s || '');
+// After a reinit the fresh session's browser_tabs index order is authoritative but
+// may not equal our creation-ordered pageTargets (external tab-close + session
+// churn can diverge them). Rebuild pageTargets to match the MCP list by URL, so
+// index translation in selectCurrent stays correct. Order-independent, self-healing.
+async function resyncOrder() {
+  try {
+    const r = await up({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_tabs', arguments: { action: 'list' } } });
+    const text = ((r && r.result && r.result.content) || []).map(x => x.text).join('\n');
+    const urls = [];
+    for (const l of text.split('\n')) { const m = l.match(/^\s*-\s*\d+:.*\(([^)]*)\)\s*$/); if (m) urls.push(m[1]); }
+    if (urls.length !== pageTargets.length) { log('resyncOrder: count mismatch', urls.length, 'vs', pageTargets.length, '— skipping'); return; }
+    const pool = pageTargets.slice(), ordered = [];
+    for (const u of urls) {
+      let idx = pool.findIndex(t => (targetUrl.get(t) || '') === u);
+      if (idx < 0) idx = 0;                       // unknown url -> take next remaining
+      ordered.push(pool.splice(idx, 1)[0]);
+    }
+    pageTargets = ordered;
+    log('resynced tab order to MCP list');
+  } catch (e) { log('resyncOrder failed:', String(e && e.message || e)); }
+}
+async function reinit() { closeUpStream(); upstreamSid = null; toolsCache = null; await ensureUpstream(); await resyncOrder(); }
+async function withRetry(fn) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let r;
+    try { r = await fn(); }
+    catch (e) { if (attempt === 0 && isTransient(String(e && e.message || e))) { log('recovering upstream (thrown):', String(e.message || e)); await reinit(); continue; } throw e; }
+    if (r && r.error && attempt === 0 && isTransient(JSON.stringify(r.error))) { log('recovering upstream (result-error)'); await reinit(); continue; }
+    return r;
+  }
+}
+// Idempotent liveness check: ensure the upstream session is alive, exercising it
+// with a harmless browser_tabs list. A stale session makes up() throw 'session
+// expired' (404), which withRetry catches -> reinit. Safe to run any number of
+// times (no side effects), so it absorbs the common "session went stale between
+// turns" 404 BEFORE any non-idempotent tab mutation runs.
+async function ensureSession() {
+  await ensureUpstream();
+  const r = await tool('browser_tabs', { action: 'list' });
+  if (r && r.error && isTransient(JSON.stringify(r.error))) throw new Error('session probe: ' + JSON.stringify(r.error));
+  return r;
+}
+
+/* ---------- room <-> tabs ----------
+   A room owns a list of tabs (targetIds); `current` is its active tab. Every
+   browser_tabs op is intercepted and re-scoped to the room-local tab set, so a
+   room can neither see nor select another room's tabs (no cross-room leak). */
+function pruneRoom(rt) {
+  rt.tabs = rt.tabs.filter(t => pageTargets.includes(t));
+  if (!rt.tabs.includes(rt.current)) rt.current = rt.tabs[rt.tabs.length - 1] || null;
+}
+async function newTab() {
+  const before = new Set(pageTargets);
+  await tool('browser_tabs', { action: 'new' });
+  // Wait for the freshly-created page target to register in CDP. NEVER fall back
+  // to an existing tab — that would alias another room onto this room's tab
+  // (two rooms sharing one targetId => cross-room clobber + spurious "freed").
+  for (let i = 0; i < 80; i++) {                 // up to ~4s
+    const added = pageTargets.filter(t => !before.has(t));
+    if (added.length) return added[added.length - 1];
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error('new tab did not register in CDP');
+}
+async function ensureRoomTab(room) {
+  await ensureUpstream();
+  await ensureCDP();
+  let rt = rooms.get(room);
+  if (rt) { pruneRoom(rt); if (rt.current) return rt; }
+  else { rt = { tabs: [], current: null, lastUrl: null }; rooms.set(room, rt); }
+  const tid = await newTab();
+  rt.tabs.push(tid); rt.current = tid;
+  await selectCurrent(rt);
+  // Restore the room's last page if its tab was lost to a reinit; else blank.
+  const restore = rt.lastUrl || 'about:blank';
+  await tool('browser_navigate', { url: restore });
+  log('room', room, '-> tab', tid, '(index', pageTargets.indexOf(tid) + ')', rt.lastUrl ? 'restored ' + restore : '');
+  return rt;
+}
+async function selectCurrent(rt) {
+  const idx = pageTargets.indexOf(rt.current);
+  if (idx < 0) throw new Error('room tab vanished');
+  await tool('browser_tabs', { action: 'select', index: idx });
+}
+
+// Intercept browser_tabs and present a room-local view (indices 0..n within the
+// room only). list/select/new/close all operate on the room's own tabs.
+function parseTabList(text) {
+  const map = new Map();   // global index -> label ("Title - URL")
+  for (const l of (text || '').split('\n')) {
+    const m = l.match(/^\s*-\s*(\d+):\s*(?:\(current\)\s*)?(.*)$/);
+    if (m) map.set(parseInt(m[1]), m[2].trim());
+  }
+  return map;
+}
+async function roomTabList(rt) {
+  const full = ((await tool('browser_tabs', { action: 'list' })).result || {}).content || [];
+  const map = parseTabList(full.map(x => x.text).join('\n'));
+  const lines = rt.tabs.map((tid, i) => `- ${i}:${tid === rt.current ? ' (current)' : ''} ${map.get(pageTargets.indexOf(tid)) || '(tab)'}`);
+  return { content: [{ type: 'text', text: lines.join('\n') || '- (no tabs)' }] };
+}
+async function handleTabs(room, rt, args) {
+  const action = args && args.action;
+  if (action === 'select') {
+    const i = args.index;
+    if (i == null || i < 0 || i >= rt.tabs.length) return { content: [{ type: 'text', text: `Error: this room has no tab ${i}` }], isError: true };
+    rt.current = rt.tabs[i]; await selectCurrent(rt);
+    return roomTabList(rt);
+  }
+  if (action === 'new') {
+    const tid = await newTab(); rt.tabs.push(tid); rt.current = tid;
+    await selectCurrent(rt); await tool('browser_navigate', { url: 'about:blank' });
+    log('room', room, 'opened tab', tid, '(now', rt.tabs.length, 'tabs)');
+    return roomTabList(rt);
+  }
+  if (action === 'close') {
+    const i = (args.index == null) ? rt.tabs.indexOf(rt.current) : args.index;
+    const tid = rt.tabs[i];
+    if (tid == null) return { content: [{ type: 'text', text: `Error: this room has no tab ${i}` }], isError: true };
+    const g = pageTargets.indexOf(tid);
+    if (g >= 0) { await tool('browser_tabs', { action: 'select', index: g }); await tool('browser_tabs', { action: 'close' }); }
+    rt.tabs = rt.tabs.filter(t => t !== tid);
+    if (rt.current === tid) rt.current = rt.tabs[rt.tabs.length - 1] || null;
+    if (rt.tabs.length === 0) { const n = await newTab(); rt.tabs.push(n); rt.current = n; }
+    await selectCurrent(rt);
+    return roomTabList(rt);
+  }
+  // list / anything else: return the room-local list.
+  return roomTabList(rt);
+}
+
+/* ---------- HTTP / MCP surface ---------- */
+function sse(res, sid, obj) {
+  const h = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' };
+  if (sid) h['Mcp-Session-Id'] = sid;
+  res.writeHead(200, h);
+  if (obj !== undefined) res.write(`event: message\ndata: ${JSON.stringify(obj)}\n\n`);
+  res.end();
+}
+const server = http.createServer((req, res) => {
+  const url = req.url || '';
+  if (process.env.SHIM_DEBUG) log('REQ', req.method, url);
+  // Read-only room->target map for the live viewer (task 190): GET /rooms returns
+  // every room's current CDP targetId + tab list; GET /rooms/<room> returns one.
+  // The relay (follow mode) uses `current` to pin the screencast to the exact page
+  // Claude's automation is driving, so the pane shows what Claude sees. Promotion
+  // aliases (draft id -> real session id) are resolved so a viewer keyed on the
+  // promoted id still finds the room the MCP created under the draft key.
+  if (req.method === 'GET') {
+    if (url === '/rooms' || url.startsWith('/rooms?')) {
+      const out = {};
+      for (const [r, rt] of rooms) out[r] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null };
+      for (const [alias, canon] of roomAlias) { const rt = rooms.get(canon); if (rt && !out[alias]) out[alias] = { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null }; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(out));
+    }
+    const rm = url.match(/^\/rooms\/([^/?]+)$/);
+    if (rm) {
+      const rk = decodeURIComponent(rm[1]);
+      const rt = rooms.get(rk) || rooms.get(roomAlias.get(rk));
+      res.writeHead(rt ? 200 : 404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(rt ? { current: rt.current || null, tabs: rt.tabs || [], lastUrl: rt.lastUrl || null } : { error: 'no such room' }));
+    }
+  }
+  // Promotion alias (draft id -> real session id): POST /admin/rekey/<old>/<new>.
+  // The MCP keeps hitting /mcp/<old>; the viewer switches to <new>; this makes
+  // /rooms/<new> resolve to the room still stored under <old>. Read-only for the
+  // MCP path (rooms map is untouched), so tab isolation is unaffected.
+  const rkm = url.match(/^\/admin\/rekey\/([^/?]+)\/([^/?]+)$/);
+  if (rkm && req.method === 'POST') {
+    roomAlias.set(decodeURIComponent(rkm[2]), decodeURIComponent(rkm[1]));
+    log('alias', decodeURIComponent(rkm[2]), '->', decodeURIComponent(rkm[1]));
+    res.writeHead(200); return res.end('ok');
+  }
+  // Admin room-close (bridge calls this on room teardown): POST /admin/close/<room>.
+  // Frees the room mapping and closes its tab.
+  const adm = url.match(/^\/admin\/close\/([^/?]+)$/);
+  if (adm) {
+    const room = decodeURIComponent(adm[1]);
+    lock(async () => {
+      const rt = rooms.get(room); rooms.delete(room);
+      if (rt && rt.tabs) for (const tid of rt.tabs) {
+        const g = pageTargets.indexOf(tid);
+        if (g >= 0) { try { await tool('browser_tabs', { action: 'select', index: g }); await tool('browser_tabs', { action: 'close' }); } catch {} }
+      }
+      log('room', room, 'closed (admin)');
+    });
+    res.writeHead(200); return res.end('closed');
+  }
+  const mm = url.match(/^\/mcp\/([^/?]+)/);
+  if (!mm) { res.writeHead(404); return res.end('no room'); }
+  const room = decodeURIComponent(mm[1]);
+  // MCP session terminate (client shutdown): keep the room's tab — the browser
+  // persists between Claude invocations, so the next turn reuses the same tab.
+  if (req.method === 'DELETE') { res.writeHead(200); return res.end('ok'); }
+  // GET opens the server->client SSE channel. The MCP http client marks the
+  // server "connected" once this stream is established, so we hold it open with
+  // periodic keepalives (we never push server-initiated messages, but the channel
+  // must exist). Matches the real Playwright MCP's behaviour.
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    res.write(': ok\n\n');
+    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
+    req.on('close', () => clearInterval(ping));
+    return;
+  }
+  let body = ''; req.on('data', c => body += c); req.on('end', async () => {
+    let msg = {}; try { msg = JSON.parse(body || '{}'); } catch {}
+    const id = msg.id, method = msg.method;
+    try {
+      if (method === 'initialize') {
+        await lock(() => withRetry(() => ensureRoomTab(room)));
+        const pv = (msg.params && msg.params.protocolVersion) || '2025-06-18';   // echo client's version
+        return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, result: { protocolVersion: pv, capabilities: { tools: {} }, serverInfo: { name: 'shim-per-room', version: '1' } } });
+      }
+      // Notifications / responses expect no reply: 202 Accepted (per MCP spec).
+      if (method && method.startsWith('notifications/')) { res.writeHead(202); return res.end(); }
+      if (method === 'tools/list') {
+        if (!toolsCache) { await ensureUpstream(); toolsCache = await up({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }); }
+        return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, result: toolsCache.result });
+      }
+      if (method === 'tools/call') {
+        const nm = msg.params.name, a = msg.params.arguments || {};
+        const out = await lock(async () => {
+          // Recovery is REACTIVE only (no pre-emptive session probe): sessions
+          // survive idle fine, so an extra probe would just add its own 404 risk
+          // -> reinit -> tab-index drift. ensureRoomTab (idempotent) is retried;
+          // browser_tabs new/close are NOT idempotent (a retry would create/close
+          // an extra tab), so they run exactly ONCE, never wrapped in withRetry.
+          const rt = await withRetry(() => ensureRoomTab(room));
+          if (nm === 'browser_tabs') return handleTabs(room, rt, a);   // room-scoped, runs once
+          // Remember the room's target page so a lost tab can be restored there.
+          if (nm === 'browser_navigate' && a && a.url) rt.lastUrl = a.url;
+          // Plain forwarded calls (navigate/click/evaluate/...) are safe to re-run,
+          // so retry just the select+forward if the session dies mid-call.
+          return withRetry(async () => { await selectCurrent(rt); return tool(nm, a); });
+        });
+        // Pass upstream result OR error straight through (don't swallow tool errors).
+        if (out && out.error) return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: out.error });
+        // tool() returns a full JSON-RPC envelope (.result); handleTabs returns a bare result.
+        return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, result: (out && out.result) || out || {} });
+      }
+      return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: { code: -32601, message: 'method not handled: ' + method } });
+    } catch (e) { return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: { code: -32000, message: String(e && e.message || e) } }); }
+  });
+});
+ensureCDP();
+// NOTE: no proactive keepalive. Idle sessions survive fine (measured: 5s+), so a
+// periodic probe only adds its own 404 risk -> reinit -> tab-index drift. Recovery
+// is purely reactive via withRetry on real calls. Opt back in with SHIM_KEEPALIVE_MS.
+const KEEPALIVE_MS = parseInt(process.env.SHIM_KEEPALIVE_MS || '0');
+if (KEEPALIVE_MS > 0) setInterval(() => {
+  if (rooms.size === 0 || !upstreamSid) return;
+  lock(() => withRetry(ensureSession).catch(e => log('keepalive:', String(e && e.message || e))));
+}, KEEPALIVE_MS);
+server.listen(PORT, '127.0.0.1', () => log(`listening ${PORT}, upstream ${UPSTREAM}, cdp ${CDP_URL}`));

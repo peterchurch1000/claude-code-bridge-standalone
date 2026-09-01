@@ -1,0 +1,3606 @@
+/* Claude Code Bridge — Chat UI */
+(function () {
+  'use strict';
+
+  const $ = id => document.getElementById(id);
+
+  const messagesEl      = $('messages');
+
+  // ── Chat search: highlight + step through matches in this session, plus a
+  //    global search panel listing matches in every other session ────────────
+  (function initChatSearch(){
+    const btnSearch = $('btn-search');
+    const bar       = $('msg-search-bar');
+    const input     = $('msg-search-input');
+    const countEl   = $('msg-search-count');
+    const closeBtn  = $('msg-search-close');
+    const prevBtn   = $('msg-search-prev');
+    const nextBtn   = $('msg-search-next');
+    const resultsEl = $('msg-search-results');
+    if (!btnSearch || !bar || !input) return;
+
+    let marks = [];   // <mark> nodes for the current query, in document order
+    let curIdx = -1;
+
+    function clearMarks(){
+      messagesEl.querySelectorAll('mark.search-mark').forEach(m => {
+        const t = document.createTextNode(m.textContent);
+        m.parentNode.replaceChild(t, m);
+      });
+      messagesEl.querySelectorAll('.msg, .msg-tool').forEach(el => el.normalize());
+      marks = []; curIdx = -1;
+    }
+    function wrapNode(node, lc){
+      const text = node.nodeValue, low = text.toLowerCase();
+      let idx = low.indexOf(lc), last = 0;
+      if (idx === -1) return;
+      const frag = document.createDocumentFragment();
+      while (idx !== -1){
+        if (idx > last) frag.appendChild(document.createTextNode(text.slice(last, idx)));
+        const m = document.createElement('mark');
+        m.className = 'search-mark';
+        m.textContent = text.slice(idx, idx + lc.length);
+        frag.appendChild(m); marks.push(m);
+        last = idx + lc.length; idx = low.indexOf(lc, last);
+      }
+      if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    }
+    function updateCount(){
+      if (!countEl) return;
+      countEl.textContent = marks.length ? (curIdx + 1) + ' / ' + marks.length : 'No matches here';
+    }
+    function setActive(i){
+      if (!marks.length){ updateCount(); return; }
+      marks.forEach(m => m.classList.remove('search-mark-active'));
+      curIdx = (i + marks.length) % marks.length;
+      const m = marks[curIdx];
+      m.classList.add('search-mark-active');
+      m.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      updateCount();
+    }
+    function _msgHasTerm(m, lc){
+      if (!m) return false;
+      if (m.type === 'tool') return String(m.toolName||'').toLowerCase().includes(lc)
+        || String(m.result==null?'':m.result).toLowerCase().includes(lc)
+        || (m.args ? JSON.stringify(m.args).toLowerCase().includes(lc) : false);
+      return String(m.text||'').toLowerCase().includes(lc);
+    }
+    // Reveal older (not-yet-rendered) messages containing the term so their matches
+    // highlight too — fixes global-result clicks showing "No matches here" when the
+    // hits live in messages beyond the initial render window.
+    function revealOlderContaining(lc){
+      try {
+        let guard = 0;
+        while (typeof _pendingOlder !== 'undefined' && _pendingOlder.length
+               && typeof loadOlder === 'function'
+               && guard++ < 1000 && _pendingOlder.some(m => _msgHasTerm(m, lc))) {
+          loadOlder();
+        }
+      } catch (_) {}
+    }
+    function runSearch(q){
+      clearMarks();
+      q = (q || '').trim();
+      if (!q){ if (countEl) countEl.textContent = ''; return; }
+      const lc = q.toLowerCase();
+      const doWrap = () => {
+        const walker = document.createTreeWalker(messagesEl, NodeFilter.SHOW_TEXT, {
+          acceptNode(n){ return (n.nodeValue && n.nodeValue.toLowerCase().includes(lc)) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT; }
+        });
+        const nodes = []; let n; while ((n = walker.nextNode())) nodes.push(n);
+        for (const node of nodes) wrapNode(node, lc);
+      };
+      doWrap();
+      if (!marks.length && typeof _pendingOlder !== 'undefined' && _pendingOlder.some(m => _msgHasTerm(m, lc))) {
+        revealOlderContaining(lc);
+        clearMarks();
+        doWrap();
+      }
+      if (marks.length) setActive(0); else updateCount();
+    }
+
+    // Global search across every stored session (server scans transcripts).
+    let globalTimer = null;
+    let _globalAbort = null;
+    function clearGlobal(){ if (resultsEl){ resultsEl.innerHTML=''; resultsEl.classList.add('hidden'); } }
+    function fmtTime(ms){ try { return ms ? new Date(ms).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : ''; } catch { return ''; } }
+    async function runGlobal(q){
+      if (!resultsEl) return;
+      q = (q || '').trim();
+      if (q.length < 2) { clearGlobal(); return; }
+      if (_globalAbort) { try { _globalAbort.abort(); } catch (_) {} }
+      _globalAbort = new AbortController();
+      const _sig = _globalAbort.signal;
+      let data;
+      try {
+        const r = await fetch(API_BASE + '/search?q=' + encodeURIComponent(q), { cache:'no-store', signal:_sig });
+        data = await r.json();
+      } catch (e) { if (e && e.name === 'AbortError') return; clearGlobal(); return; }
+      if (_sig.aborted) return;
+      const results = (data.results || []).filter(s => s.id !== currentSessionId);
+      resultsEl.innerHTML = '';
+      if (!results.length) { clearGlobal(); return; }
+      const head = document.createElement('div');
+      head.className = 'gsearch-head';
+      head.textContent = 'Other sessions (' + results.length + ')';
+      resultsEl.appendChild(head);
+      for (const s of results) {
+        const row = document.createElement('button');
+        row.className = 'gsearch-row';
+        const title = document.createElement('div');
+        title.className = 'gsearch-title';
+        title.appendChild(document.createTextNode(s.name || s.preview || '(session)'));
+        const meta = document.createElement('span');
+        meta.className = 'gsearch-meta';
+        meta.textContent = s.hits + (s.hits === 1 ? ' hit · ' : ' hits · ') + fmtTime(s.updatedAt);
+        title.appendChild(meta);
+        const snip = document.createElement('div');
+        snip.className = 'gsearch-snippet';
+        snip.textContent = s.snippet || '';
+        row.appendChild(title); row.appendChild(snip);
+        row.onclick = async () => {
+          await switchToSession(s.id);
+          bar.classList.remove('hidden');
+          btnSearch.classList.add('active');
+          input.value = q;
+          clearGlobal();
+          setTimeout(async () => {
+            for (let i=0;i<40 && (typeof _restoring !== 'undefined' && _restoring); i++) await new Promise(r=>setTimeout(r,50));
+            runSearch(q);
+          }, 80);
+          input.focus();
+        };
+        resultsEl.appendChild(row);
+      }
+      resultsEl.classList.remove('hidden');
+    }
+
+    function closeSearch(){ bar.classList.add('hidden'); btnSearch.classList.remove('active'); clearMarks(); if (countEl) countEl.textContent=''; clearGlobal(); input.value=''; }
+    btnSearch.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const hidden = bar.classList.toggle('hidden');
+      btnSearch.classList.toggle('active', !hidden);
+      if (!hidden) { input.focus(); } else { clearMarks(); if (countEl) countEl.textContent=''; clearGlobal(); }
+    });
+    input.addEventListener('input', () => {
+      runSearch(input.value);
+      if (globalTimer) clearTimeout(globalTimer);
+      globalTimer = setTimeout(() => runGlobal(input.value), 250);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { closeSearch(); return; }
+      if (e.key === 'Enter') { e.preventDefault(); setActive(curIdx + (e.shiftKey ? -1 : 1)); }
+    });
+    if (prevBtn) prevBtn.addEventListener('click', (e) => { e.preventDefault(); setActive(curIdx - 1); });
+    if (nextBtn) nextBtn.addEventListener('click', (e) => { e.preventDefault(); setActive(curIdx + 1); });
+    if (closeBtn) closeBtn.addEventListener('click', closeSearch);
+  })();
+
+  const inputEl         = $('chat-input');
+  const btnSend         = $('btn-send');
+  const btnAttach       = $('btn-attach');
+  const fileInput       = $('file-input');
+  const attachBar       = $('attach-bar');
+
+  const btnMenu         = $('btn-menu');
+  const btnLogout       = $('btn-logout');
+  const sessionDropdown = $('session-dropdown');
+  const sessionList     = $('session-list');
+  const statusBar       = $('status-bar');
+  const statusText      = $('status-text');
+  const busySpin        = $('busy-spin');
+  let   activityEl      = null;  // turn-scoped activity/intent row
+  const vncFrame        = $('vnc-frame');
+  const cdotWs     = $('cdot-ws');
+  const cdotVnc    = $('cdot-vnc');
+  const cdotMcp    = $('cdot-mcp');
+  const cbtnWs     = $('cbtn-ws');
+  const cbtnVnc    = $('cbtn-vnc');
+  const cbtnMcp    = $('cbtn-mcp');
+  const connTime   = $('conn-time');
+
+  // ── Status dot helpers ─────────────────────────────────────────────────────
+  function _setDot(el, state) { if (el) el.className = `cdot cdot-${state}`; }
+  // Each refresh button (Chat / Browser / MCP) is shown ONLY when that element is
+  // disconnected or errored; hidden while connecting/connected. The dot also drives
+  // the automatic reconnect scheduling on error/disconnect.
+  const isDown = (s) => s === 'disconnected' || s === 'error';
+  function setWsDot(s) {
+    _setDot(cdotWs, s);
+    if (cbtnWs) cbtnWs.classList.toggle('hidden', !isDown(s));
+  }
+  // The manual refresh button shows whenever the browser display isn't healthy —
+  // disconnected, error, OR mid auto-reconnect ('reconnecting') — so the user always
+  // has an escape hatch when the automatic reconnect can't recover on its own
+  // (common after a mobile tab is backgrounded and the socket quietly dies).
+  // Previously it only showed for disconnected/error, but scheduleVncReconnect()
+  // flips straight to 'reconnecting' in the same tick, so the button never stayed up.
+  const vncNeedsBtn = (s) => s === 'disconnected' || s === 'error' || s === 'reconnecting';
+  function setVncDot(s) {
+    _setDot(cdotVnc, s);
+    if (cdotVnc) cdotVnc.title = s === 'waiting' ? 'Browser idle — not requested' : 'Browser / noVNC';
+    if (cbtnVnc) cbtnVnc.classList.toggle('hidden', !vncNeedsBtn(s));
+    if (isDown(s)) {
+      scheduleVncReconnect();
+    } else if (s !== 'reconnecting') {
+      // 'reconnecting' must keep its pending timer + attempt count (backoff);
+      // only a healthy state (connected/connecting) clears them.
+      clearTimeout(vncReconnectTimer);
+      vncReconnectAttempt = 0;
+    }
+  }
+  function setMcpDot(s) {
+    _setDot(cdotMcp, s);
+    if (cbtnMcp) cbtnMcp.classList.toggle('hidden', !isDown(s));
+    if (isDown(s)) {
+      scheduleMcpReconnect();
+    } else {
+      clearTimeout(mcpReconnectTimer);
+      mcpReconnectAttempt = 0;
+    }
+  }
+
+  // Uptime clock in conn-bar
+  let connectedAt = null;
+  function startConnTime() { connectedAt = Date.now(); }
+  function tickConnTime() {
+    if (!connectedAt || !connTime) return;
+    const s = Math.floor((Date.now() - connectedAt) / 1000);
+    connTime.textContent = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m`;
+  }
+  setInterval(tickConnTime, 5000);
+
+  // ── Set noVNC iframe src from server config ────────────────────────────────
+  const novncBase = (window.BRIDGE_CONFIG?.novncUrl || '').replace(/\/$/, '');
+  const API_BASE = (window.BRIDGE_CONFIG?.basePath || '').replace(/\/$/, '');
+  // Per-room browsers: each room shows its OWN browser in the panel. The iframe src
+  // carries ?room=<key>; on room switch we reload it so the panel follows the room.
+  // When the server flag is off, _PRB is false and behaviour is identical to before.
+  const _PRB = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.perRoomBrowsers);
+  // Per-room live viewer (task 190): when the server flag is on, the pane loads the
+  // CDP-screencast canvas client instead of noVNC — one live window per room.
+  const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
+  function vncSrcFor(room) {
+    if (_RV) return `${API_BASE}/room-view-client.html?v=4&room=` + encodeURIComponent(room || 'default');
+    return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
+  }
+  function setVncRoom(room) {
+    const s = vncSrcFor(room);
+    if (vncFrame.src.replace(location.origin, '') !== s.replace(location.origin, '')) vncFrame.src = s;
+  }
+  vncFrame.src = vncSrcFor(null);   // room-aware src re-applied once currentRoomId is known
+
+  // ── Live-browser zoom (slider) + pan (one-finger) — mobile ──────────────────
+  // Interaction model on touch devices:
+  //   • SLIDER            → zoom 100–500%.
+  //   • ONE finger, tap   → forwarded to noVNC as a mouse click.
+  //   • ONE finger, drag  → pan the zoomed view.
+  const browserPanel = $('browser-panel');
+  const zoomSlider   = $('zoom-slider');
+  const zoomPct      = $('zoom-pct');
+  let gZoom = 1, gTx = 0, gTy = 0;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  function applyView() {
+    vncFrame.style.transformOrigin = '0 0';
+    vncFrame.style.width  = (gZoom * 100) + '%';
+    vncFrame.style.height = (gZoom * 100) + '%';
+    vncFrame.style.transform = `translate(${gTx}px, ${gTy}px)`;
+  }
+  function clampPan() {
+    const Wp = browserPanel.clientWidth, Hp = browserPanel.clientHeight;
+    gTx = clamp(gTx, Wp - gZoom * Wp, 0);
+    gTy = clamp(gTy, Hp - gZoom * Hp, 0);
+  }
+
+  // ── Slider zoom, anchored on the pane centre ──
+  function zoomTo(z) {
+    const Wp = browserPanel.clientWidth, Hp = browserPanel.clientHeight;
+    const fx = (Wp / 2 - gTx) / (gZoom * Wp);
+    const fy = (Hp / 2 - gTy) / (gZoom * Hp);
+    gZoom = z;
+    gTx = Wp / 2 - fx * (z * Wp);
+    gTy = Hp / 2 - fy * (z * Hp);
+    clampPan();
+    applyView();
+  }
+  // Single entry point so the slider and the −/+ steppers stay in sync.
+  const ZMIN = 100, ZMAX = 500, ZSTEP = 20;
+  function setZoomPct(pct) {
+    pct = clamp(Math.round(pct), ZMIN, ZMAX);
+    if (zoomSlider) zoomSlider.value = pct;
+    if (zoomPct) zoomPct.textContent = pct + '%';
+    zoomTo(pct / 100);
+  }
+  if (zoomSlider) {
+    zoomSlider.addEventListener('input', (e) => {
+      setZoomPct(parseInt(e.target.value, 10) || 100);
+    });
+  }
+  // −/+ steppers: reach 500% without having to drag the thumb the full width.
+  const zoomOutBtn = $('zoom-out'), zoomInBtn = $('zoom-in');
+  if (zoomOutBtn) zoomOutBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    setZoomPct((parseInt(zoomSlider && zoomSlider.value, 10) || 100) - ZSTEP);
+  });
+  if (zoomInBtn) zoomInBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    setZoomPct((parseInt(zoomSlider && zoomSlider.value, 10) || 100) + ZSTEP);
+  });
+
+  // ── Two-finger pan ──  (ROLLED BACK to the original working behaviour)
+  //   • ONE finger  → falls through untouched to noVNC = the remote mouse
+  //                   (tap / click-drag inside the remote browser).
+  //   • TWO fingers → captured here BEFORE noVNC sees them = pan the zoomed view.
+  let gest = null;                        // active pan gesture, or null
+  let panMode = false;                    // ✥ toggle: one-finger drag pans instead of moving the cursor
+
+  // ✥ Pan-mode toggle (mobile): when ON, a single finger pans the whole zoomed
+  // page (same gesture as two fingers); when OFF, one finger falls through to the
+  // iframe and drives the virtual cursor. Off by default.
+  const panBtn = $('pan-btn');
+  const isTouchDev = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  if (panBtn && isTouchDev) {
+    panBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      panMode = !panMode;
+      panBtn.classList.toggle('pan-on', panMode);
+    });
+  } else if (panBtn) {
+    panBtn.style.display = 'none';        // desktop uses a real mouse
+  }
+
+  // Centroid in stable top-window coords (the iframe's own clientX is relative
+  // to a viewport that moves as we pan, so add the iframe's rect to cancel it).
+  // Handles one OR two fingers so the same pan math serves both gestures.
+  function centroid(e) {
+    const r = vncFrame.getBoundingClientRect();
+    if (e.touches.length >= 2) {
+      const a = e.touches[0], b = e.touches[1];
+      return { cx: r.left + (a.clientX + b.clientX) / 2,
+               cy: r.top  + (a.clientY + b.clientY) / 2 };
+    }
+    const a = e.touches[0];
+    return { cx: r.left + a.clientX, cy: r.top + a.clientY };
+  }
+  function startGesture(e) {
+    const c = centroid(e);
+    gest = { cx0: c.cx, cy0: c.cy, tx0: gTx, ty0: gTy };
+    // Release any half-started one-finger mouse press inside noVNC so the first
+    // finger of the gesture doesn't leave a stuck button / stray click.
+    try {
+      const cv = vncFrame.contentDocument && vncFrame.contentDocument.querySelector('canvas');
+      if (cv) cv.dispatchEvent(new TouchEvent('touchcancel', { bubbles: true, cancelable: true }));
+    } catch (_) {}
+  }
+  function updateGesture(e) {
+    const c = centroid(e);
+    gTx = gest.tx0 + (c.cx - gest.cx0);
+    gTy = gest.ty0 + (c.cy - gest.cy0);
+    clampPan();
+    applyView();
+  }
+
+  function onTouchStart(e) {
+    if (!e.isTrusted) return;                 // ignore our own synthetic cancel
+    if (e.touches.length >= 2 || (panMode && e.touches.length === 1)) {
+      if (!gest) startGesture(e);
+      e.preventDefault(); e.stopImmediatePropagation();
+    } else if (gest) {                        // stray finger mid-gesture — swallow
+      e.preventDefault(); e.stopImmediatePropagation();
+    }
+    // one finger & pan OFF → do nothing: the iframe drives the virtual cursor.
+  }
+  function onTouchMove(e) {
+    if (!e.isTrusted || !gest) return;        // no gesture → iframe cursor / mouse
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.touches.length >= 1) updateGesture(e);
+  }
+  function onTouchEnd(e) {
+    if (!e.isTrusted || !gest) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (e.touches.length === 0) gest = null;  // all fingers up → finish pan
+  }
+
+  // Listeners live INSIDE the same-origin iframe doc (capture phase) so they
+  // run before noVNC's canvas handlers; re-attach whenever the frame reloads.
+  function attachGestures() {
+    const doc = vncFrame.contentDocument;
+    if (!doc) return;
+    const opts = { capture: true, passive: false };
+    doc.addEventListener('touchstart',  onTouchStart, opts);
+    doc.addEventListener('touchmove',   onTouchMove,  opts);
+    doc.addEventListener('touchend',    onTouchEnd,   opts);
+    doc.addEventListener('touchcancel', onTouchEnd,   opts);
+  }
+  if (browserPanel) vncFrame.addEventListener('load', attachGestures);
+
+  // ── Mobile soft-keyboard (touch only) ───────────────────────────────────────
+  // Tapping a field in the remote can't raise the phone keyboard (the remote is
+  // a <canvas>). The ⌨ button focuses a hidden editable field — which DOES raise
+  // the OS keyboard — and we forward what's typed into the remote via the
+  // iframe's __rfbSendKey bridge. Flow: tap the remote field (one-finger = mouse)
+  // to focus it, tap ⌨, then type.
+  const kbdBtn = $('kbd-btn');
+  const kbdCap = $('kbd-capture');
+  const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  if (kbdBtn && kbdCap && isTouch) {
+    const XK = { Tab: 0xff09, Enter: 0xff0d, Escape: 0xff1b, Delete: 0xffff,
+                 Home: 0xff50, ArrowLeft: 0xff51, ArrowUp: 0xff52,
+                 ArrowRight: 0xff53, ArrowDown: 0xff54, PageUp: 0xff55,
+                 PageDown: 0xff56, End: 0xff57 };
+    const sendKey = (ks, down) => {
+      try { vncFrame.contentWindow.__rfbSendKey(ks, down); } catch (_) {}
+    };
+    const sendChar = (ch) => {
+      let ks;
+      if (ch === '\n' || ch === '\r') ks = 0xff0d;            // Return
+      else if (ch === '\t') ks = 0xff09;                       // Tab
+      else { const cp = ch.codePointAt(0); ks = cp < 0x100 ? cp : 0x01000000 + cp; }
+      sendKey(ks);                                             // press+release
+    };
+
+    // Diff the field against its previous value: typed chars are sent forward,
+    // deletions become Backspaces. This also handles autocorrect (it rewrites
+    // the tail, which diffs cleanly to backspaces + retype).
+    let prev = '';
+    kbdCap.addEventListener('input', () => {
+      const cur = kbdCap.value;
+      let i = 0;
+      const m = Math.min(prev.length, cur.length);
+      while (i < m && prev[i] === cur[i]) i++;
+      for (let k = prev.length - 1; k >= i; k--) sendKey(0xff08);   // Backspace
+      for (let k = i; k < cur.length; k++) sendChar(cur[k]);
+      prev = cur;
+      if (cur.length > 2000) { kbdCap.value = ''; prev = ''; }      // cap growth
+    });
+    // Non-text keys that don't fire 'input' (Enter handled here to avoid a stray
+    // newline; Backspace is left to the input-diff above to avoid double-send).
+    kbdCap.addEventListener('keydown', (e) => {
+      if (e.key === 'Backspace') return;
+      const ks = XK[e.key];
+      if (ks) { e.preventDefault(); sendKey(ks); }
+    });
+
+    let kbdLocked = false;
+    kbdBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (kbdLocked) {
+        kbdLocked = false;
+        kbdCap.blur();
+      } else {
+        kbdLocked = true;
+        prev = ''; kbdCap.value = '';
+        // Blur anything else first so iOS doesn't get confused about which input is active.
+        if (document.activeElement && document.activeElement !== kbdCap) {
+          document.activeElement.blur();
+        }
+        kbdCap.focus({ preventScroll: true });
+      }
+    });
+    kbdCap.addEventListener('focus', () => kbdBtn.classList.add('kbd-on'));
+    kbdCap.addEventListener('blur', () => {
+      kbdBtn.classList.remove('kbd-on');
+      // If lock is still on, something stole focus (layout shift, tap elsewhere) — grab it back.
+      if (kbdLocked) {
+        setTimeout(() => {
+          if (kbdLocked) kbdCap.focus({ preventScroll: true });
+        }, 50);
+      }
+    });
+  } else if (kbdBtn) {
+    kbdBtn.style.display = 'none';   // desktop: physical keyboard goes via canvas
+  }
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let ws = null;
+  let wsReconnectAttempt = 0;
+  let wsReconnectTimer   = null;
+  let vncReconnectAttempt = 0;
+  let vncReconnectTimer  = null;
+  let mcpReconnectAttempt = 0;
+  let mcpReconnectTimer  = null;
+  let keepaliveInterval  = null;
+  let busy = false;
+  // Client stall-watchdog: 'lastStreamAt' is the last time a live turn produced
+  // output; if we're busy but silent past STALL_MS with the socket up, we probe
+  // the server for the room's real state and self-recover a missed 'done'.
+  let lastStreamAt = 0;
+  let stallTimer   = null;
+  const STALL_MS   = 45_000;
+  let currentAssistantEl   = null;
+  let currentAssistantText = '';
+  let lastToolEl = null;
+  let hasConnectedBefore = false;
+  let contextBanner = null;
+
+  // ── Chat persistence (server-side SQLite) ─────────────────────────────────
+  // A pinned room (?room=NAME in the URL) binds THIS tab to a stable room that
+  // is independent of the Claude session: resets don't unhook it, and different
+  // tabs (even in the same profile) never cross over. Two tabs sharing ?room=
+  // mirror each other.
+  const _rawRoom = new URLSearchParams(location.search).get('room');
+  let PINNED_ROOM = (_rawRoom && _rawRoom.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60)) || null;
+  // Session id namespaced per pinned room so rooms in one profile stay independent.
+  let SESSION_KEY  = 'bridge_session_id' + (PINNED_ROOM ? '::' + PINNED_ROOM : '');
+  // Stable per-browser id so the bridge can reattach a live Claude turn after a
+  // disconnect (refresh / network blip) instead of killing it. Distinct from the
+  // Claude session id; survives session resets.
+  const CLIENT_KEY = 'bridge_client_id';
+  let clientId = localStorage.getItem(CLIENT_KEY);
+  if (!clientId) {
+    clientId = 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    localStorage.setItem(CLIENT_KEY, clientId);
+  }
+  let currentSessionId     = localStorage.getItem(SESSION_KEY) || null;
+  // Room id = which conversation THIS device drives. Equals the Claude session id
+  // once known; a per-device 'draft-…' id before the first reply. Two devices with
+  // the same room id mirror; different room ids run independently.
+  const ROOM_KEY = 'bridge_room_id';
+  const newDraftRoomId = () => 'draft-' + clientId + '-' + Math.random().toString(36).slice(2, 8);
+  let currentRoomId = PINNED_ROOM || currentSessionId || localStorage.getItem(ROOM_KEY) || newDraftRoomId();
+  let roomEpoch = 0;   // bumps on every room change; guards async history repaints
+  if (!PINNED_ROOM) localStorage.setItem(ROOM_KEY, currentRoomId);
+  // Engine model: a pane-wide GLOBAL engine (set by account switching; read from the
+  // server's /accounts `engine`) is the default every room follows. A room may be
+  // PINNED via its titlebar selector to override the global for that room only.
+  const OVR_KEY = rid => 'bridge_engine_override::' + rid;
+  function roomOverride(rid) { try { const v = localStorage.getItem(OVR_KEY(rid || currentRoomId)); return (v === 'claude' || v === 'codex') ? v : 'global'; } catch { return 'global'; } }
+  function setRoomOverride(mode, rid) { try { const k = OVR_KEY(rid || currentRoomId); if (mode === 'claude' || mode === 'codex') localStorage.setItem(k, mode); else localStorage.removeItem(k); } catch {} }
+  let globalEngine = 'claude', codexEnabled = false;
+  function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
+  function applyEngineMeta(d) { if (!d) return; globalEngine = (d.engine === 'codex') ? 'codex' : 'claude'; codexEnabled = !!d.codexEnabled; if (typeof updateTitlebar === 'function') updateTitlebar(); }
+  (async () => { try { const _d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
+  if (_PRB || _RV) setVncRoom(currentRoomId);   // point the live panel at this room's own browser
+  let storedMsgData        = [];
+  let lastAssistantDataIdx = -1;
+  let lastToolDataIdx      = -1;
+  let _restoring           = false;
+
+  let pendingTaskLink = null;   // task file awaiting its new session id (see openTaskChat)
+
+  let _saveTimer = null;
+  function saveToStorage() {
+    if (_restoring || !currentSessionId) return;
+    clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(() => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'save_history', sessionId: currentSessionId, messages: storedMsgData }));
+      }
+    }, 400);
+  }
+  async function fetchAndRestoreHistory(sessionId) {
+    const epoch = roomEpoch;   // room may change while we await the fetch
+    try {
+      const res = await fetch(`${API_BASE}/history/${sessionId}`, { cache: 'no-store' });
+      const data = await res.json();
+      if (roomEpoch !== epoch) return;   // user opened/switched another room mid-fetch — do not repaint stale history
+      if (data.messages && data.messages.length > 0) renderStoredDisplay(data.messages);
+    } catch {}
+  }
+
+  // ── Markdown helper ────────────────────────────────────────────────────────
+  function renderMd(el, text) {
+    if (typeof marked !== 'undefined') {
+      el.innerHTML = marked.parse(text, { breaks: true, gfm: true });
+    } else {
+      el.textContent = text;
+    }
+  }
+
+  // ── Toast ──────────────────────────────────────────────────────────────────
+  function showToast(msg, type = 'info') {
+    const c = $('toast-container');
+    if (!c) return;
+    const t = document.createElement('div');
+    t.className = `toast toast-${type}`;
+    t.textContent = msg;
+    c.appendChild(t);
+    requestAnimationFrame(() => t.classList.add('show'));
+    setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 4000);
+  }
+
+  // ── Context warning banner ────────────────────────────────────────────────
+  function showContextWarning(pct) {
+    if (contextBanner) {
+      contextBanner.querySelector('.ctx-pct').textContent = pct.toFixed(0) + '%';
+      return;
+    }
+    contextBanner = document.createElement('div');
+    contextBanner.className = 'ctx-warning';
+    contextBanner.innerHTML =
+      `<span>⚠ Context at <strong class="ctx-pct">${pct.toFixed(0)}%</strong> — compact to free space?</span>` +
+      `<button class="ctx-btn-compact">Compact now</button>` +
+      `<button class="ctx-btn-dismiss">✕</button>`;
+    contextBanner.querySelector('.ctx-btn-compact').onclick = () => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'compact' }));
+        showToast('Compacting conversation…', 'info');
+        hideContextWarning();
+      }
+    };
+    contextBanner.querySelector('.ctx-btn-dismiss').onclick = hideContextWarning;
+    messagesEl.parentNode.insertBefore(contextBanner, messagesEl);
+  }
+
+  function hideContextWarning() {
+    contextBanner?.remove();
+    contextBanner = null;
+  }
+
+  // ── DOM helpers ────────────────────────────────────────────────────────────
+  function appendMsg(role, text) {
+    removeThinking();
+    const div = document.createElement('div');
+
+    if (role === 'thinking') {
+      div.className = 'msg msg-thinking';
+      div.dataset.role = 'thinking';
+      div.innerHTML = '<div class="spinner"></div><span>Claude is thinking…</span>';
+      messagesEl.appendChild(div);
+      scrollBottom();
+      return null;
+    }
+
+    div.className = `msg msg-${role}`;
+
+    if (role === 'assistant') {
+      div.style.whiteSpace = 'normal';
+      renderMd(div, text || '');
+    } else {
+      div.textContent = text || '';
+    }
+
+    messagesEl.appendChild(div);
+    scrollBottom();
+
+    if (!_restoring) {
+      storedMsgData.push({ type: role, text: text || '' });
+      if (role === 'assistant') lastAssistantDataIdx = storedMsgData.length - 1;
+      saveToStorage();
+    }
+
+    return div;
+  }
+
+  function appendToolMsg(name, args) {
+    removeThinking();
+
+    const wrap = document.createElement('div');
+    wrap.className = 'msg-tool';
+
+    const header = document.createElement('div');
+    header.className = 'tool-header';
+
+    const icon  = document.createElement('span');
+    icon.className = 'tool-icon';
+    icon.textContent = '⚙';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'tool-name-text';
+    nameEl.textContent = name || 'tool';
+
+    const caret = document.createElement('span');
+    caret.className = 'tool-caret';
+    caret.textContent = '›';
+
+    header.appendChild(icon);
+    header.appendChild(nameEl);
+    header.appendChild(caret);
+
+    const body = document.createElement('div');
+    body.className = 'tool-body';
+
+    const argsEl = document.createElement('pre');
+    argsEl.className = 'tool-args';
+    argsEl.textContent = args ? JSON.stringify(args, null, 2) : '';
+
+    const resEl = document.createElement('pre');
+    resEl.className = 'tool-result pending';
+    resEl.textContent = '…running';
+    resEl.dataset.role = 'tool-result';
+
+    body.appendChild(argsEl);
+    body.appendChild(resEl);
+
+    let expanded = false;
+    header.addEventListener('click', () => {
+      expanded = !expanded;
+      body.style.display  = expanded ? 'block' : 'none';
+      caret.style.transform = expanded ? 'rotate(90deg)' : '';
+    });
+
+    wrap.appendChild(header);
+    wrap.appendChild(body);
+    messagesEl.appendChild(wrap);
+    scrollBottom();
+    lastToolEl = wrap;
+
+    if (!_restoring) {
+      storedMsgData.push({ type: 'tool', toolName: name, args, result: null });
+      lastToolDataIdx = storedMsgData.length - 1;
+      saveToStorage();
+    }
+  }
+
+  function updateLastToolResult(content) {
+    if (!lastToolEl) return;
+    lastToolEl.querySelector('.tool-spin')?.remove();
+    const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
+    if (resEl) {
+      resEl.classList.remove('pending');
+      resEl.className = 'tool-result';
+      const truncated = String(content).slice(0, 600);
+      resEl.textContent = truncated + (String(content).length > 600 ? '…' : '');
+    }
+    if (!_restoring && lastToolDataIdx >= 0) {
+      storedMsgData[lastToolDataIdx].result = String(content).slice(0, 600);
+      saveToStorage();
+    }
+  }
+
+  function removeThinking() {
+    messagesEl.querySelector('[data-role="thinking"]')?.remove();
+  }
+
+  function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+  function setStatus(t)   { (statusText || statusBar).textContent = t; }
+
+  // Deterministic, client-side map from a tool call to a plain-language intent.
+  // Uses only data already in the stream — zero extra model cost.
+  function toolIntent(name, input) {
+    const n = name || 'tool';
+    const i = input || {};
+    const base = (p) => { try { return String(p).split('/').pop(); } catch { return p; } };
+    const host = (u) => { try { return new URL(u).host; } catch { return u; } };
+    const clip = (s, len = 60) => { s = String(s == null ? '' : s); return s.length > len ? s.slice(0, len) + '…' : s; };
+    switch (n) {
+      case 'Read':         return `Reading ${base(i.file_path) || 'a file'}`;
+      case 'Write':        return `Writing ${base(i.file_path) || 'a file'}`;
+      case 'Edit':         return `Editing ${base(i.file_path) || 'a file'}`;
+      case 'NotebookEdit': return `Editing ${base(i.notebook_path) || 'a notebook'}`;
+      case 'Bash':         return i.description ? `Running: ${clip(i.description)}` : 'Running a command';
+      case 'Grep':         return `Searching for “${clip(i.pattern, 40)}”`;
+      case 'Glob':         return `Finding files: ${clip(i.pattern, 40)}`;
+      case 'WebSearch':    return `Searching the web: “${clip(i.query, 40)}”`;
+      case 'WebFetch':     return `Fetching ${host(i.url) || 'a page'}`;
+      case 'Task':         return 'Running a subtask';
+      case 'TaskCreate':   return 'Creating a task';
+      case 'TaskUpdate':   return 'Updating a task';
+      case 'TaskList':     return 'Checking tasks';
+    }
+    if (n.startsWith('mcp__playwright__browser_')) {
+      const act = n.replace('mcp__playwright__browser_', '');
+      const map = {
+        navigate: `Browsing to ${host(i.url) || 'a page'}`,
+        navigate_back: 'Going back',
+        click: `Clicking ${clip(i.element, 30) || 'an element'}`,
+        type: `Typing ${clip(i.text, 30)}`,
+        fill_form: 'Filling a form',
+        select_option: 'Selecting an option',
+        snapshot: 'Reading the page',
+        take_screenshot: 'Taking a screenshot',
+        wait_for: 'Waiting on the page',
+        evaluate: 'Running a page script',
+        press_key: `Pressing ${i.key || 'a key'}`,
+        hover: 'Hovering on the page',
+        tabs: 'Managing browser tabs',
+        close: 'Closing the browser',
+      };
+      return map[act] || `Browser: ${act.replace(/_/g, ' ')}`;
+    }
+    if (n.startsWith('mcp__')) return `Using ${n.replace(/^mcp__/, '').replace(/__/g, ' / ')}`;
+    return `Using ${n}`;
+  }
+
+  // Single turn-scoped indicator: one spinner + intent line, always pinned to
+  // the bottom of the conversation while a turn is active.
+  function setActivity(label) {
+    if (!activityEl) {
+      activityEl = document.createElement('div');
+      activityEl.className = 'msg msg-activity';
+      activityEl.dataset.role = 'activity';
+      activityEl.innerHTML = '<div class="spinner"></div><span class="activity-text"></span>';
+    }
+    const t = activityEl.querySelector('.activity-text');
+    if (t) t.textContent = label || 'Working…';
+    messagesEl.appendChild(activityEl); // re-append => stays last, below tool rows
+    scrollBottom();
+  }
+  function clearActivity() { activityEl?.remove(); activityEl = null; }
+
+  function setBusy(b) {
+    busy = b;
+    if (busySpin) busySpin.classList.toggle('busy-hidden', !b);
+    if (b) { if (statusText) statusText.textContent = 'Working…'; }
+    else {
+      document.querySelectorAll('.tool-spin').forEach(e => e.remove());
+      clearActivity();
+    }
+  }
+
+  // ── Stall watchdog ─────────────────────────────────────────────────────────
+  // While a turn is in flight, if no output arrives for STALL_MS and the socket
+  // is up, probe the server for the room's real state. A missed 'done' (socket
+  // blip) otherwise leaves the spinner stuck forever; this self-recovers it.
+  function startStallWatch() {
+    stopStallWatch();
+    stallTimer = setInterval(() => {
+      if (!busy) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;   // onclose handles reconnect
+      if (Date.now() - lastStreamAt < STALL_MS) return;
+      try { ws.send(JSON.stringify({ type: 'status_query' })); } catch {}
+    }, 15_000);
+  }
+  function stopStallWatch() { clearInterval(stallTimer); stallTimer = null; }
+
+  // ── Last-question highlight ────────────────────────────────────────────────
+  // Pull the final question the assistant asked (last '?'-terminated sentence,
+  // capped ~30 words) from the newest assistant bubble and show it as a distinct
+  // highlighted callout, so the pending ask is always easy to spot.
+  function extractLastQuestion(text) {
+    if (!text) return '';
+    const clean = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`]*`/g, ' ');
+    const m = clean.match(/[^.!?\n]*\?/g);
+    if (!m || !m.length) return '';
+    let q = m[m.length - 1].replace(/^[\s\-*>#0-9.)]+/, '').trim();
+    const w = q.split(/\s+/);
+    if (w.length > 30) q = w.slice(0, 30).join(' ') + '…';
+    return q;
+  }
+  function updateLastQuestion() {
+    messagesEl.querySelectorAll('.last-q').forEach(e => e.remove());
+    const bubbles = messagesEl.querySelectorAll('.msg-assistant');
+    if (!bubbles.length) return;
+    const last = bubbles[bubbles.length - 1];
+    const q = extractLastQuestion(last.textContent || '');
+    if (!q) return;
+    const box = document.createElement('div');
+    box.className = 'last-q';
+    box.textContent = '❓ ' + q;
+    box.style.cssText = 'margin-top:8px;padding:7px 10px;border-left:3px solid #f5b301;'
+      + 'background:rgba(245,179,1,0.12);border-radius:6px;font-weight:600;font-size:0.92em;line-height:1.35;';
+    last.appendChild(box);
+  }
+  function clearLastQuestion() { messagesEl.querySelectorAll('.last-q').forEach(e => e.remove()); }
+
+  // ── Server message handler ─────────────────────────────────────────────────
+  function handleMsg(msg) {
+    switch (msg.type) {
+
+      case 'pong': break;
+
+      case 'status':
+        setStatus(msg.text || '');
+        break;
+
+      // A message sent from another device on this shared session.
+      case 'user_msg':
+        appendMsg('user', msg.text || '');
+        break;
+
+      // Full history pushed by server when a second device joins mid-session.
+      case 'history_sync':
+        // Only honour a pushed history when we are actually on a real session. A
+        // brand-new/draft room has currentSessionId===null, so a late history_sync
+        // for the room we just left cannot repaint the empty new room.
+        if (currentSessionId && Array.isArray(msg.messages) && msg.messages.length && !storedMsgData.length) {
+          renderStoredDisplay(msg.messages);
+        }
+        break;
+
+      case 'thinking':
+        currentAssistantEl   = null;
+        currentAssistantText = '';
+        lastToolEl = null;
+        setBusy(true);
+        lastStreamAt = Date.now();
+        setActivity('Thinking…');
+        break;
+
+      case 'stream':
+        lastStreamAt = Date.now();
+        handleStreamEvent(msg.data);
+        break;
+
+      case 'raw':
+        // Unparseable line from claude — show as assistant text
+        if (!currentAssistantEl) {
+          currentAssistantText = '';
+          currentAssistantEl   = appendMsg('assistant', '');
+        }
+        currentAssistantText += msg.text + '\n';
+        renderMd(currentAssistantEl, currentAssistantText);
+        scrollBottom();
+        break;
+
+      case 'done':
+        removeThinking();
+        setBusy(false);
+        currentAssistantEl   = null;
+        currentAssistantText = '';
+        lastToolEl = null;
+        updateLastQuestion();
+        break;
+
+      case 'room_status':
+        // Reply to the stall-watchdog probe. If the server says this room is
+        // idle but our UI is still busy, we missed the 'done' — recover the UI.
+        if (msg.processing) {
+          lastStreamAt = Date.now();   // genuinely alive; reset the stall clock
+        } else if (busy) {
+          removeThinking();
+          setBusy(false);
+          currentAssistantEl   = null;
+          currentAssistantText = '';
+          lastToolEl = null;
+          updateLastQuestion();
+          showToast('Recovered — the reply had already finished', 'info');
+        }
+        break;
+
+      case 'queued':
+        setStatus(`Message queued (${msg.queueLength} waiting)…`);
+        break;
+
+      case 'session_id':
+        currentSessionId = msg.id;
+        // A brand-new room rides a temporary draft key; once Claude assigns the
+        // real session id (the server re-keys the room to it too), promote the room
+        // to that durable id so a reload rejoins THIS exact room/conversation.
+        if (PINNED_ROOM && PINNED_ROOM.startsWith('draft-')) {
+          try { setRoomOverride(roomOverride(currentRoomId), msg.id); localStorage.removeItem(OVR_KEY(currentRoomId)); } catch {}
+          if (pendingRoomName) {
+            const _pn = pendingRoomName;
+            sessionNameById[msg.id] = _pn;
+            fetch(`${API_BASE}/sessions/${msg.id}/name`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: _pn })
+            }).then(() => { if (typeof loadSessions === 'function') loadSessions(); }).catch(() => {});
+            try { localStorage.removeItem('bridge_pending_name::' + currentRoomId); } catch {}
+            pendingRoomName = '';
+          }
+          PINNED_ROOM = msg.id;
+          currentRoomId = msg.id;
+          SESSION_KEY = 'bridge_session_id::' + msg.id;
+          try { const u = new URL(location.href); u.searchParams.set('room', msg.id); history.replaceState(null, '', u); } catch {}
+          if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
+          if (_PRB || _RV) setVncRoom(msg.id);   // panel follows the promoted room id
+        } else if (!PINNED_ROOM) {
+          currentRoomId = msg.id;
+          localStorage.setItem(ROOM_KEY, msg.id);
+          if (_PRB || _RV) setVncRoom(msg.id);
+        }
+        localStorage.setItem(SESSION_KEY, msg.id);
+        if (window._pendingTask) { localStorage.setItem(taskKey(msg.id), window._pendingTask); window._pendingTask = null; }
+        updateTitlebar();
+        if (pendingTaskLink) {
+          const file = pendingTaskLink; pendingTaskLink = null;
+          fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/session`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session: msg.id }),
+          }).then(() => loadTasks()).catch(() => {});
+        }
+        break;
+
+      case 'error':
+        removeThinking();
+        setBusy(false);
+        appendMsg('error', '⚠ ' + (msg.text || 'Unknown error'));
+        break;
+    }
+  }
+
+  // ── VNC iframe health polling ──────────────────────────────────────────────
+  function pollVnc() {
+    try {
+      const doc = vncFrame.contentDocument || vncFrame.contentWindow?.document;
+      if (!doc || doc.readyState === 'loading') { setVncDot('connecting'); return; }
+
+      // vnc_clean.html exposes #vnc-status whose className = connection state
+      const cleanStatus = doc.getElementById('vnc-status');
+      if (cleanStatus) {
+        const s = cleanStatus.className; // 'connecting' | 'connected' | 'disconnected' | 'error'
+        setVncDot(s === 'connected' ? 'connected'
+                : s === 'disconnected' ? 'disconnected'
+                : s === 'error' ? 'error'
+                : s === 'waiting' ? 'waiting'
+                : 'connecting');
+        return;
+      }
+
+      // Fallback for legacy vnc_auto.html
+      const bar  = doc.getElementById('noVNC_status_bar');
+      const text = (doc.getElementById('noVNC_status')?.textContent || bar?.textContent || '').toLowerCase();
+      if (text.includes('connect') && !text.includes('disconnect')) { setVncDot('connected'); }
+      else if (text.includes('disconnect') || text.includes('closed') || text.includes('wrong')) { setVncDot('disconnected'); }
+      else if (text.includes('connect')) { setVncDot('connecting'); }
+      else { setVncDot('unknown'); }
+    } catch { setVncDot('unknown'); }
+  }
+  setInterval(pollVnc, 3000);
+
+  // ── VNC "connected-but-black" watchdog ──────────────────────────────────────
+  let vncBlankStreak = 0;
+  let lastVncForceReconnect = 0;
+  function vncBlankCheck() {
+    try {
+      if (!cdotVnc.className.includes('connected')) { vncBlankStreak = 0; return; }
+      const doc = vncFrame.contentDocument || vncFrame.contentWindow?.document;
+      const cv  = doc && doc.querySelector('canvas');
+      if (!cv || !cv.width || !cv.height) { vncBlankStreak = 0; return; }
+      const ctx = cv.getContext('2d');
+      if (!ctx) return;
+      let nonBlack = 0;
+      for (let gx = 1; gx <= 5 && nonBlack === 0; gx++) {
+        for (let gy = 1; gy <= 5; gy++) {
+          const p = ctx.getImageData(Math.floor(cv.width * gx / 6),
+                                     Math.floor(cv.height * gy / 6), 1, 1).data;
+          if (p[0] > 16 || p[1] > 16 || p[2] > 16) { nonBlack++; break; }
+        }
+      }
+      if (nonBlack === 0) {
+        vncBlankStreak++;
+        if (vncBlankStreak >= 2 && Date.now() - lastVncForceReconnect > 30000) {
+          lastVncForceReconnect = Date.now();
+          vncBlankStreak = 0;
+          try { vncFrame.contentWindow.__rfbReconnect(); } catch { reconnectVnc(); }
+        }
+      } else {
+        vncBlankStreak = 0;
+      }
+    } catch { /* cross-origin / not ready — ignore */ }
+  }
+  setInterval(vncBlankCheck, 3000);
+
+  // ── MCP health polling ─────────────────────────────────────────────────────
+  async function pollMcp() {
+    try {
+      const res = await fetch(API_BASE + '/mcp-health', { cache: 'no-store' });
+      const data = await res.json();
+      if (data.ok) {
+        // Only upgrade to connected if currently unknown/disconnected (don't override session-init detection)
+        if (cdotMcp.className.includes('unknown') || cdotMcp.className.includes('disconnected')) {
+          setMcpDot('connected');
+        }
+      } else {
+        setMcpDot('disconnected');
+      }
+    } catch { setMcpDot('disconnected'); }
+  }
+  setInterval(pollMcp, 15000);
+
+  // ── Usage section (5h / 7d / ctx + meta) ─────────────────────────────────
+  const fill5h    = $('fill-5h');
+  const pct5h     = $('pct-5h');
+  const time5h    = $('time-5h');
+  const fill7d    = $('fill-7d');
+  const pct7d     = $('pct-7d');
+  const time7d    = $('time-7d');
+  const fillCtx   = $('fill-ctx');
+  const pctCtx    = $('pct-ctx');
+  const metaModel = $('meta-model');
+  const metaEmail = $('meta-email');
+  const metaSep   = $('meta-sep');
+
+  function usageColor(p) {
+    return p > 80 ? 'var(--red)' : p > 50 ? 'var(--orange)' : 'var(--green)';
+  }
+
+  function setBar(fill, pctEl, pct) {
+    const p = Math.min(100, Math.max(0, pct || 0));
+    fill.style.width = p + '%';
+    fill.style.background = usageColor(p);
+    pctEl.textContent = p.toFixed(0) + '%';
+  }
+
+  function formatResetTime(tsSec, includeDay) {
+    if (!tsSec) return '';
+    const remaining = tsSec * 1000 - Date.now();
+    if (remaining <= 0) return 'reset now';
+    const totalSecs = Math.floor(remaining / 1000);
+    let timeLeft;
+    if (includeDay) {
+      const days = Math.floor(totalSecs / 86400);
+      const hrs  = Math.floor((totalSecs % 86400) / 3600);
+      timeLeft = days > 0 ? `${days}d${String(hrs).padStart(2, '0')}h` : `${hrs}h`;
+    } else {
+      const h = Math.floor(totalSecs / 3600);
+      const m = Math.floor((totalSecs % 3600) / 60);
+      timeLeft = h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+    }
+    const d = new Date(tsSec * 1000);
+    const opts = includeDay
+      ? { weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true }
+      : { hour: 'numeric', minute: '2-digit', hour12: true };
+    const resetStr = d.toLocaleString('en', opts).toLowerCase().replace(',', '');
+    return `${timeLeft} (${resetStr})`;
+  }
+
+  async function pollUsage() {
+    try {
+      const res  = await fetch(API_BASE + '/usage', { cache: 'no-store' });
+      const data = await res.json();
+      if (!data.ok) return;
+
+      const rl = data.rateLimits || {};
+      const b  = data.block      || {};
+      const w  = data.week       || {};
+
+      // When the backend flags the data as stale (cache belongs to another account
+      // and there's no snapshot for the active one), blank the bar instead of showing
+      // a cross-account ccusage estimate.
+      const blankBar = (fill, pctEl) => { fill.style.width = '0%'; pctEl.textContent = '–'; };
+
+      // 5h bar
+      if (rl.stale && rl.five_hour_pct == null) { blankBar(fill5h, pct5h); if (time5h) time5h.textContent = ''; }
+      else {
+        const fivePct = rl.five_hour_pct != null ? rl.five_hour_pct : (b.pct || 0);
+        setBar(fill5h, pct5h, fivePct);
+        const fiveReset = rl.five_hour_resets_at || (b.resetsAtMs ? b.resetsAtMs / 1000 : null);
+        if (time5h) time5h.textContent = formatResetTime(fiveReset, false) + (rl.stale ? ' ~' : '');
+      }
+
+      // 7d bar
+      if (rl.stale && rl.seven_day_pct == null) { blankBar(fill7d, pct7d); if (time7d) time7d.textContent = ''; }
+      else {
+        const sevenPct = rl.seven_day_pct != null ? rl.seven_day_pct : (w.pct || 0);
+        setBar(fill7d, pct7d, sevenPct);
+        if (time7d) time7d.textContent = formatResetTime(rl.seven_day_resets_at, true) + (rl.stale ? ' ~' : '');
+      }
+
+      // ctx bar — from rateLimits file (updated each Claude Code turn)
+      if (rl.ctx_pct != null) setBar(fillCtx, pctCtx, rl.ctx_pct);
+
+      // Model + email
+      if (metaModel && rl.model) metaModel.textContent = rl.model;
+      if (metaEmail && rl.email) metaEmail.textContent = rl.email;
+      if (metaSep) metaSep.style.visibility = (rl.model && rl.email) ? 'visible' : 'hidden';
+
+      maybeSuggestSwitch(rl);
+    } catch { /* silent */ }
+  }
+
+  // ↻ Refresh usage now — fires a tiny Haiku ping on the active account so the
+  // 5h/7d figures update immediately instead of waiting for the next chat turn.
+  const btnUsageRefresh = $('btn-usage-refresh');
+  if (btnUsageRefresh) {
+    btnUsageRefresh.addEventListener('click', async () => {
+      if (btnUsageRefresh.disabled) return;
+      btnUsageRefresh.disabled = true;
+      btnUsageRefresh.classList.add('spinning');
+      try {
+        const res = await fetch(API_BASE + '/usage/refresh', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        await pollUsage();
+        if (data.ok) showToast(data.updated ? 'Usage refreshed' : 'Usage unchanged (already current)', 'success');
+        else showToast('Refresh failed: ' + (data.error || 'error'), 'warning');
+      } catch {
+        showToast('Usage refresh failed', 'warning');
+      } finally {
+        btnUsageRefresh.disabled = false;
+        btnUsageRefresh.classList.remove('spinning');
+      }
+    });
+  }
+
+  // -- Account auto-switch suggestion (task 120) -----------------------------
+  // When the active account's 5-hour usage crosses the threshold, suggest (or,
+  // in auto mode, perform) a switch to the freshest saved account. Switching
+  // only swaps ~/.claude/.credentials.json; the current chat keeps its context
+  // because every turn re-spawns `claude --resume <session>` under whatever
+  // account is active at that moment.
+  const SWITCH_THRESHOLD = 50;
+  const AUTO_KEY   = 'acctAutoSwitch';
+  const SNOOZE_KEY = 'acctSwitchSnooze';
+  const acctUsagePct = u => (u && u.five_hour_pct != null) ? u.five_hour_pct : null;
+
+  function hideSwitchPrompt() {
+    const el = document.getElementById('acct-switch-prompt');
+    if (el) el.remove();
+  }
+
+  async function doSwitchKeepContext(name, note) {
+    try {
+      const r = await fetch(API_BASE + '/accounts/switch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, type })
+      });
+      const d = await r.json();
+      if (r.ok && d.ok) {
+        showToast((note || 'Switched') + ' to ' + name + '. Your next message continues here on the new account.', 'success');
+        pollUsage();
+        return true;
+      }
+      showToast('Switch failed: ' + ((d && (d.error || d.message)) || 'error'), 'warning');
+    } catch (e) { showToast('Switch failed: ' + e.message, 'warning'); }
+    return false;
+  }
+
+  function showSwitchPrompt(curPct, cand, resetsAt) {
+    if (document.getElementById('acct-switch-prompt')) return;   // already showing
+    const box = document.createElement('div');
+    box.id = 'acct-switch-prompt';
+    box.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:88px;z-index:9999;max-width:520px;width:calc(100% - 32px);background:#1f2937;color:#f3f4f6;border:1px solid #f59e0b;border-radius:10px;padding:12px 14px;box-shadow:0 8px 24px rgba(0,0,0,.4);font-size:13px;line-height:1.4';
+    const msg = document.createElement('div');
+    msg.style.marginBottom = '8px';
+    msg.innerHTML = 'We are at <b>' + curPct + '%</b> of the 5-hour limit on this account. ' +
+      'Switch to <b>' + cand.name + '</b> (' + (cand.pct === 0 ? 'available' : cand.pct + '% used') + ')? ' +
+      '<span style="opacity:.7">Your chat context is kept.</span>';
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap';
+    const yes = document.createElement('button');
+    yes.textContent = 'Switch to ' + cand.name;
+    yes.style.cssText = 'background:#f59e0b;color:#111;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer';
+    yes.onclick = async () => {
+      yes.disabled = true;
+      const ok = await doSwitchKeepContext(cand.name, 'Switched (at ' + curPct + '%)');
+      if (ok) hideSwitchPrompt(); else yes.disabled = false;
+    };
+    const no = document.createElement('button');
+    no.textContent = 'Not now';
+    no.style.cssText = 'background:transparent;color:#f3f4f6;border:1px solid #4b5563;border-radius:6px;padding:6px 12px;cursor:pointer';
+    no.onclick = () => { if (resetsAt) localStorage.setItem(SNOOZE_KEY, String(resetsAt)); hideSwitchPrompt(); };
+    const auto = document.createElement('label');
+    auto.style.cssText = 'margin-left:auto;opacity:.85;display:flex;gap:5px;align-items:center;cursor:pointer;font-size:12px';
+    const cb = document.createElement('input'); cb.type = 'checkbox';
+    cb.checked = localStorage.getItem(AUTO_KEY) === '1';
+    cb.onchange = () => localStorage.setItem(AUTO_KEY, cb.checked ? '1' : '0');
+    auto.appendChild(cb); auto.appendChild(document.createTextNode('auto-switch next time'));
+    row.appendChild(yes); row.appendChild(no); row.appendChild(auto);
+    box.appendChild(msg); box.appendChild(row);
+    document.body.appendChild(box);
+  }
+
+  async function maybeSuggestSwitch(rl) {
+    const pct = rl ? rl.five_hour_pct : null;
+    const resetsAt = rl ? rl.five_hour_resets_at : null;
+    if (pct == null || pct < SWITCH_THRESHOLD) { hideSwitchPrompt(); return; }
+    const auto = localStorage.getItem(AUTO_KEY) === '1';
+    // Respect a "Not now" dismissal (manual mode) for the current 5h window.
+    if (!auto && resetsAt && localStorage.getItem(SNOOZE_KEY) === String(resetsAt)) return;
+    try {
+      const d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json();
+      if (!d.ok) return;
+      const cands = (d.accounts || [])
+        .filter(a => a.email && a.email !== d.active)
+        .map(a => ({ name: a.name, email: a.email, pct: acctUsagePct(a.usage), expired: a.expired }))
+        .filter(a => a.pct != null && a.pct < SWITCH_THRESHOLD && a.expired !== true)
+        .sort((x, y) => x.pct - y.pct);
+      if (!cands.length) { hideSwitchPrompt(); return; }
+      const best = cands[0];
+      if (auto) {
+        // Only auto-switch once per window (guard against the 30s poll re-firing).
+        if (resetsAt && localStorage.getItem(SNOOZE_KEY) === String(resetsAt)) return;
+        if (resetsAt) localStorage.setItem(SNOOZE_KEY, String(resetsAt));
+        await doSwitchKeepContext(best.name, 'Auto-switched (at ' + pct + '%)');
+      } else {
+        showSwitchPrompt(pct, best, resetsAt);
+      }
+    } catch { /* silent */ }
+  }
+
+  pollUsage();
+  setInterval(pollUsage, 30_000);
+
+  // ── Auto-reconnect schedulers ──────────────────────────────────────────────
+  function scheduleVncReconnect() {
+    clearTimeout(vncReconnectTimer);
+    const delay = Math.min(1000 * Math.pow(2, vncReconnectAttempt), 30_000);
+    vncReconnectAttempt++;
+    setVncDot('reconnecting');
+    vncReconnectTimer = setTimeout(reconnectVnc, delay);
+  }
+
+  function scheduleMcpReconnect() {
+    clearTimeout(mcpReconnectTimer);
+    const delay = Math.min(1000 * Math.pow(2, mcpReconnectAttempt), 30_000);
+    mcpReconnectAttempt++;
+    setMcpDot('reconnecting');
+    mcpReconnectTimer = setTimeout(reconnectMcp, delay);
+  }
+
+  function reconnectVnc() {
+    setVncDot('connecting');
+    const src = vncFrame.src;
+    vncFrame.src = '';
+    setTimeout(() => { vncFrame.src = src; }, 300);
+  }
+
+  // `manual` is true only when the user clicks the MCP reconnect button. The
+  // automatic scheduler must NEVER send a reset: reset kills the live Claude
+  // process, and reacting to a transient MCP-down by resetting was the cause of
+  // the "no response" loop (Claude was killed before it could reply). The MCP
+  // server is a persistent standalone process — for an auto-recover we just
+  // re-probe its health; the next spawned Claude turn picks it up on its own.
+  function reconnectMcp(manual) {
+    setMcpDot('connecting');
+    if (manual && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    setTimeout(pollMcp, 3000);
+  }
+
+  // ── Chat (WebSocket) reconnect button ──────────────────────────────────────
+  // Force an immediate fresh WebSocket. The bridge reattaches our live session by
+  // clientId, so an in-flight answer is preserved across the reconnect.
+  if (cbtnWs) {
+    cbtnWs.onclick = () => {
+      showToast('Reconnecting chat…', 'info');
+      wsReconnectAttempt = 0;
+      clearTimeout(wsReconnectTimer);
+      try { if (ws) { ws.onclose = null; ws.close(); } } catch {}
+      connect();
+    };
+  }
+
+  // ── MCP reconnect button ───────────────────────────────────────────────────
+  if (cbtnMcp) {
+    cbtnMcp.onclick = () => {
+      reconnectMcp(true);
+      showToast('MCP session reset — send a message to reconnect', 'info');
+    };
+  }
+
+  // ── Browser (VNC) reconnect button ────────────────────────────────────────
+  if (cbtnVnc) {
+    cbtnVnc.onclick = () => {
+      reconnectVnc();
+      showToast('Reconnecting browser display…', 'info');
+    };
+  }
+
+  // ── Mobile: force a fresh reconnect when the tab returns to the foreground ──
+  // On mobile the OS frequently kills the VNC websocket while the tab is
+  // backgrounded WITHOUT firing a clean close, so the iframe's #vnc-status is left
+  // stale at 'connected' and the 3s poller never detects the drop — the pane just
+  // freezes with no auto-recovery. When the page becomes visible again after being
+  // hidden for more than a few seconds, proactively reload the VNC and nudge the
+  // chat socket. (pageshow handles bfcache restores from mobile back/forward.)
+  let _hiddenSince = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      _hiddenSince = Date.now();
+      return;
+    }
+    const away = _hiddenSince ? Date.now() - _hiddenSince : 0;
+    _hiddenSince = 0;
+    if (away > 5000) {
+      reconnectVnc();
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+    }
+  });
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) {                       // restored from bfcache → sockets are dead
+      reconnectVnc();
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+    }
+  });
+
+  // ── Clipboard paste into VNC ───────────────────────────────────────────────
+  async function pasteClipboardToVnc() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) { showToast('Clipboard is empty', 'warning'); return; }
+      const res = await fetch(API_BASE + '/type-text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+      if (data.ok) showToast('Pasted into browser', 'success');
+      else showToast('Paste failed: ' + (data.error || 'unknown'), 'error');
+    } catch (e) {
+      showToast('Clipboard access denied — grant permission and try again', 'error');
+    }
+  }
+
+  const btnVncPaste = $('btn-vnc-paste');
+  if (btnVncPaste) btnVncPaste.onclick = pasteClipboardToVnc;
+
+  // Ctrl+V when chat panel has focus (user typed in input, then wants to paste into browser)
+  window.addEventListener('keydown', e => {
+    const _ae = document.activeElement;
+    const _editable = _ae && (_ae.tagName === 'INPUT' || _ae.tagName === 'TEXTAREA' || _ae.isContentEditable);
+    if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !_editable) {
+      e.preventDefault();
+      pasteClipboardToVnc();
+    }
+  });
+
+  // ── Parse Claude CLI stream-json events ────────────────────────────────────
+  function handleStreamEvent(ev) {
+    if (!ev?.type) return;
+
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      // tools array contains plain strings or objects depending on CLI version
+      const hasMcp = (ev.tools || []).some(t => {
+        const name = typeof t === 'string' ? t : (t?.name || '');
+        return name.startsWith('mcp__playwright__');
+      });
+      setMcpDot(hasMcp ? 'connected' : 'disconnected');
+      setStatus('Claude Code session ready — tools loaded.');
+      return;
+    }
+
+    if (ev.type === 'assistant') {
+      // Complete assistant message (possibly with tool_use blocks)
+      const content = ev.message?.content || [];
+      currentAssistantEl   = null;
+      currentAssistantText = '';
+      lastToolEl = null;
+
+      for (const block of content) {
+        if (block.type === 'text') {
+          if (!currentAssistantEl) {
+            currentAssistantEl = appendMsg('assistant', '');
+          }
+          currentAssistantText += block.text;
+          renderMd(currentAssistantEl, currentAssistantText);
+          // Persist THIS bubble's text immediately. Without this, assistant text
+          // that precedes a tool_use is never written back to storedMsgData (only
+          // the turn's final bubble was, via lastAssistantDataIdx at 'result'),
+          // so it saved empty and reloaded as a blank thin line.
+          if (lastAssistantDataIdx >= 0) storedMsgData[lastAssistantDataIdx].text = currentAssistantText;
+          saveToStorage();
+          scrollBottom();
+        } else if (block.type === 'tool_use') {
+          appendToolMsg(block.name, block.input);
+          setActivity(toolIntent(block.name, block.input));
+          currentAssistantEl   = null;
+          currentAssistantText = '';
+        }
+      }
+      return;
+    }
+
+    if (ev.type === 'tool_result') {
+      // Tool execution result from Claude Code
+      const content = ev.content?.[0]?.text || ev.result || '';
+      updateLastToolResult(content);
+      setActivity('Thinking…');
+      return;
+    }
+
+    if (ev.type === 'result') {
+      const dur = ev.duration_ms ? ` in ${(ev.duration_ms / 1000).toFixed(1)}s` : '';
+      const cost = ev.total_cost_usd ? ` · $${ev.total_cost_usd.toFixed(4)}` : '';
+      setStatus(`Done${dur}${cost}`);
+      removeThinking();
+      setBusy(false);
+      // Persist final accumulated assistant text
+      if (lastAssistantDataIdx >= 0 && currentAssistantText) {
+        storedMsgData[lastAssistantDataIdx].text = currentAssistantText;
+        saveToStorage();
+      }
+      // Update ctx bar from live usage
+      const inputTokens = ev.usage?.input_tokens || 0;
+      if (inputTokens > 0) {
+        const ctxPct = (inputTokens / 200_000) * 100;
+        setBar(fillCtx, pctCtx, ctxPct);
+        if (ctxPct >= 40) showContextWarning(ctxPct);
+        else hideContextWarning();
+      }
+      return;
+    }
+  }
+
+  // ── Restore saved chat from localStorage ───────────────────────────────────
+  // ── Restore saved chat (lazy / folded for long transcripts) ───────────────
+  // Long transcripts are costly to render at once, so on restore we render only
+  // the most recent slice and keep older messages in _pendingOlder — revealed
+  // via a "Load older" button or by scrolling to the top (infinite scroll).
+  const INITIAL_RENDER = 30;   // messages rendered immediately on restore
+  const OLDER_BATCH    = 30;   // messages revealed per "load older" step
+  let _pendingOlder = [];
+  let _olderBtn = null;
+  let _olderScrollWired = false;
+
+  function renderOneStored(m) {            // bottom-append, mirrors the live path
+    if (m.type === 'tool') {
+      appendToolMsg(m.toolName, m.args);
+      if (m.result !== null && m.result !== undefined && lastToolEl) {
+        const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
+        if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
+      }
+    } else {
+      appendMsg(m.type, m.text || '');
+    }
+  }
+
+  function buildMsgNode(role, text) {
+    const div = document.createElement('div');
+    div.className = `msg msg-${role}`;
+    if (role === 'assistant') { div.style.whiteSpace = 'normal'; renderMd(div, text || ''); }
+    else div.textContent = text || '';
+    return div;
+  }
+
+  function buildToolNode(name, args, result) {
+    const wrap = document.createElement('div'); wrap.className = 'msg-tool';
+    const header = document.createElement('div'); header.className = 'tool-header';
+    const icon = document.createElement('span'); icon.className = 'tool-icon'; icon.textContent = '⚙';
+    const nameEl = document.createElement('span'); nameEl.className = 'tool-name-text'; nameEl.textContent = name || 'tool';
+    const caret = document.createElement('span'); caret.className = 'tool-caret'; caret.textContent = '›';
+    header.append(icon, nameEl, caret);
+    const body = document.createElement('div'); body.className = 'tool-body';
+    const argsEl = document.createElement('pre'); argsEl.className = 'tool-args'; argsEl.textContent = args ? JSON.stringify(args, null, 2) : '';
+    const resEl = document.createElement('pre'); resEl.dataset.role = 'tool-result';
+    if (result !== null && result !== undefined) { resEl.className = 'tool-result'; resEl.textContent = String(result); }
+    else { resEl.className = 'tool-result pending'; resEl.textContent = '…running'; }
+    body.append(argsEl, resEl);
+    let expanded = false;
+    header.addEventListener('click', () => { expanded = !expanded; body.style.display = expanded ? 'block' : 'none'; caret.style.transform = expanded ? 'rotate(90deg)' : ''; });
+    wrap.append(header, body);
+    return wrap;
+  }
+
+  function ensureOlderBtn() {
+    if (!_pendingOlder.length) { _olderBtn?.remove(); _olderBtn = null; return; }
+    if (!_olderBtn) {
+      _olderBtn = document.createElement('button');
+      _olderBtn.className = 'load-older-btn';
+      _olderBtn.addEventListener('click', loadOlder);
+    }
+    if (_olderBtn !== messagesEl.firstChild) messagesEl.insertBefore(_olderBtn, messagesEl.firstChild);
+    const n = Math.min(OLDER_BATCH, _pendingOlder.length);
+    _olderBtn.textContent = `↑ Load ${n} older — ${_pendingOlder.length} hidden`;
+  }
+
+  function loadOlder() {
+    if (!_pendingOlder.length) return;
+    const cut = Math.max(0, _pendingOlder.length - OLDER_BATCH);
+    const batch = _pendingOlder.slice(cut);
+    _pendingOlder = _pendingOlder.slice(0, cut);
+    const prevH = messagesEl.scrollHeight, prevTop = messagesEl.scrollTop;
+    const frag = document.createDocumentFragment();
+    for (const m of batch) {
+      const node = m.type === 'tool' ? buildToolNode(m.toolName, m.args, m.result) : buildMsgNode(m.type, m.text || '');
+      if (node) frag.appendChild(node);
+    }
+    const anchor = _olderBtn ? _olderBtn.nextSibling : messagesEl.firstChild;
+    messagesEl.insertBefore(frag, anchor);
+    ensureOlderBtn();
+    messagesEl.scrollTop = prevTop + (messagesEl.scrollHeight - prevH);
+  }
+
+  function renderStoredDisplay(msgs) {
+    _restoring = true;
+    messagesEl.innerHTML = '';
+    _olderBtn = null;
+    storedMsgData        = msgs.slice();   // full data retained for save fidelity
+    lastAssistantDataIdx = -1;
+    lastToolDataIdx      = -1;
+    for (let k = 0; k < storedMsgData.length; k++) {
+      if (storedMsgData[k].type === 'assistant') lastAssistantDataIdx = k;
+      else if (storedMsgData[k].type === 'tool') lastToolDataIdx = k;
+    }
+
+    const split = Math.max(0, msgs.length - INITIAL_RENDER);
+    _pendingOlder = msgs.slice(0, split);
+    ensureOlderBtn();
+    for (const m of msgs.slice(split)) renderOneStored(m);
+
+    if (!_olderScrollWired) {
+      _olderScrollWired = true;
+      messagesEl.addEventListener('scroll', () => {
+        if (!_restoring && _pendingOlder.length && messagesEl.scrollTop < 60) loadOlder();
+      });
+    }
+
+    // Pin to the newest message. Content (markdown/images/fonts) reflows after
+    // insertion, so a single synchronous scroll lands mid-transcript; re-pin across
+    // several frames + on image load, and keep _restoring=true until settled so the
+    // scroll-to-load-older handler cannot fire and drag the view far back.
+    pinToBottomAfterRestore();
+    updateLastQuestion();
+  }
+
+  function pinToBottomAfterRestore() {
+    let frames = 0;
+    const pin = () => {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (++frames < 8) requestAnimationFrame(pin);
+    };
+    requestAnimationFrame(pin);
+    messagesEl.querySelectorAll('img').forEach(img => {
+      if (!img.complete) img.addEventListener('load', () => { if (_restoring) messagesEl.scrollTop = messagesEl.scrollHeight; }, { once: true });
+    });
+    setTimeout(() => { messagesEl.scrollTop = messagesEl.scrollHeight; _restoring = false; }, 300);
+  }
+
+  // ── WebSocket connection ───────────────────────────────────────────────────
+  function wsUrl() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${location.host}${API_BASE}/ws`;
+  }
+
+  function startKeepalive() {
+    stopKeepalive();
+    keepaliveInterval = setInterval(() => {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+    }, 25_000);
+  }
+  function stopKeepalive() { clearInterval(keepaliveInterval); keepaliveInterval = null; }
+
+  function scheduleReconnect() {
+    const delay = Math.min(2000 * Math.pow(2, wsReconnectAttempt), 30_000);
+    wsReconnectAttempt++;
+    setWsDot('reconnecting');
+    setStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s…`);
+    wsReconnectTimer = setTimeout(connect, delay);
+  }
+
+  function connect() {
+    clearTimeout(wsReconnectTimer);
+    setWsDot('connecting');
+    setStatus('Connecting…');
+    ws = new WebSocket(wsUrl());
+
+    ws.onopen = () => {
+      wsReconnectAttempt = 0;
+      setWsDot('connected');
+      startConnTime();
+      btnSend.disabled = false;
+      startKeepalive();
+      startStallWatch();
+      // Announce our stable client id FIRST so the bridge can reattach a live
+      // Claude turn that was running when we disconnected (refresh / blip).
+      ws.send(JSON.stringify({ type: 'hello', clientId, roomId: currentRoomId }));
+      const prevSessionId = localStorage.getItem(SESSION_KEY);
+      if (prevSessionId) {
+        currentSessionId = prevSessionId;
+        // Pinned room adopts the session into the room (keeps stable key); legacy
+        // resume_session re-roots the socket onto the session-id room.
+        ws.send(JSON.stringify({ type: PINNED_ROOM ? 'adopt_session' : 'resume_session', id: prevSessionId }));
+        if (!hasConnectedBefore) fetchAndRestoreHistory(prevSessionId);
+        if (hasConnectedBefore) showToast('Reconnected — restoring context…', 'success');
+      } else {
+        if (hasConnectedBefore) showToast('Reconnected', 'success');
+      }
+      hasConnectedBefore = true;
+    };
+
+    ws.onclose = () => {
+      stopKeepalive();
+      setBusy(false);
+      setWsDot('disconnected');
+      if (hasConnectedBefore) showToast('Disconnected — reconnecting…', 'warning');
+      scheduleReconnect();
+    };
+
+    ws.onerror = () => { setWsDot('error'); };
+
+    ws.onmessage = ev => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      handleMsg(msg);
+    };
+  }
+
+  // ── Attachments (screenshots / files) ───────────────────────────────────────
+  // Files are uploaded to the server immediately and stored per-user; Claude reads
+  // them back by path. Pending uploads show as removable chips above the input.
+  let pendingAttachments = [];   // { path, name, isImage, previewUrl }
+  let uploadsInFlight = 0;
+
+  function renderAttachBar() {
+    attachBar.innerHTML = '';
+    if (!pendingAttachments.length && uploadsInFlight === 0) {
+      attachBar.classList.add('hidden');
+      return;
+    }
+    attachBar.classList.remove('hidden');
+    pendingAttachments.forEach((a, i) => {
+      const chip = document.createElement('div');
+      chip.className = 'attach-chip';
+      if (a.isImage && a.previewUrl) {
+        const img = document.createElement('img');
+        img.className = 'attach-thumb';
+        img.src = a.previewUrl;
+        chip.appendChild(img);
+      } else {
+        const ic = document.createElement('span');
+        ic.className = 'attach-icon';
+        ic.textContent = '📄';
+        chip.appendChild(ic);
+      }
+      const label = document.createElement('span');
+      label.className = 'attach-name';
+      label.textContent = a.name;
+      chip.appendChild(label);
+      const rm = document.createElement('button');
+      rm.className = 'attach-remove';
+      rm.title = 'Remove';
+      rm.textContent = '×';
+      rm.onclick = () => {
+        if (a.previewUrl) URL.revokeObjectURL(a.previewUrl);
+        pendingAttachments.splice(i, 1);
+        renderAttachBar();
+      };
+      chip.appendChild(rm);
+      attachBar.appendChild(chip);
+    });
+    if (uploadsInFlight > 0) {
+      const up = document.createElement('div');
+      up.className = 'attach-chip attach-uploading';
+      up.innerHTML = '<div class="spinner spinner-sm"></div><span>Uploading…</span>';
+      attachBar.appendChild(up);
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file) return;
+    uploadsInFlight++;
+    renderAttachBar();
+    try {
+      const res = await fetch(API_BASE + '/upload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': file.type || 'application/octet-stream',
+          'X-Filename': encodeURIComponent(file.name || 'file'),
+        },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.path) throw new Error(data.error || 'upload failed');
+      const isImage = (file.type || '').startsWith('image/');
+      pendingAttachments.push({
+        path: data.path,
+        name: data.name || file.name || 'file',
+        isImage,
+        previewUrl: isImage ? URL.createObjectURL(file) : null,
+      });
+    } catch (e) {
+      showToast('Upload failed: ' + e.message, 'error');
+    } finally {
+      uploadsInFlight--;
+      renderAttachBar();
+    }
+  }
+
+  function clearAttachments() {
+    pendingAttachments.forEach(a => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+    pendingAttachments = [];
+    renderAttachBar();
+  }
+
+  btnAttach.onclick = () => fileInput.click();
+  fileInput.addEventListener('change', () => {
+    Array.from(fileInput.files || []).forEach(uploadFile);
+    fileInput.value = '';   // allow re-selecting the same file
+  });
+
+  // Paste a screenshot/image straight into the message box.
+  inputEl.addEventListener('paste', e => {
+    const imgs = Array.from(e.clipboardData?.items || [])
+      .filter(it => it.kind === 'file' && it.type.startsWith('image/'));
+    if (!imgs.length) return;   // plain-text paste keeps default behaviour
+    e.preventDefault();
+    imgs.forEach(it => {
+      const blob = it.getAsFile();
+      if (blob) {
+        const named = new File([blob], blob.name || `screenshot-${Date.now()}.png`,
+          { type: blob.type });
+        uploadFile(named);
+      }
+    });
+  });
+
+  // ── Send ──────────────────────────────────────────────────────────────────
+  function sendMessage() {
+    const text = inputEl.value.trim();
+    if (!text && !pendingAttachments.length) return;
+    if (uploadsInFlight > 0) { showToast('Wait for the upload to finish', 'warning'); return; }
+    if (ws?.readyState !== WebSocket.OPEN) return;
+
+    const attachments = pendingAttachments.map(a => ({ path: a.path, name: a.name }));
+    const echo = text + (attachments.length
+      ? (text ? '\n' : '') + attachments.map(a => `📎 ${a.name}`).join('\n')
+      : '');
+    appendMsg('user', echo);
+    clearLastQuestion();
+    ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: roomOverride(), roomId: currentRoomId }));
+    setCurrentTask(text.replace(/\s+/g, ' ').trim().slice(0, 140));
+
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    clearAttachments();
+  }
+
+  btnSend.onclick = sendMessage;
+  inputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+  inputEl.addEventListener('input', () => {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  });
+
+  // ── Session management ────────────────────────────────────────────────────
+  function fmtSessionDate(ts) {
+    const d   = new Date(ts);
+    const now = new Date();
+    const time = d.toLocaleTimeString('en', { hour: 'numeric', minute: '2-digit', hour12: true });
+    if (d.toDateString() === now.toDateString()) return 'Today ' + time;
+    const yest = new Date(now - 86400000);
+    if (d.toDateString() === yest.toDateString()) return 'Yesterday ' + time;
+    return d.toLocaleDateString('en', { month: 'short', day: 'numeric' }) + ' ' + time;
+  }
+
+  // -- Session title bar (name / current task / short id) --
+  let sessionNameById = {};
+  let pendingRoomName = (() => { try { return localStorage.getItem('bridge_pending_name::' + currentRoomId) || ''; } catch { return ''; } })();
+  const taskKey = id => 'bridge_task_' + id;
+  function setCurrentTask(text) {
+    const id = currentSessionId;
+    if (!id) { window._pendingTask = text; return; }
+    if (text) localStorage.setItem(taskKey(id), text);
+    updateTitlebar();
+  }
+  function updateTitlebar() {
+    const id = currentSessionId;
+    const nameEl = $('st-name'), idEl = $('st-id'), taskEl = $('st-task');
+    if (nameEl) {
+      const nm = (id && sessionNameById[id]) || pendingRoomName || 'New room';
+      nameEl.textContent = nm; nameEl.title = nm;
+      nameEl.style.minWidth = Math.min(20, (nm||'').length) + 'ch';
+    }
+    if (idEl) { idEl.textContent = id ? id.slice(0, 8) : '\u2014'; idEl.title = id || ''; }
+    if (taskEl) {
+      const t = id ? (localStorage.getItem(taskKey(id)) || '') : '';
+      taskEl.textContent = t ? ('\u2316 ' + t) : '';
+      taskEl.style.display = t ? '' : 'none';
+    }
+    const editEl = $('st-edit');
+    if (editEl && !editEl._wired) { editEl._wired = true; editEl.onclick = startTitlebarRename; }
+    const engSel = $('st-engine');
+    if (engSel) {
+      engSel.style.display = codexEnabled ? '' : 'none';
+      engSel.value = roomOverride(currentRoomId);
+      const gopt = engSel.querySelector('option[value="global"]');
+      if (gopt) gopt.textContent = 'Global (' + (globalEngine === 'codex' ? 'Codex' : 'Claude') + ')';
+      const eff = effectiveEngine(currentRoomId);
+      engSel.classList.toggle('eng-codex', eff === 'codex');
+      engSel.title = 'Engine for this room \u2014 effective: ' + (eff === 'codex' ? 'Codex' : 'Claude');
+      if (!engSel._wired) {
+        engSel._wired = true;
+        engSel.addEventListener('change', () => {
+          setRoomOverride(engSel.value, currentRoomId);
+          updateTitlebar();
+          if (typeof showToast === 'function') showToast('This room \u2192 ' + (engSel.value === 'global' ? 'Global engine' : engSel.value === 'codex' ? 'Codex' : 'Claude'), 'info');
+        });
+      }
+    }
+  }
+
+  // Retained as an alias so existing callers (delete flow, usage overlays) keep
+  // working; a "new session" now means "new room".
+  // Inline rename of the CURRENT room straight from the titlebar pencil.
+  function startTitlebarRename() {
+    const id = currentSessionId;
+    const nameEl = $('st-name');
+    if (!nameEl || nameEl.dataset.editing) return;
+    const cur = (id && sessionNameById[id]) || pendingRoomName || (nameEl.textContent === 'New room' ? '' : nameEl.textContent);
+    const inp = document.createElement('input');
+    inp.className = 'st-rename-input';
+    inp.value = cur; inp.maxLength = 40;
+    nameEl.dataset.editing = '1';
+    nameEl.style.display = 'none';
+    nameEl.after(inp);
+    inp.focus(); inp.select();
+    let done = false;
+    const finish = async (save) => {
+      if (done) return; done = true;
+      const to = inp.value.trim();
+      inp.remove();
+      nameEl.style.display = '';
+      delete nameEl.dataset.editing;
+      if (save && to && to !== cur) {
+        if (!id) {
+          // Draft room has no server id yet: stash the name and apply it the moment
+          // Claude assigns a real session id (see the 'session_id' handler).
+          pendingRoomName = to;
+          try { localStorage.setItem('bridge_pending_name::' + currentRoomId, to); } catch {}
+          updateTitlebar();
+          return;
+        }
+        try {
+          await fetch(`${API_BASE}/sessions/${id}/name`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: to })
+          });
+          sessionNameById[id] = to;
+          updateTitlebar();
+          if (typeof loadSessions === 'function') loadSessions();
+        } catch { showToast('Rename failed', 'error'); }
+      }
+    };
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    inp.addEventListener('blur', () => finish(true));
+  }
+
+  const newSession = () => newRoom();
+
+  // ── Rooms ─────────────────────────────────────────────────────────────────
+  // A room IS a conversation. Its key is the Claude session id once it has one,
+  // or a temporary 'draft-…' id for a brand-new room. Entering a room pins THIS
+  // tab to it (writes ?room= to the URL) so a reload rejoins the same room and two
+  // browser tabs never cross over; two tabs on the same room mirror each other.
+  async function enterRoom(roomKey, sessionId) {
+    sessionDropdown.classList.add('hidden');
+    roomEpoch++;
+    PINNED_ROOM   = roomKey;
+    currentRoomId = roomKey;
+    SESSION_KEY   = 'bridge_session_id::' + roomKey;
+    try { const u = new URL(location.href); u.searchParams.set('room', roomKey); history.replaceState(null, '', u); } catch {}
+    if (_PRB || _RV) setVncRoom(roomKey);   // switch the live panel to this room's browser
+    messagesEl.innerHTML = '';
+    _pendingOlder = []; _olderBtn = null; _restoring = false;   // drop prior room's load-older backlog so it can't refill the new room
+    currentAssistantEl   = null;
+    currentAssistantText = '';
+    lastToolEl = null;
+    setBusy(false);
+    hideContextWarning();
+    storedMsgData        = [];
+    lastAssistantDataIdx = -1;
+    lastToolDataIdx      = -1;
+    currentSessionId = sessionId || null;
+    pendingRoomName = sessionId ? '' : ((() => { try { return localStorage.getItem('bridge_pending_name::' + roomKey) || ''; } catch { return ''; } })());
+    if (sessionId) localStorage.setItem(SESSION_KEY, sessionId); else localStorage.removeItem(SESSION_KEY);
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'switch_session', id: roomKey }));   // re-room this socket live
+      if (sessionId) ws.send(JSON.stringify({ type: 'adopt_session', id: sessionId }));
+    }
+    if (sessionId) await fetchAndRestoreHistory(sessionId);
+    updateTitlebar();
+    if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
+  }
+
+  // Start a brand-new room from zero and enter it. It rides a temporary draft key
+  // until the first reply assigns a real session id (see the 'session_id' handler).
+  function newRoom() {
+    enterRoom(newDraftRoomId(), null);
+    setMcpDot('unknown');
+    showToast('New room started', 'info');
+  }
+
+  // Back-compat shim: opening a past session = entering its room.
+  async function switchToSession(id) {
+    await enterRoom(id, id);
+    showToast('Room loaded', 'success');
+  }
+
+  // ── Room picker: bind THIS tab to a named room and switch live (no reload) ──
+  function refreshRoomBtn() {
+    const b = document.getElementById('btn-room');
+    if (b) b.textContent = '🚪 Room: ' + (PINNED_ROOM ? PINNED_ROOM.slice(0, 8) : 'none');
+  }
+  function switchRoom(rawName) {
+    const name = (rawName || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60);
+    if (!name) return;
+    if (name === PINNED_ROOM) { showToast('Already on room: ' + name, 'info'); return; }
+    PINNED_ROOM = name;
+    currentRoomId = name;
+    roomEpoch++;
+    SESSION_KEY = 'bridge_session_id::' + name;            // re-point session namespace
+    const u = new URL(location.href); u.searchParams.set('room', name);
+    history.replaceState(null, '', u);                     // a later reload stays on this room
+    if (_PRB || _RV) setVncRoom(name);   // switch the live panel to this room's browser
+    const prev = localStorage.getItem(SESSION_KEY) || null;
+    messagesEl.innerHTML = ''; _pendingOlder = []; _olderBtn = null; _restoring = false; currentAssistantEl = null; currentAssistantText = '';
+    lastToolEl = null; setBusy(false); storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
+    currentSessionId = prev;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'switch_session', id: name }));   // re-room this socket live
+      if (prev) ws.send(JSON.stringify({ type: 'adopt_session', id: prev }));
+    }
+    if (prev) fetchAndRestoreHistory(prev);
+    if (typeof updateTitlebar === 'function') updateTitlebar();
+    refreshRoomBtn();
+    showToast('Room: ' + name + (prev ? '' : ' (new)'), 'success');
+  }
+  (function wireRoomBtn() {
+    const b = document.getElementById('btn-room');
+    if (!b) return;
+    refreshRoomBtn();
+    b.onclick = () => {
+      document.getElementById('settings-dropdown')?.classList.add('hidden');
+      const name = prompt('Connect this tab to which room?\nTabs sharing a room name mirror each other.', PINNED_ROOM || '');
+      if (name != null && name.trim()) switchRoom(name.trim());
+    };
+  })();
+
+  let _sessRows = [];
+  let _taskRoomsData = [];
+  let _archivedRoomsData = [];
+  let _makeRow = null;
+  // Filter both the rooms list and the task-rooms list by their title text.
+  function applySessionFilter(q) {
+    q = (q || '').trim().toLowerCase();
+    const box = document.getElementById('task-rooms-box');
+    if (q && box && !box.childElementCount && _makeRow) {
+      for (const s of _taskRoomsData) box.appendChild(_makeRow(s));   // render collapsed task rooms so they're searchable
+    }
+    const abox = document.getElementById('archived-rooms-box');
+    if (q && abox && !abox.childElementCount && _makeRow) {
+      for (const s of _archivedRoomsData) abox.appendChild(_makeRow(s));
+    }
+    let taskHits = 0, archHits = 0;
+    for (const r of _sessRows) {
+      if (!r || !r.dataset) continue;
+      const hit = !q || (r.dataset.label || '').includes(q);
+      r.style.display = hit ? '' : 'none';
+      if (hit && r.dataset.task === '1') taskHits++;
+      if (hit && r.dataset.archived === '1') archHits++;
+    }
+    if (box) box.style.display = q ? (taskHits ? 'block' : 'none') : (taskRoomsExpanded ? 'block' : 'none');
+    if (abox) abox.style.display = q ? (archHits ? 'block' : 'none') : (archivedRoomsExpanded ? 'block' : 'none');
+  }
+  let taskRoomsExpanded = false;
+  let archivedRoomsExpanded = false;
+  async function loadSessions() {
+    sessionList.innerHTML = '';
+    _sessRows = [];
+    let _search = document.getElementById('session-search');
+    if (!_search) {
+      _search = document.createElement('input');
+      _search.id = 'session-search';
+      _search.type = 'search';
+      _search.placeholder = 'Search rooms\u2026';
+      _search.autocomplete = 'off';
+      _search.addEventListener('click', e => e.stopPropagation());
+      _search.addEventListener('input', () => applySessionFilter(_search.value));
+      sessionDropdown.insertBefore(_search, sessionList);
+    }
+    const sessionFooter = document.getElementById('session-footer');
+    if (sessionFooter) sessionFooter.innerHTML = '';
+    const newBtn = document.createElement('button');
+    newBtn.className = 'sess-new';
+    newBtn.textContent = '+ New room';
+    newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newRoom(); };
+    sessionList.appendChild(newBtn);
+    try {
+      const res = await fetch(API_BASE + '/sessions', { cache: 'no-store' });
+      const data = await res.json();
+      if (!data.sessions || data.sessions.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'sess-empty';
+        empty.textContent = 'No rooms yet';
+        sessionList.appendChild(empty);
+        return;
+      }
+      // Build one session row element (identical for normal + autonomy task rooms).
+      const makeRow = (s) => {
+        sessionNameById[s.id] = s.name || s.preview || '';
+        const row = document.createElement('div');
+        row.className = 'sess-row';
+        const btn = document.createElement('button');
+        btn.className = 'sess-item';
+        const time = document.createElement('span');
+        time.className = 'sess-time';
+        time.textContent = fmtSessionDate(s.updatedAt);
+        const sid = document.createElement('span');
+        sid.textContent = (s.id || '').slice(0, 8);
+        sid.title = s.id || '';
+        sid.style.cssText = 'float:right;opacity:0.5;font-family:monospace;font-size:10px;';
+        time.appendChild(sid);
+        const preview = document.createElement('span');
+        preview.className = 'sess-preview';
+        let _taskLabel = '';
+        if (s.taskRoom) {
+          const _mtr = String(s.taskRoom).match(/^(?:task-)+(\d+)-(.+)$/);
+          if (_mtr) _taskLabel = '#' + _mtr[1] + ' \u00b7 ' + _mtr[2].replace(/-/g, ' ');
+          else _taskLabel = String(s.taskRoom).replace(/^(?:task-)+/, '').replace(/-/g, ' ');
+        }
+        preview.textContent = s.name || _taskLabel || s.preview || '(empty)';
+        btn.appendChild(time);
+        btn.appendChild(preview);
+        const subText = s.lastMessage || s.preview || '';
+        if (subText && subText !== preview.textContent) {
+          const sub = document.createElement('span');
+          sub.className = 'sess-sub';
+          sub.textContent = subText;
+          btn.appendChild(sub);
+        }
+        btn.onclick = () => enterRoom(s.id, s.id);
+        row.dataset.label = ((s.name || '') + ' ' + _taskLabel + ' ' + (s.preview || '') + ' ' + (s.lastMessage || '')).toLowerCase();
+        row.dataset.task = s.taskRoom ? '1' : '';
+        row.dataset.archived = s.archived ? '1' : '';
+        _sessRows.push(row);
+        const edit = document.createElement('span');
+        edit.className = 'sess-edit';
+        edit.textContent = '✎';
+        edit.title = 'Rename room';
+        edit.onclick = async (e) => {
+          e.stopPropagation();
+          const name = prompt('Room name:', s.name || '');
+          if (name === null) return;
+          try {
+            await fetch(`${API_BASE}/sessions/${s.id}/name`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name })
+            });
+            loadSessions();
+          } catch { showToast('Rename failed', 'error'); }
+        };
+        row.appendChild(btn);
+        if (s.active) {
+          const live = document.createElement('span');
+          live.className = 'sess-live';
+          live.style.cssText = 'flex:0 0 auto;margin:0 4px;display:inline-flex;align-items:center;';
+          if (s.busy) {
+            const sp = document.createElement('span');
+            sp.className = 'spinner spinner-sm';
+            live.appendChild(sp);
+            live.title = 'Active — running now';
+          } else {
+            live.textContent = '●';                 // green dot = live room
+            live.style.color = '#22c55e';
+            live.style.fontSize = '22px';
+            live.style.lineHeight = '1';
+            live.title = s.viewers
+              ? `Active — ${s.viewers} device(s) connected`
+              : 'Active — running in background';
+          }
+          row.appendChild(live);
+        }
+        const del = document.createElement('span');
+        del.className = 'sess-edit';
+        del.textContent = '🗑';
+        del.title = 'Delete room';
+        del.style.cssText = 'cursor:pointer;flex:0 0 auto;margin-left:2px;opacity:0.7;';
+        del.onclick = async (e) => {
+          e.stopPropagation();
+          if (!confirm('Delete this room and its entire conversation history? This cannot be undone.')) return;
+          try {
+            const r = await fetch(`${API_BASE}/sessions/${s.id}`, { method: 'DELETE' });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { showToast(d.error || 'Delete failed', 'error'); return; }
+            if (s.id === currentSessionId) newSession();
+            loadSessions();
+            showToast('Room deleted', 'success');
+          } catch { showToast('Delete failed', 'error'); }
+        };
+        const arch = document.createElement('span');
+        arch.className = 'sess-edit';
+        arch.textContent = s.archived ? '↩' : '⤓';
+        arch.title = s.archived ? 'Unarchive room' : 'Archive room';
+        arch.style.cssText = 'cursor:pointer;flex:0 0 auto;margin-left:2px;opacity:0.7;';
+        arch.onclick = async (e) => {
+          e.stopPropagation();
+          try {
+            const r = await fetch(`${API_BASE}/sessions/${s.id}/archive`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ archived: !s.archived })
+            });
+            if (!r.ok) { showToast('Archive failed', 'error'); return; }
+            loadSessions();
+            showToast(s.archived ? 'Room unarchived' : 'Room archived', 'success');
+          } catch { showToast('Archive failed', 'error'); }
+        };
+        row.appendChild(edit);
+        row.appendChild(del);
+        row.appendChild(arch);
+        return row;
+      };
+      // Autonomy per-task/pool rooms are kept OUT of the main list and tucked into
+      // a collapsible "Task rooms" section so they never flood the dropdown.
+      const _taskNum = s => { const m = String(s.taskRoom || '').match(/^(?:task-)+(\d+)-/); return m ? parseInt(m[1], 10) : -1; };
+      const archivedRooms = data.sessions.filter(s => s.archived);
+      const taskRooms = data.sessions.filter(s => s.taskRoom && !s.archived).sort((a, b) => _taskNum(a) - _taskNum(b));
+      const normal    = data.sessions.filter(s => !s.taskRoom && !s.archived);
+      _makeRow = makeRow; _taskRoomsData = taskRooms; _archivedRoomsData = archivedRooms;
+      for (const s of normal) sessionList.appendChild(makeRow(s));
+      if (taskRooms.length && sessionFooter) {
+        const toggle = document.createElement('button');
+        toggle.className = 'sess-new';
+        toggle.style.opacity = '0.85';
+        const box = document.createElement('div');
+        box.id = 'task-rooms-box';
+        const setLabel = (open) => { toggle.textContent = `${open ? '▾' : '▸'} Task rooms (${taskRooms.length})`; };
+        const render = (open) => {
+          box.style.display = open ? 'block' : 'none';
+          if (open && !box.childElementCount) { for (const s of taskRooms) box.appendChild(makeRow(s)); }
+          setLabel(open);
+        };
+        render(taskRoomsExpanded);   // restore prior open/closed state after a re-render
+        toggle.onclick = (e) => { e.stopPropagation(); taskRoomsExpanded = !taskRoomsExpanded; render(taskRoomsExpanded); };
+        sessionFooter.appendChild(toggle);
+        sessionFooter.appendChild(box);
+      }
+      if (archivedRooms.length && sessionFooter) {
+        const toggle = document.createElement('button');
+        toggle.className = 'sess-new';
+        toggle.style.opacity = '0.85';
+        const box = document.createElement('div');
+        box.id = 'archived-rooms-box';
+        const setLabel = (open) => { toggle.textContent = `${open ? '▾' : '▸'} Archived rooms (${archivedRooms.length})`; };
+        const render = (open) => {
+          box.style.display = open ? 'block' : 'none';
+          if (open && !box.childElementCount) { for (const s of archivedRooms) box.appendChild(makeRow(s)); }
+          setLabel(open);
+        };
+        render(archivedRoomsExpanded);
+        toggle.onclick = (e) => { e.stopPropagation(); archivedRoomsExpanded = !archivedRoomsExpanded; render(archivedRoomsExpanded); };
+        sessionFooter.appendChild(toggle);
+        sessionFooter.appendChild(box);
+      }
+      updateTitlebar();
+      applySessionFilter(document.getElementById('session-search')?.value || '');
+    } catch {
+      const empty = document.createElement('div');
+      empty.className = 'sess-empty';
+      empty.textContent = 'Failed to load rooms';
+      sessionList.appendChild(empty);
+    }
+  }
+
+  // Refresh the live dots while the dropdown is open (every 60s). Self-stops when
+  // the menu is closed by any path, so no stray timer keeps running.
+  let sessionPollTimer = null;
+  let ddHover = false;
+  function startSessionPoll() {
+    stopSessionPoll();
+    if (!sessionDropdown._hoverWired) {
+      // Never reorder the list while the pointer is over it: if a poll re-render
+      // fires between mousedown and click, the row moves and the click lands on the
+      // wrong room. Freeze refreshes while hovering.
+      sessionDropdown.addEventListener('mouseenter', () => { ddHover = true; });
+      sessionDropdown.addEventListener('mouseleave', () => { ddHover = false; });
+      sessionDropdown._hoverWired = true;
+    }
+    sessionPollTimer = setInterval(() => {
+      if (sessionDropdown.classList.contains('hidden')) { stopSessionPoll(); return; }
+      if (ddHover) return;
+      loadSessions();
+    }, 60000);
+  }
+  function stopSessionPoll() {
+    if (sessionPollTimer) { clearInterval(sessionPollTimer); sessionPollTimer = null; }
+  }
+
+  btnMenu.addEventListener('click', e => {
+    e.stopPropagation();
+    if (sessionDropdown.classList.contains('hidden')) {
+      const rect = btnMenu.getBoundingClientRect();
+      sessionDropdown.style.top  = (rect.bottom + 6) + 'px';
+      sessionDropdown.style.left = Math.max(4, rect.right - 240) + 'px';
+      loadSessions();
+      sessionDropdown.classList.remove('hidden');
+      // Keep the menu fully on-screen (esp. narrow mobile): clamp after layout.
+      const ddw = sessionDropdown.offsetWidth;
+      sessionDropdown.style.left = Math.max(4, Math.min(rect.right - 240, window.innerWidth - ddw - 4)) + 'px';
+      startSessionPoll();
+    } else {
+      sessionDropdown.classList.add('hidden');
+      stopSessionPoll();
+    }
+  });
+
+  btnLogout.addEventListener('click', e => {
+    e.stopPropagation();
+    window.location.href = API_BASE + '/auth/logout';
+  });
+
+  document.addEventListener('click', () => {
+    sessionDropdown.classList.add('hidden');
+  });
+
+  // ── Resizable divider ─────────────────────────────────────────────────────
+  const divider   = $('divider');
+  const chatPanel = $('chat-panel');
+  let dragging = false;
+
+  divider.addEventListener('mousedown', e => {
+    dragging = true;
+    divider.classList.add('dragging');
+    vncFrame.style.pointerEvents = 'none';   // stop iframe swallowing mouse events
+    chatPanel.style.maxWidth = 'none';        // lift CSS max-width cap
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const chatLeft = chatPanel.getBoundingClientRect().left;
+    const w = Math.max(200, Math.min(e.clientX - chatLeft, window.innerWidth * 0.90));
+    chatPanel.style.width = w + 'px';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    divider.classList.remove('dragging');
+    vncFrame.style.pointerEvents = '';       // restore
+  });
+
+  // ── Tasks panel toggle ────────────────────────────────────────────────────
+  const btnTasks  = $('btn-tasks');
+  const tasksPanel = $('tasks-panel');
+  if (btnTasks && tasksPanel) {
+    btnTasks.addEventListener('click', () => {
+      const isHidden = tasksPanel.classList.contains('tasks-panel-hidden');
+      tasksPanel.classList.toggle('tasks-panel-hidden', !isHidden);
+      tasksPanel.classList.toggle('tasks-panel-visible', isHidden);
+      btnTasks.classList.toggle('active', isHidden);
+      if (isHidden) loadTasks();
+    });
+  }
+
+  // ── Settings dropdown (Connectors / Settings) ─────────────────────────────
+  const btnSettings      = $('btn-settings');
+  const settingsDropdown = $('settings-dropdown');
+  const btnOpenSettings  = $('btn-open-settings');
+  const settingsPanel    = $('settings-panel');
+  const btnCloseSettings = $('btn-close-settings');
+  const settingsBody     = $('settings-body');
+
+  if (btnSettings && settingsDropdown) {
+    btnSettings.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const hidden = settingsDropdown.classList.toggle('hidden');
+      btnSettings.classList.toggle('active', !hidden);
+    });
+    settingsDropdown.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => {
+      settingsDropdown.classList.add('hidden');
+      btnSettings.classList.remove('active');
+    });
+  }
+  if (btnOpenSettings && settingsPanel) {
+    btnOpenSettings.addEventListener('click', () => {
+      settingsDropdown.classList.add('hidden');
+      btnSettings.classList.remove('active');
+      settingsPanel.classList.remove('hidden');
+      if (settingsBody) {
+        settingsBody.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Settings coming soon.</p>';
+      }
+    });
+  }
+  if (btnCloseSettings) {
+    btnCloseSettings.addEventListener('click', () => {
+      settingsPanel && settingsPanel.classList.add('hidden');
+    });
+  }
+
+  // ── Light / dark theme toggle ─────────────────────────────────────────────
+  const btnTheme = document.getElementById('btn-theme');
+  if (btnTheme) {
+    const curTheme = () => (document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark');
+    const refreshThemeLabel = () => { btnTheme.textContent = (curTheme() === 'light' ? '\u{1F319} Dark mode' : '\u2600\uFE0F Light mode'); };
+    refreshThemeLabel();
+    btnTheme.addEventListener('click', () => {
+      const next = curTheme() === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('ccb-theme', next); } catch (e) {}
+      refreshThemeLabel();
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+    });
+  }
+
+  // ── Claude Code re-authentication (per-user, self-service) ────────────────
+  const btnClaudeAuth = document.getElementById('btn-claude-auth');
+  if (btnClaudeAuth) {
+    btnClaudeAuth.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      openClaudeAuth();
+    });
+  }
+  function openClaudeAuth(reauthName) {
+    const type = 'claude';
+    document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
+    const ov = document.createElement('div');
+    ov.className = 'cauth-overlay';
+    ov.innerHTML = `
+      <div class="cauth-modal">
+        <div class="cauth-head"><span>\u{2795} Add Claude account</span><button class="cauth-x" title="Close">✕</button></div>
+        <div class="cauth-body">
+          <p class="cauth-intro">Sign in to a Claude account and save it for one-click switching. Optionally name it, click start, open the link to sign in &amp; approve, then paste the code back here.</p>
+          <div class="cauth-linkrow">
+            <input id="cauth-name" type="text" placeholder="Short name (optional — defaults to the email address)" autocomplete="off" spellcheck="false" />
+          </div>
+          <button class="cauth-btn" id="cauth-start">Start sign-in</button>
+          <div id="cauth-step2" class="cauth-hidden">
+            <p><b>1.</b> Open this link, sign in and approve:</p>
+            <div class="cauth-linkrow">
+              <a id="cauth-link" target="_blank" rel="noopener">Open sign-in page ↗</a>
+              <button class="cauth-btn cauth-sm" id="cauth-copy">Copy link</button>
+            </div>
+            <p><b>2.</b> Paste the code shown after approving:</p>
+            <div class="cauth-linkrow">
+              <input id="cauth-code" type="text" placeholder="Paste code here" autocomplete="off" spellcheck="false" />
+              <button class="cauth-btn cauth-sm" id="cauth-submit">Submit</button>
+            </div>
+          </div>
+          <div id="cauth-msg" class="cauth-msg"></div>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    if (reauthName) {
+      const _h = ov.querySelector('.cauth-head span'); if (_h) _h.textContent = '↻ Re-authenticate ' + reauthName;
+      const _i = ov.querySelector('.cauth-intro'); if (_i) _i.textContent = 'Sign in again to refresh this account’s saved login. Keep the name the same so it updates this entry.';
+      const _n = ov.querySelector('#cauth-name'); if (_n) { _n.value = reauthName; _n.readOnly = true; }
+    }
+    const msg = ov.querySelector('#cauth-msg');
+    let curAuthId = '';
+    const setMsg = (t, kind) => { msg.textContent = t || ''; msg.className = 'cauth-msg' + (kind ? ' cauth-' + kind : ''); };
+    const close = () => { try { fetch(`${API_BASE}/auth/cancel`, { method: 'POST' }); } catch (_) {} ov.remove(); };
+    ov.querySelector('.cauth-x').addEventListener('click', close);
+    ov.addEventListener('click', e => { if (e.target === ov) close(); });
+    const startBtn = ov.querySelector('#cauth-start');
+    startBtn.addEventListener('click', async () => {
+      startBtn.disabled = true; setMsg('Starting sign-in…', 'info');
+      const name = (ov.querySelector('#cauth-name').value || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
+      try {
+        const r = await fetch(`${API_BASE}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
+        const d = await r.json();
+        if (!r.ok || !d.url) throw new Error(d.error || 'Could not start sign-in.');
+        curAuthId = d.authId || '';
+        ov.querySelector('#cauth-name').disabled = true;
+        ov.querySelector('#cauth-link').href = d.url;
+        ov.querySelector('#cauth-step2').classList.remove('cauth-hidden');
+        startBtn.classList.add('cauth-hidden');
+        setMsg('', '');
+        ov.querySelector('#cauth-copy').addEventListener('click', () => {
+          navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => setMsg('Copy failed — select the link manually.', 'err'));
+        });
+      } catch (e) { startBtn.disabled = false; setMsg(e.message, 'err'); }
+    });
+    const submit = async () => {
+      const code = (ov.querySelector('#cauth-code').value || '').trim();
+      if (!code) { setMsg('Paste the code first.', 'err'); return; }
+      const sBtn = ov.querySelector('#cauth-submit'); sBtn.disabled = true;
+      setMsg('Completing sign-in…', 'info');
+      try {
+        const r = await fetch(`${API_BASE}/auth/code`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, authId: curAuthId }) });
+        const d = await r.json();
+        if (r.ok && d.ok) {
+          setMsg('✓ ' + (d.message || 'Signed in.') + ' Your next message continues in this room.', 'ok');   // continues in this room after sign-in
+          setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage(); if (typeof updateTitlebar === 'function') updateTitlebar(); }, 2000);
+        }
+        else { sBtn.disabled = false; setMsg(d.message || d.error || 'Sign-in failed.', 'err'); }
+      } catch (e) { sBtn.disabled = false; setMsg(e.message, 'err'); }
+    };
+    ov.querySelector('#cauth-submit').addEventListener('click', submit);
+    ov.querySelector('#cauth-code').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+  }
+
+  // ── Account switcher (rotate between saved Claude accounts) ───────────────
+  const btnSwitchAccount = document.getElementById('btn-switch-account');
+  if (btnSwitchAccount) {
+    btnSwitchAccount.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      openAccountSwitcher();
+    });
+  }
+  async function openAccountSwitcher() {
+    document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
+    const ov = document.createElement('div');
+    ov.className = 'cauth-overlay';
+    ov.innerHTML = `
+      <div class="cauth-modal">
+        <div class="cauth-head"><span>\u{1F464} Switch Claude account</span><button class="cauth-x" title="Close">✕</button></div>
+        <div class="cauth-body">
+          <p class="cauth-intro">Pick which saved Claude account this pane runs on. Switching starts a fresh chat on that account — no sign-in needed.</p>
+          <div id="acct-list" class="acct-list">Loading…</div>
+          <div id="acct-msg" class="cauth-msg"></div>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    const listEl = ov.querySelector('#acct-list');
+    const msgEl  = ov.querySelector('#acct-msg');
+    const setMsg = (t, kind) => { msgEl.textContent = t || ''; msgEl.className = 'cauth-msg' + (kind ? ' cauth-' + kind : ''); };
+    const close = () => ov.remove();
+    ov.querySelector('.cauth-x').addEventListener('click', close);
+    ov.addEventListener('click', e => { if (e.target === ov) close(); });
+    const relTime = iso => {
+      if (!iso) return '';
+      const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if (s < 90) return 'just now';
+      if (s < 3600) return Math.round(s / 60) + 'm ago';
+      if (s < 86400) return Math.round(s / 3600) + 'h ago';
+      return Math.round(s / 86400) + 'd ago';
+    };
+    function addAccountRow() {
+      const add = document.createElement('button');
+      add.className = 'acct-item acct-add';
+      const nm = document.createElement('span'); nm.className = 'acct-name'; nm.textContent = '➕ Add account';
+      const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = 'sign in to a new Claude account';
+      add.appendChild(nm); add.appendChild(em);
+      add.addEventListener('click', () => { ov.remove(); openClaudeAuth(); });
+      listEl.appendChild(add);
+    }
+    function startRename(nmSpan, oldName) {
+      const inp = document.createElement('input');
+      inp.className = 'acct-rename-input'; inp.value = oldName; inp.maxLength = 40;
+      nmSpan.replaceWith(inp);
+      inp.focus(); inp.select();
+      let done = false;
+      const commit = async () => {
+        const to = inp.value.trim().replace(/[^a-zA-Z0-9_-]/g, '');
+        if (!to || to === oldName) return render();
+        setMsg('Renaming…', 'info');
+        try {
+          const r = await fetch(`${API_BASE}/accounts/rename`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from: oldName, to }) });
+          const d = await r.json();
+          if (r.ok && d.ok) setMsg('✓ ' + (d.message || 'Renamed.'), 'ok');
+          else setMsg((d && (d.error || d.message)) || 'Rename failed.', 'err');
+        } catch (e) { setMsg(e.message, 'err'); }
+        await render();
+      };
+      inp.addEventListener('click', e => e.stopPropagation());
+      inp.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); done = true; commit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); done = true; render(); }
+      });
+      inp.addEventListener('blur', () => { if (!done) { done = true; commit(); } });
+    }
+    async function render() {
+      try {
+        const r = await fetch(`${API_BASE}/accounts`);
+        const d = await r.json();
+        applyEngineMeta(d);
+        if (!d.ok) throw new Error(d.error || 'Could not load accounts.');
+        listEl.innerHTML = '';
+        if (!d.accounts || !d.accounts.length) {
+          const p = document.createElement('p'); p.className = 'cauth-intro';
+          p.textContent = 'No saved accounts yet — add one below.';
+          listEl.appendChild(p); addAccountRow(); return;
+        }
+        const _hasCodex = d.accounts.some(a => a.type === 'codex');
+        listEl._codexHeaderDone = false;
+        if (_hasCodex) { const _hc = document.createElement('div'); _hc.className = 'acct-group-label'; _hc.textContent = 'Code accounts'; listEl.appendChild(_hc); }
+        d.accounts.forEach(a => {
+          const isCodex = a.type === 'codex';
+          const _eng = effectiveEngine();
+          const isActive = isCodex ? (_eng === 'codex' && !!a.active) : (_eng !== 'codex' && !!(a.email && d.active && a.email === d.active));
+          if (isCodex && !listEl._codexHeaderDone) { listEl._codexHeaderDone = true; const _h = document.createElement('div'); _h.className = 'acct-group-label'; _h.textContent = 'Codex accounts'; listEl.appendChild(_h); }
+          const b = document.createElement('button');
+          b.className = 'acct-item' + (isActive ? ' acct-active' : '') + (isCodex ? ' acct-codex' : '');
+          const top = document.createElement('span'); top.className = 'acct-top';
+          const nm = document.createElement('span'); nm.className = 'acct-name'; nm.textContent = a.name;
+          top.appendChild(nm);
+          /* acct-health-ui */ if (a.health === 'fail') { const w = document.createElement('span'); w.textContent = '\u26a0'; w.title = 'Token refresh failing \u2014 re-authenticate: ' + (a.healthReason || 'sign in again'); w.style.color = '#e11'; w.style.marginLeft = '4px'; w.style.cursor = 'help'; top.appendChild(w); }
+          if (isActive) { const badge = document.createElement('span'); badge.className = 'acct-badge'; badge.textContent = 'active'; top.appendChild(badge); }
+          const edit = document.createElement('span'); edit.className = 'acct-edit'; edit.textContent = '✎'; edit.title = 'Rename this account tag';
+          edit.addEventListener('click', e => { e.stopPropagation(); startRename(nm, a.name); });
+          top.appendChild(edit);
+          if (!isCodex) {
+            const reauth = document.createElement('span'); reauth.className = 'acct-edit acct-reauth'; reauth.textContent = '↻'; reauth.title = 'Re-authenticate (sign in again)';
+            reauth.addEventListener('click', e => { e.stopPropagation(); ov.remove(); openClaudeAuth(a.name); });
+            top.appendChild(reauth);
+            const del = document.createElement('span'); del.className = 'acct-edit acct-del'; del.textContent = '🗑'; del.title = 'Delete this saved account';
+            del.addEventListener('click', e => { e.stopPropagation(); doDelete(a.name, a.type, isActive); });
+            top.appendChild(del);
+          }
+          const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = a.email || '';
+          b.appendChild(top); b.appendChild(em);
+          const u = isCodex ? null : normalizeAcctUsage(a.usage);
+          if (u && (u.five_hour_pct != null || u.seven_day_pct != null)) {
+            const usg = document.createElement('span'); usg.className = 'acct-usage';
+            const parts = [];
+            if (u.five_hour_pct != null) parts.push('5h ' + (u.five_hour_reset_expired ? 'available' : u.five_hour_pct + '%' + (u.five_hour_resets_at ? ' · resets ' + formatResetTime(u.five_hour_resets_at, false).replace(/^.*\(/, '').replace(/\)$/, '') : '')));
+            if (u.seven_day_pct != null) parts.push('7d ' + (u.seven_day_reset_expired ? 'available' : u.seven_day_pct + '%'));
+            if (u.updated_at) parts.push('as of ' + relTime(u.updated_at));
+            usg.textContent = parts.join('  ·  ');
+            b.appendChild(usg);
+          } else {
+            const usg = document.createElement('span'); usg.className = 'acct-usage acct-usage-none';
+            usg.textContent = isCodex ? 'Codex \u00b7 ChatGPT sign-in' : 'usage unknown (send a message on it to record)';
+            b.appendChild(usg);
+          }
+          if (isActive) b.classList.add('acct-current');   // not disabled, so ✎ stays clickable
+          b.addEventListener('click', () => { if (isActive) return; doSwitch(a.name, a.type); });
+          listEl.appendChild(b);
+        });
+        addAccountRow();
+      } catch (e) { setMsg(e.message, 'err'); }
+    }
+    // Reset-aware usage: once a window's reset time has passed it has rolled
+    // over, so show it as available rather than the stale snapshot percentage.
+    function normalizeAcctUsage(u) {
+      if (!u) return u;
+      const now = Date.now() / 1000;
+      const out = { ...u };
+      if (out.five_hour_resets_at != null && out.five_hour_resets_at <= now) {
+        out.five_hour_pct = 0; out.five_hour_resets_at = null; out.five_hour_reset_expired = true;
+      }
+      if (out.seven_day_resets_at != null && out.seven_day_resets_at <= now) {
+        out.seven_day_pct = 0; out.seven_day_resets_at = null; out.seven_day_reset_expired = true;
+      }
+      return out;
+    }
+    async function doDelete(name, type, isActive) {
+      if (isActive) { setMsg('Can’t delete the active account — switch to another first.', 'err'); return; }
+      const ok = (typeof confirmDialog === 'function')
+        ? await confirmDialog('Delete saved account “' + name + '”? This only forgets its stored login on this pane — you can add it again by signing in.')
+        : confirm('Delete saved account “' + name + '”?');
+      if (!ok) return;
+      setMsg('Deleting…', 'info');
+      listEl.querySelectorAll('button').forEach(b => b.disabled = true);
+      try {
+        const r = await fetch(`${API_BASE}/accounts/delete`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
+        const d = await r.json();
+        if (r.ok && d.ok) setMsg('✓ ' + (d.message || 'Deleted.'), 'ok');
+        else setMsg((d && (d.error || d.message)) || 'Delete failed.', 'err');
+      } catch (e) { setMsg(e.message, 'err'); }
+      await render();
+    }
+    async function doSwitch(name, type) {
+      setMsg('Switching…', 'info');
+      listEl.querySelectorAll('button').forEach(b => b.disabled = true);
+      try {
+        const r = await fetch(`${API_BASE}/accounts/switch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
+        const d = await r.json();
+        if (r.ok && d.ok) {
+          if (d.engine) globalEngine = (d.engine === 'codex') ? 'codex' : 'claude';
+          setMsg('✓ ' + (d.message || 'Switched.'), 'ok');
+          setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage();
+            if (typeof updateTitlebar === 'function') updateTitlebar();
+            if (typeof showToast === 'function') showToast('Switched \u2014 your next message continues in this room.', 'success'); }, 1200);
+        } else { setMsg((d && (d.error || d.message)) || 'Switch failed.', 'err'); await render(); }
+      } catch (e) { setMsg(e.message, 'err'); await render(); }
+    }
+    render();
+  }
+
+  // ── Task panel rendering: state, filters, sort ────────────────────────────
+  const tasksListEl     = $('tasks-list');
+  const tasksCountEl    = $('tasks-count');
+  const btnTasksRefresh = $('btn-tasks-refresh');
+  const openTasks       = new Set();
+
+  const statusClass  = s => 's-' + String(s || 'new').replace(/[^a-z-]/g, '');
+  const prettyStatus = s => String(s || 'new').replace(/-/g, ' ');
+  const SHORT_STATUS = { 'new': 'new', 'needs-clarification': 'clarify', 'objective-clear': 'clear',
+    'planned': 'plan', 'approved': 'appr', 'in-progress': 'active', 'blocked': 'block', 'done': 'done' };
+  const shortStatus = s => SHORT_STATUS[s] || prettyStatus(s);
+
+  // Organiser task "type" shown on the badge (in place of status).
+  const typeClass  = t => 't-' + String(t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  const SHORT_TYPE = { 'ai': 'AI', 'task to block': 'BLK', 'communication': 'COM',
+    'idea/concept': 'IDE', 'analysis': 'ANA', 'meeting item': 'MTG' };
+  const shortType = t => { const k = String(t || '').trim().toLowerCase(); return (SHORT_TYPE[k] || String(t || '').trim()).slice(0, 3); };
+
+  const STATUS_RANK = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3,
+    'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
+  const rankOf = s => (STATUS_RANK[s] ?? 5);
+  const todayStr = () => new Date().toISOString().slice(0, 10);
+  const isFuture = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && d > todayStr();
+
+  const TS_KEY = 'taskloop.tasks.v1';
+  function loadTaskState() {
+    let s = {};
+    try { s = JSON.parse(localStorage.getItem(TS_KEY) || '{}'); } catch (_) {}
+    return {
+      sort:   s.sort || '',
+      dir:    s.dir === 'desc' ? 'desc' : 'asc',
+      date:   ['pending','today','past','no-date','all'].includes(s.date) ? s.date : 'pending',
+      status: Array.isArray(s.status) ? s.status : [],
+      area:   Array.isArray(s.area) ? s.area : [],
+      type:   Array.isArray(s.type) ? s.type : [],
+      person: Array.isArray(s.person) ? s.person : [],
+      project:Array.isArray(s.project) ? s.project : [],
+    };
+  }
+  let taskState  = loadTaskState();
+  let taskSearch = '';
+  let lastTasks  = [];
+
+  function saveTaskState() { try { localStorage.setItem(TS_KEY, JSON.stringify(taskState)); } catch (_) {} }
+
+  function applyTaskView(tasks) {
+    let list = tasks.slice();
+    const today = todayStr();
+    switch (taskState.date) {
+      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled)); break;
+      case 'today':   list = list.filter(t => t.scheduled === today); break;
+      case 'past':    list = list.filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') && t.scheduled < today); break;
+      case 'no-date': list = list.filter(t => !t.scheduled); break;
+      /* 'all' => no date constraint */
+    }
+    if (taskState.status.length)  list = list.filter(t => taskState.status.includes(t.status));
+    if (taskState.area.length)    list = list.filter(t => taskState.area.includes(t.area || '__none__'));
+    if (taskState.type.length)    list = list.filter(t => taskState.type.includes(t.type || '__none__'));
+    if (taskState.person.length)  list = list.filter(t => taskState.person.includes(t.person || '__none__'));
+    if (taskState.project.length) list = list.filter(t => taskState.project.includes(t.project || '__none__'));
+    const q = taskSearch.trim().toLowerCase();
+    if (q) list = list.filter(t => (t.title || '').toLowerCase().includes(q));
+    if (taskState.sort) {
+      const col = taskState.sort, mul = taskState.dir === 'desc' ? -1 : 1;
+      const val = t => col === 'priority' ? (t.priority === '' || t.priority == null || Number.isNaN(parseInt(t.priority, 10)) ? 99 : parseInt(t.priority, 10))
+                     : col === 'status'   ? rankOf(t.status)
+                     : String(t[col] || '').toLowerCase();
+      list.sort((a, b) => {
+        const va = val(a), vb = val(b);
+        return ((va < vb ? -1 : va > vb ? 1 : 0) * mul) ||
+          String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+      });
+    }
+    return list;
+  }
+
+  // ── Server actions ──
+  async function updateTaskFields(file, fields) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/update`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }) });
+      const data = await res.json();
+      if (res.ok && data.ok) loadTasks(); else showToast('Update failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+  }
+  async function reorderTask(file, move) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/reorder`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ move }) });
+      const data = await res.json();
+      if (res.ok && data.ok) { taskState.sort = ''; saveTaskState(); loadTasks(); }
+      else showToast('Reorder failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Reorder failed: ' + e.message, 'error'); }
+  }
+  async function deleteTask(t) {
+    const ok = await confirmDialog('Delete "' + t.title + '" permanently? This cannot be undone.');
+    if (!ok) return;
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok && data.ok) { showToast('Task deleted', 'success'); openTasks.delete(t.file); loadTasks(); }
+      else showToast('Delete failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
+  }
+  function deferTask(t, days) {
+    const d = new Date(); d.setDate(d.getDate() + days);
+    updateTaskFields(t.file, { scheduled: d.toISOString().slice(0, 10) });
+    showToast('Scheduled forward ' + days + ' day' + (days > 1 ? 's' : ''), 'info');
+  }
+  // Priority levels in the picker (0 = highest, above P1). Keep in sync with the
+  // DB CHECK constraint and the Organiser selector.
+  const PRIORITY_LEVELS = [0, 1, 2, 3];
+  function pickPriority(t, anchor) {
+    document.querySelectorAll('.task-menu, .area-picker, .pri-picker').forEach(m => m.remove());
+    const menu = document.createElement('div');
+    menu.className = 'task-menu pri-picker';
+    const cur = parseInt(t.priority, 10);
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const item = (label, val, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); close(); updateTaskFields(t.file, { priority: val }); });
+      menu.appendChild(b);
+    };
+    for (const lv of PRIORITY_LEVELS) {
+      item((lv === cur ? '\u25cf ' : '\u00a0\u00a0\u00a0') + 'P' + lv, String(lv));
+    }
+    const sepEl = document.createElement('div'); sepEl.className = 'task-menu-sep'; menu.appendChild(sepEl);
+    item('\u2717 Clear', '', 'danger');
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.position = 'fixed';
+    menu.style.top  = Math.max(8, Math.min(r.bottom + 2, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+  }
+  function editArea(t) {
+    document.querySelectorAll('.task-menu, .area-picker').forEach(m => m.remove());
+    const areas = Array.from(new Set((lastTasks || []).map(x => x.area).filter(Boolean)))
+      .sort((a, b) => String(a).localeCompare(String(b)));
+    const menu = document.createElement('div');
+    menu.className = 'task-menu area-picker';
+    menu.style.cssText = 'position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:10000;max-height:64vh;overflow-y:auto';
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const item = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); close(); fn(); });
+      menu.appendChild(b);
+    };
+    const head = document.createElement('div');
+    head.className = 'task-menu-sep';
+    head.textContent = 'Set area';
+    head.style.cssText = 'padding:4px 12px;opacity:.55;font-size:11px';
+    menu.appendChild(head);
+    for (const a of areas) {
+      item((a === t.area ? '\u25cf ' : '\u00a0\u00a0\u00a0') + a, () => updateTaskFields(t.file, { area: a }));
+    }
+    const sepEl = document.createElement('div'); sepEl.className = 'task-menu-sep'; menu.appendChild(sepEl);
+    item('\u270e Custom\u2026', () => {
+      const v = prompt('Area for "' + t.title + '":', t.area || '');
+      if (v !== null) updateTaskFields(t.file, { area: v.trim() });
+    });
+    if (t.area) item('\u2717 Clear area', () => updateTaskFields(t.file, { area: '' }), 'danger');
+    document.body.appendChild(menu);
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+  }
+  function editPriority(t) {
+    const v = prompt('Priority 0–4 (blank to clear):', t.priority || '');
+    if (v === null) return;
+    const n = v.trim();
+    const p = parseInt(n, 10);
+    updateTaskFields(t.file, { priority: n === '' || Number.isNaN(p) ? '' : String(Math.max(0, Math.min(4, p))) });
+  }
+  function renameTask(t) {
+    const v = prompt('Task title:', t.title);
+    if (v === null) return;
+    const title = v.replace(/\s+/g, ' ').trim();
+    if (!title) return;
+    fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/title`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) })
+      .then(r => r.json()).then(d => { if (d.ok) loadTasks(); else showToast('Rename failed: ' + (d.error || ''), 'error'); })
+      .catch(e => showToast('Rename failed: ' + e.message, 'error'));
+  }
+
+  // ── Per-row ⋮ action menu ──
+  function closeTaskMenu() { const m = document.querySelector('.task-menu'); if (m) m.remove(); }
+  function openTaskMenu(t, anchor) {
+    closeTaskMenu();
+    const menu = document.createElement('div');
+    menu.className = 'task-menu';
+    const item = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); closeTaskMenu(); fn(); });
+      menu.appendChild(b);
+    };
+    const sep = () => { const s = document.createElement('div'); s.className = 'task-menu-sep'; menu.appendChild(s); };
+    if (t.session) item('💬 Open chat', () => openTaskChat(t));
+    item('📄 View file', () => viewTaskFile(t));
+    item('📋 Details', () => openTaskDetails(t));
+    sep();
+    item('▲ Move to top', () => reorderTask(t.file, 'top'));
+    item('↑ Move up',     () => reorderTask(t.file, 'up'));
+    item('↓ Move down',   () => reorderTask(t.file, 'down'));
+    sep();
+    if (t.status === 'planned') item('✓ Approve plan', () => setTaskStatus(t, 'approved'));
+    if (t.status === 'blocked') item('↻ Resume',       () => setTaskStatus(t, 'approved'));
+    item('✎ Rename…',       () => renameTask(t));
+    item('⊞ Set area…',    () => editArea(t));
+    item('⚑ Set priority…', () => editPriority(t));
+    item(t.requires_desktop ? '🖥 Requires desktop ✓' : '🖥 Requires desktop', () => toggleRequiresDesktop(t));
+    item(isQueued(t) ? '🟢 Queued ✓' : '🟢 Mark queued', () => toggleQueued(t));
+    item(isQueuedAuto(t) ? '🔵 Queued Autonomous ✓' : '🔵 Mark queued autonomous', () => toggleQueuedAuto(t));
+    sep();
+    item('⏰ Schedule forward 1 day',  () => deferTask(t, 1));
+    item('⏰ Schedule forward 3 days', () => deferTask(t, 3));
+    item('⏰ Schedule forward 7 days', () => deferTask(t, 7));
+    item('⏰ Schedule forward 15 days', () => deferTask(t, 15));
+    item('⏰ Schedule forward 30 days', () => deferTask(t, 30));
+    sep();
+    if (t.status === 'done') item('↺ Reopen', () => setTaskStatus(t, 'new'));
+    else                     item('✓ Completed', () => setTaskStatus(t, 'done'));
+    item('🗑 Delete', () => deleteTask(t), 'danger');
+    document.body.appendChild(menu);
+    const r = anchor.getBoundingClientRect();
+    menu.style.top  = Math.max(8, Math.min(r.bottom + 2, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8)) + 'px';
+    setTimeout(() => document.addEventListener('click', closeTaskMenu, { once: true }), 0);
+  }
+
+  // -- Rich task detail: intermediate objective (history), dated progress feed,
+  //    related emails + drafts. Backed by MariaDB via /tasks/<file>/{objectives,
+  //    progress,emails}. Single source of truth; no .md. [TASKDETAIL_UI_V1]
+  function openTaskDetails(t) {
+    const base = `${API_BASE}/tasks/${encodeURIComponent(t.file)}`;
+    const ov = document.createElement('div'); ov.className = 'task-confirm-overlay'; ov.style.zIndex = '100000';
+    const box = document.createElement('div'); box.className = 'task-confirm task-details';
+    box.style.cssText = 'max-width:720px;width:92%;max-height:88vh;display:flex;flex-direction:column;text-align:left;gap:12px';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px';
+    const ttl = document.createElement('div'); ttl.textContent = t.title || t.file;
+    ttl.style.cssText = 'font-weight:600;font-size:14px;word-break:break-word';
+    const x = document.createElement('button'); x.textContent = '✕'; x.className = 'tc-cancel'; x.style.flex = '0 0 auto';
+    // Jump straight to this task's live room (autonomy per-task room = full
+    // running context up to the last turn; falls back to any linked chat thread).
+    const roomLink = el('a', 'flex:0 0 auto;font-size:12px;font-weight:600;color:var(--accent);cursor:pointer;text-decoration:none;white-space:nowrap', '↗ Live room');
+    roomLink.title = "Open this task's live room (full running context)";
+    roomLink.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const label = roomLink.textContent; roomLink.textContent = '…';
+      let sid = '';
+      try {
+        const d = await (await fetch(`${API_BASE}/sessions`, { cache: 'no-store' })).json();
+        const list = (d && d.sessions) || [];
+        const match = list.find(s => { const m = String(s.taskRoom || '').match(/^(?:task-)+(\d+)-/); return m && String(m[1]) === String(t.id); });
+        sid = (match && match.id) || (t.session || '');
+      } catch (_) {}
+      roomLink.textContent = label;
+      if (!sid) { showToast('No live room yet for this task', 'info'); return; }
+      close();
+      switchToSession(sid);
+    });
+    head.appendChild(ttl); head.appendChild(roomLink); head.appendChild(x);
+    const bodyWrap = document.createElement('div');
+    bodyWrap.style.cssText = 'overflow:auto;display:flex;flex-direction:column;gap:16px;flex:1 1 auto';
+    box.appendChild(head); box.appendChild(bodyWrap); ov.appendChild(box); document.body.appendChild(ov);
+    const close = () => { ov.remove(); document.removeEventListener('keydown', esc); };
+    function esc(e){ if (e.key === 'Escape') close(); }
+    x.addEventListener('click', close);
+    ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+    document.addEventListener('keydown', esc);
+
+    const el = (tag, css, txt) => { const n = document.createElement(tag); if (css) n.style.cssText = css; if (txt != null) n.textContent = txt; return n; };
+    const secTitle = (s) => el('div', 'font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em;opacity:.7;margin-bottom:6px', s);
+    const fmt = (s) => s ? String(s).replace('T', ' ').slice(0, 16) : '';
+    async function jget(u){ const r = await fetch(u, { cache: 'no-store' }); return r.ok ? r.json() : null; }
+    async function jsend(u, method, data){ const r = await fetch(u, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) }); return r.ok; }
+
+    // Questions  [TASK_QUESTIONS_UI_V1] — agent asks, Peter answers, in place.
+    const qSec = el('div'); bodyWrap.appendChild(qSec);
+    function qAnswerBox(row, q){
+      if (row.querySelector('.q-answerbox')) return;
+      const box = el('div', 'display:flex;gap:6px;margin-top:8px'); box.className = 'q-answerbox';
+      const ta = el('textarea', 'flex:1 1 auto;font-family:inherit;font-size:13px;line-height:1.4;padding:8px 10px;min-height:96px;resize:vertical'); ta.placeholder = 'Type your answer…'; if (q.answer) ta.value = q.answer;
+      const btn = el('button', 'flex:0 0 auto', 'Submit'); btn.className = 'tc-ok';
+      const btnRun = el('button', 'flex:0 0 auto', 'Submit & Run'); btnRun.className = 'q-run'; btnRun.title = 'Save the answer and run this task now if any Claude quota is free';
+      const submit = async (run) => {
+        const v = ta.value.trim(); if (!v) return;
+        btn.disabled = btnRun.disabled = true;
+        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = false; return; }
+        // Reflect the answer on the row dot at once (don't wait for the list poll), then close.
+        if (q.status !== 'answered') {
+          const o = Math.max(0, (Number(t.open_questions) || 0) - 1);
+          const a = (Number(t.answered_questions) || 0) + 1;
+          t.open_questions = String(o); t.answered_questions = String(a);
+          try {
+            const sel = (window.CSS && CSS.escape) ? CSS.escape(t.file) : t.file;
+            const live = document.querySelector('.task-status-dot[data-qfile="' + sel + '"]');
+            if (live) {
+              live.className = 'task-status-dot ' + (o > 0 ? 'q-pending' : 'q-answered');
+              live.title = o > 0 ? (o === 1 ? 'A question is awaiting your answer' : (o + ' questions awaiting your answer')) : 'Your question has been answered';
+            }
+          } catch (e) {}
+        }
+        // [RUN_NOW_V1] kick an immediate autonomy turn on this task (server-side
+        // no-op if no account has spare quota or the loop is not armed).
+        if (run) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
+        close();
+      };
+      btn.onclick = () => submit(false);
+      btnRun.onclick = () => submit(true);
+      const btnCol = el('div', 'display:flex;flex-direction:column;gap:6px;flex:0 0 auto');
+      btnCol.appendChild(btn); btnCol.appendChild(btnRun);
+      box.appendChild(ta); box.appendChild(btnCol); row.appendChild(box);
+    }
+    async function renderQuestions(){
+      qSec.innerHTML = ''; qSec.appendChild(secTitle('Questions'));
+      const data = await jget(`${base}/questions`); const list = (data && data.questions) || [];
+      if (!list.length){ qSec.appendChild(el('div', 'font-size:12px;opacity:.5', 'No questions on this task.')); return; }
+      const lw = el('div', 'display:flex;flex-direction:column;gap:8px'); qSec.appendChild(lw);
+      list.forEach(q => {
+        const answered = q.status === 'answered';
+        const row = el('div', `font-size:13px;border-radius:6px;padding:8px 10px;border:1px solid ${answered ? 'rgba(80,200,120,.30)' : 'rgba(255,180,60,.45)'};background:${answered ? 'rgba(80,200,120,.08)' : 'rgba(255,180,60,.10)'}`);
+        const top = el('div', 'display:flex;gap:8px;align-items:flex-start');
+        const qtext = el('div', 'flex:1 1 auto;white-space:pre-wrap;word-break:break-word', q.question);
+        const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '×');
+        del.onclick = async () => { if (confirm('Delete this question?') && await jsend(`${base}/questions/${q.id}`, 'DELETE')) renderQuestions(); };
+        top.appendChild(qtext); top.appendChild(del); row.appendChild(top);
+        row.appendChild(el('div', 'font-size:11px;opacity:.5;margin-top:3px', `${q.asked_by || 'agent'} asked · ${fmt(q.created_at)}`));
+        if (answered){
+          row.appendChild(el('div', 'margin-top:6px;padding:6px 8px;border-radius:5px;background:rgba(255,255,255,.05);white-space:pre-wrap;word-break:break-word', q.answer));
+          row.appendChild(el('div', 'font-size:11px;opacity:.5;margin-top:3px', `answered ${fmt(q.answered_at)}`));
+          const edit = el('button', 'margin-top:6px', 'Edit answer'); edit.className = 'tc-cancel';
+          edit.onclick = () => qAnswerBox(row, q); row.appendChild(edit);
+        } else {
+          qAnswerBox(row, q);
+        }
+        lw.appendChild(row);
+      });
+    }
+
+    // Objectives
+    const objSec = el('div'); bodyWrap.appendChild(objSec);
+    async function renderObjectives(){
+      objSec.innerHTML = ''; objSec.appendChild(secTitle('Intermediate objective'));
+      const data = await jget(`${base}/objectives`); const list = (data && data.objectives) || [];
+      const current = list.filter(o => o.status === 'current').slice(-1)[0];
+      const cur = el('div', 'font-size:13px;padding:8px 10px;border-radius:6px;background:rgba(80,160,255,.10);border:1px solid rgba(80,160,255,.25);white-space:pre-wrap;word-break:break-word');
+      cur.textContent = current ? current.body : '(no intermediate objective set)';
+      if (!current) cur.style.opacity = '.6';
+      objSec.appendChild(cur);
+      const form = el('div', 'display:flex;gap:6px;margin-top:6px');
+      const inp = el('input', 'flex:1 1 auto;font-size:13px;padding:6px 8px'); inp.placeholder = 'Set a new intermediate objective…';
+      const btn = el('button', 'flex:0 0 auto', 'Set'); btn.className = 'tc-ok';
+      btn.onclick = async () => { const v = inp.value.trim(); if (!v) return; if (await jsend(`${base}/objectives`, 'POST', { body: v })) renderObjectives(); };
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') btn.click(); });
+      form.appendChild(inp); form.appendChild(btn); objSec.appendChild(form);
+      const past = list.filter(o => o.status !== 'current');
+      if (past.length){
+        const h = el('div', 'font-size:11px;opacity:.6;margin-top:8px;cursor:pointer', '▸ History (' + past.length + ')');
+        const ul = el('div', 'display:none;flex-direction:column;gap:4px;margin-top:4px');
+        h.onclick = () => { const open = ul.style.display !== 'none'; ul.style.display = open ? 'none' : 'flex'; h.textContent = (open ? '▸' : '▾') + ' History (' + past.length + ')'; };
+        past.slice().reverse().forEach(o => { const r = el('div', 'font-size:12px;padding:4px 8px;border-left:2px solid rgba(255,255,255,.15);white-space:pre-wrap;word-break:break-word'); r.textContent = `[${o.status}${o.achieved_at ? ' ' + fmt(o.achieved_at) : ''}] ${o.body}`; ul.appendChild(r); });
+        objSec.appendChild(h); objSec.appendChild(ul);
+      }
+    }
+
+    // Progress
+    const progSec = el('div'); bodyWrap.appendChild(progSec);
+    async function renderProgress(){
+      progSec.innerHTML = ''; progSec.appendChild(secTitle('Progress'));
+      const form = el('div', 'display:flex;gap:6px;margin-bottom:8px');
+      const ta = el('textarea', 'flex:1 1 auto;font-size:13px;padding:6px 8px;min-height:38px;resize:vertical'); ta.placeholder = 'Add a dated progress note…';
+      const btn = el('button', 'flex:0 0 auto', 'Add'); btn.className = 'tc-ok';
+      btn.onclick = async () => { const v = ta.value.trim(); if (!v) return; if (await jsend(`${base}/progress`, 'POST', { body: v, author: 'peter' })) renderProgress(); };
+      form.appendChild(ta); form.appendChild(btn); progSec.appendChild(form);
+      const data = await jget(`${base}/progress`); const list = (data && data.entries) || [];
+      if (!list.length){ progSec.appendChild(el('div', 'font-size:12px;opacity:.5', 'No progress entries yet.')); return; }
+      const feed = el('div', 'display:flex;flex-direction:column;gap:6px'); progSec.appendChild(feed);
+      list.forEach(p => {
+        const row = el('div', 'font-size:13px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04);display:flex;gap:8px;align-items:flex-start');
+        const meta = el('div', 'font-size:11px;opacity:.55;white-space:nowrap;flex:0 0 auto', `${fmt(p.created_at)} · ${p.author || ''}`);
+        const b = el('div', 'flex:1 1 auto;white-space:pre-wrap;word-break:break-word', p.body);
+        const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '×');
+        del.onclick = async () => { if (await jsend(`${base}/progress/${p.id}`, 'DELETE')) renderProgress(); };
+        row.appendChild(meta); row.appendChild(b); row.appendChild(del); feed.appendChild(row);
+      });
+    }
+
+    // Emails
+    const mailSec = el('div'); bodyWrap.appendChild(mailSec);
+    async function renderEmails(){
+      mailSec.innerHTML = ''; mailSec.appendChild(secTitle('Related emails & drafts'));
+      const addBtn = el('button', 'margin-bottom:8px', '＋ Add email / draft'); addBtn.className = 'tc-cancel';
+      mailSec.appendChild(addBtn);
+      const fw = el('div', 'display:none;flex-direction:column;gap:6px;margin-bottom:10px;padding:8px;border:1px solid rgba(255,255,255,.12);border-radius:6px');
+      const mk = (ph) => { const i = el('input', 'font-size:13px;padding:5px 8px'); i.placeholder = ph; return i; };
+      const dir = el('select', 'font-size:13px;padding:5px 8px'); ['received', 'draft'].forEach(d => { const o = document.createElement('option'); o.value = d; o.textContent = d; dir.appendChild(o); });
+      const src = mk('Inbox / source (e.g. gmail-castle, outlook-adlux)'); const fn = mk('From name'); const fa = mk('From email');
+      const to = mk('To (for drafts / context)'); const subj = mk('Subject'); const date = mk('Date & time (e.g. 2026-07-15 09:30)'); const link = mk('Permalink (optional)');
+      const bta = el('textarea', 'font-size:13px;padding:6px 8px;min-height:70px;resize:vertical'); bta.placeholder = 'Email body (stored — reusable as a prepared draft)';
+      const save = el('button', null, 'Save'); save.className = 'tc-ok';
+      [dir, src, fn, fa, to, subj, date, link, bta, save].forEach(n => fw.appendChild(n));
+      mailSec.appendChild(fw);
+      addBtn.onclick = () => { fw.style.display = fw.style.display === 'none' ? 'flex' : 'none'; };
+      save.onclick = async () => { if (await jsend(`${base}/emails`, 'POST', { direction: dir.value, source: src.value, from_name: fn.value, from_addr: fa.value, to_addr: to.value, subject: subj.value, email_date: date.value, permalink: link.value, body: bta.value })) renderEmails(); };
+      const data = await jget(`${base}/emails`); const list = (data && data.emails) || [];
+      if (!list.length){ mailSec.appendChild(el('div', 'font-size:12px;opacity:.5', 'No related emails yet.')); return; }
+      const lw = el('div', 'display:flex;flex-direction:column;gap:6px'); mailSec.appendChild(lw);
+      list.forEach(m => {
+        const row = el('div', 'font-size:13px;border-radius:6px;background:rgba(255,255,255,.04);padding:8px 10px');
+        const top = el('div', 'display:flex;gap:8px;align-items:center;cursor:pointer');
+        const badge = el('span', `flex:0 0 auto;font-size:10px;padding:1px 6px;border-radius:4px;background:${m.direction === 'draft' ? 'rgba(255,200,60,.20)' : 'rgba(80,200,120,.18)'}`, m.direction);
+        const line = el('div', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', `${m.subject || '(no subject)'} — ${m.from_name || m.from_addr || ''}`);
+        const dt = el('div', 'flex:0 0 auto;font-size:11px;opacity:.55', fmt(m.email_date));
+        const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '×');
+        del.onclick = async (e) => { e.stopPropagation(); if (await jsend(`${base}/emails/${m.id}`, 'DELETE')) renderEmails(); };
+        top.appendChild(badge); top.appendChild(line); top.appendChild(dt); top.appendChild(del);
+        const detail = el('div', 'display:none;margin-top:8px;font-size:12px;border-top:1px solid rgba(255,255,255,.1);padding-top:8px');
+        detail.appendChild(el('div', 'opacity:.6;margin-bottom:6px;word-break:break-word', `${m.source ? ('[' + m.source + '] ') : ''}${m.from_name || ''} <${m.from_addr || ''}>${m.to_addr ? (' → ' + m.to_addr) : ''}`));
+        if (m.permalink){ const a = el('a', 'display:inline-block;margin-bottom:6px;font-size:12px', 'Open original'); a.href = m.permalink; a.target = '_blank'; detail.appendChild(a); }
+        detail.appendChild(el('pre', 'white-space:pre-wrap;word-break:break-word;margin:0;font-family:inherit', m.body || '(no body stored)'));
+        top.addEventListener('click', () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; });
+        row.appendChild(top); row.appendChild(detail); lw.appendChild(row);
+      });
+    }
+
+    // Images  [TASK_IMAGES_UI_V1]
+    const imgSec = el('div'); bodyWrap.appendChild(imgSec);
+    async function uploadImageFile(f){
+      if (!f || !/^image\//.test(f.type)) return;
+      if (f.size > 8 * 1024 * 1024){ alert('Image exceeds 8 MB.'); return; }
+      const dataUrl = await new Promise((res, rej) => { const rd = new FileReader(); rd.onload = () => res(rd.result); rd.onerror = rej; rd.readAsDataURL(f); });
+      if (await jsend(`${base}/images`, 'POST', { data_url: dataUrl, filename: f.name || '' })) renderImages();
+      else alert('Upload failed (image too large for the proxy, or server error).');
+    }
+    async function renderImages(){
+      imgSec.innerHTML = ''; imgSec.appendChild(secTitle('Images'));
+      const bar = el('div', 'display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap');
+      const pick = el('button', null, '＋ Attach image'); pick.className = 'tc-cancel';
+      const fileInp = el('input'); fileInp.type = 'file'; fileInp.accept = 'image/*'; fileInp.style.display = 'none';
+      pick.onclick = () => fileInp.click();
+      fileInp.onchange = () => { const f = fileInp.files && fileInp.files[0]; fileInp.value = ''; uploadImageFile(f); };
+      const hint = el('div', 'font-size:11px;opacity:.5', 'or paste a screenshot (Ctrl/⌘-V)');
+      bar.appendChild(pick); bar.appendChild(fileInp); bar.appendChild(hint); imgSec.appendChild(bar);
+
+      const data = await jget(`${base}/images`); const list = (data && data.images) || [];
+      if (!list.length){ imgSec.appendChild(el('div', 'font-size:12px;opacity:.5', 'No images attached yet.')); return; }
+      const grid = el('div', 'display:flex;flex-wrap:wrap;gap:10px'); imgSec.appendChild(grid);
+      list.forEach(im => {
+        const cell = el('div', 'position:relative;width:120px;border-radius:6px;overflow:hidden;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1)');
+        const thumb = el('div', 'width:120px;height:90px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:11px;opacity:.5');
+        thumb.textContent = '…';
+        const cap = el('div', 'font-size:11px;padding:4px 6px;opacity:.75;word-break:break-word', im.caption || im.filename || '');
+        const del = el('button', 'position:absolute;top:2px;right:2px;background:rgba(0,0,0,.55);border:none;color:#fff;border-radius:4px;cursor:pointer;font-size:14px;line-height:1;padding:1px 5px', '×');
+        del.onclick = async (e) => { e.stopPropagation(); if (await jsend(`${base}/images/${im.id}`, 'DELETE')) renderImages(); };
+        cell.appendChild(thumb); cell.appendChild(cap); cell.appendChild(del); grid.appendChild(cell);
+        // Lazily fetch the data URL (kept out of the list payload).
+        jget(`${base}/images/${im.id}`).then(full => {
+          if (!full || !full.data_url) { thumb.textContent = '⚠'; return; }
+          thumb.innerHTML = ''; thumb.style.opacity = '1';
+          const img = el('img', 'max-width:100%;max-height:90px;object-fit:contain;display:block'); img.src = full.data_url;
+          thumb.appendChild(img);
+          thumb.onclick = () => {
+            const lb = el('div', 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100001;display:flex;align-items:center;justify-content:center;cursor:zoom-out');
+            const big = el('img', 'max-width:94vw;max-height:94vh;object-fit:contain'); big.src = full.data_url;
+            lb.appendChild(big); lb.onclick = () => lb.remove(); document.body.appendChild(lb);
+          };
+        });
+      });
+    }
+    // Paste-to-attach: grab image blobs pasted anywhere in the open panel.
+    ov.addEventListener('paste', (e) => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items){ if (it.type && it.type.indexOf('image') === 0){ const f = it.getAsFile(); if (f) { e.preventDefault(); uploadImageFile(f); } } }
+    });
+
+    renderQuestions(); renderObjectives(); renderProgress(); renderEmails(); renderImages();
+  }
+
+  // ── Read-only view of a task's raw .md (incl. Loop Log). [TASKFILE_VIEWER_V1] ──
+  async function viewTaskFile(t) {
+    const ov = document.createElement('div'); ov.className = 'task-confirm-overlay';
+    const box = document.createElement('div'); box.className = 'task-confirm';
+    box.style.maxWidth='760px'; box.style.width='90%'; box.style.maxHeight='85vh';
+    box.style.display='flex'; box.style.flexDirection='column'; box.style.textAlign='left';
+    const head = document.createElement('div');
+    head.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px';
+    const ttl = document.createElement('div'); ttl.textContent = t.file || (t.title||'task');
+    ttl.style.cssText='font-weight:600;font-size:13px;word-break:break-all';
+    const x = document.createElement('button'); x.textContent='✕'; x.className='tc-cancel'; x.style.flex='0 0 auto';
+    head.appendChild(ttl); head.appendChild(x);
+    const pre = document.createElement('pre');
+    pre.style.cssText='white-space:pre-wrap;word-break:break-word;overflow:auto;margin:0;flex:1 1 auto;font-size:12px;line-height:1.45;font-family:ui-monospace,Menlo,Consolas,monospace';
+    pre.textContent='Loading…';
+    box.appendChild(head); box.appendChild(pre); ov.appendChild(box); document.body.appendChild(ov);
+    const close = () => { ov.remove(); document.removeEventListener('keydown', esc); };
+    function esc(e){ if(e.key==='Escape') close(); }
+    x.addEventListener('click', close);
+    ov.addEventListener('click', (e) => { if (e.target === ov) close(); });
+    document.addEventListener('keydown', esc);
+    if (!t.file) { pre.textContent='This task has no .md file on disk yet.'; return; }
+    try {
+      const res = await fetch(`${API_BASE}/taskfile/${encodeURIComponent(t.file)}`, { cache: 'no-store' });
+      pre.textContent = res.ok ? await res.text() : `Could not load file (${res.status}).`;
+    } catch (e) { pre.textContent = 'Error: ' + (e && e.message); }
+  }
+
+  // ── Confirm dialog (returns a Promise<boolean>) ──
+  function confirmDialog(message) {
+    return new Promise((resolve) => {
+      const ov = document.createElement('div'); ov.className = 'task-confirm-overlay';
+      const box = document.createElement('div'); box.className = 'task-confirm';
+      const msg = document.createElement('div'); msg.className = 'task-confirm-msg'; msg.textContent = message;
+      const btns = document.createElement('div'); btns.className = 'task-confirm-btns';
+      const cancel = document.createElement('button'); cancel.className = 'tc-cancel'; cancel.textContent = 'Cancel';
+      const ok = document.createElement('button'); ok.className = 'tc-ok'; ok.textContent = 'Delete';
+      const done = v => { ov.remove(); resolve(v); };
+      cancel.addEventListener('click', () => done(false));
+      ok.addEventListener('click', () => done(true));
+      ov.addEventListener('click', (e) => { if (e.target === ov) done(false); });
+      btns.appendChild(cancel); btns.appendChild(ok);
+      box.appendChild(msg); box.appendChild(btns); ov.appendChild(box);
+      document.body.appendChild(ov);
+    });
+  }
+
+  function toggleRequiresDesktop(t) { updateTaskFields(t.file, { requires_desktop: t.requires_desktop ? '' : 'true' }); }
+  // A queued task = fully scoped but deliberately parked; the row renders green.
+  function isQueued(t) { return t.queued === true || t.queued === 'yes' || t.queued === 'true' || t.queued === '1'; }
+  function toggleQueued(t) { updateTaskFields(t.file, { queued: isQueued(t) ? '' : 'true' }); }
+  // Queued Autonomous = scoped AND cleared for the AI to start on its own.
+  function isQueuedAuto(t) { return t.queued_autonomous === true || t.queued_autonomous === 'yes' || t.queued_autonomous === 'true' || t.queued_autonomous === '1'; }
+  function toggleQueuedAuto(t) { updateTaskFields(t.file, { queued_autonomous: isQueuedAuto(t) ? '' : 'true' }); }
+  // ── One task row ──
+  function renderTaskRow(t) {
+    const row = document.createElement('div');
+    row.className = 'task-row ' + statusClass(t.status);
+    if (isQueued(t)) row.classList.add('queued');
+    if (openTasks.has(t.file)) row.classList.add('open');
+
+    const line = document.createElement('div');
+    line.className = 'task-line';
+
+    const idEl = document.createElement('span');
+    idEl.className = 'task-id';
+    idEl.textContent = (t.id != null ? t.id : '?');
+    idEl.title = 'Task number';
+
+    const pri = document.createElement('span');
+    pri.className = 'task-pri' + (t.priority ? ' p' + t.priority : '');
+    pri.textContent = t.priority ? ('P' + t.priority) : '–';
+    pri.title = 'Priority (click to change)';
+    pri.addEventListener('click', (e) => { e.stopPropagation(); pickPriority(t, pri); });
+
+    const area = document.createElement('span');
+    area.className = 'task-area';
+    area.textContent = t.area || '—';
+    area.title = 'Area (click to edit)';
+    area.addEventListener('click', (e) => { e.stopPropagation(); editArea(t); });
+
+    const title = document.createElement('span');
+    title.className = 'task-title-cell';
+    title.textContent = t.title;
+    if (t.session) { const c = document.createElement('span'); c.className = 'task-chat-dot'; c.textContent = ' 💬'; c.title = 'Has a chat thread'; title.appendChild(c); }
+
+    const badge = document.createElement('span');
+    if (String(t.type || '').trim()) {
+      badge.className = 'task-badge ' + typeClass(t.type);
+      badge.textContent = shortType(t.type);
+      badge.title = String(t.type).trim() + ' — status: ' + prettyStatus(t.status);
+    } else {
+      // No Organiser type set: keep a subtle status chip so the row still reads.
+      badge.className = 'task-badge task-badge-untyped ' + statusClass(t.status);
+      badge.textContent = shortStatus(t.status);
+      badge.title = prettyStatus(t.status);
+    }
+
+    // Status cell = optional question dot + the (now-smaller) status/type chip.
+    // Red dot = a question awaits your answer; green = your question was answered.
+    const statusCell = document.createElement('span');
+    statusCell.className = 'task-status-cell';
+    const nOpenQ = Number(t.open_questions) || 0;
+    const nAnsQ = Number(t.answered_questions) || 0;
+    if (nOpenQ > 0 || nAnsQ > 0) {
+      const dot = document.createElement('span');
+      dot.className = 'task-status-dot ' + (nOpenQ > 0 ? 'q-pending' : 'q-answered');
+      dot.title = nOpenQ > 0
+        ? (nOpenQ === 1 ? 'A question is awaiting your answer' : (nOpenQ + ' questions awaiting your answer'))
+        : 'Your question has been answered';
+      dot.dataset.qfile = t.file;
+      dot.addEventListener('click', (e) => { e.stopPropagation(); openTaskDetails(t); });
+      statusCell.appendChild(dot);
+    }
+    statusCell.appendChild(badge);
+
+    const more = document.createElement('button');
+    more.className = 'task-more'; more.textContent = '⋮'; more.title = 'Task actions';
+    more.addEventListener('click', (e) => { e.stopPropagation(); openTaskMenu(t, more); });
+
+    line.appendChild(idEl); line.appendChild(pri);
+    line.appendChild(area); line.appendChild(title); line.appendChild(statusCell); line.appendChild(more);
+    row.appendChild(line);
+
+    const detail = document.createElement('div');
+    detail.className = 'task-detail';
+    const meta = document.createElement('div');
+    meta.className = 'tr-meta';
+    meta.textContent = [
+      t.scheduled ? 'sched ' + t.scheduled : '',
+      t.updated ? 'upd ' + t.updated : '',
+      t.completed_at ? 'done ' + String(t.completed_at).slice(0, 10) : '',
+    ].filter(Boolean).join('  ·  ');
+    detail.appendChild(meta);
+    const addField = (label, value, cls) => {
+      if (!value) return;
+      const f = document.createElement('div'); f.className = 'tr-field ' + (cls || '');
+      const l = document.createElement('span'); l.className = 'tr-field-label'; l.textContent = label;
+      const b = document.createElement('span'); b.className = 'tr-field-val'; b.textContent = value;
+      f.appendChild(l); f.appendChild(b); detail.appendChild(f);
+    };
+    addField('Objective', t.objective, 'tr-objective');
+    addField('Description', t.description, 'tr-desc');
+    if (t.notes) {
+      const nl = document.createElement('div'); nl.className = 'tr-field-label tr-notes-label'; nl.textContent = 'Notes / context';
+      const n = document.createElement('div'); n.className = 'tr-notes'; n.textContent = t.notes;
+      detail.appendChild(nl); detail.appendChild(n);
+    }
+    if (t.plan)  {
+      const p = document.createElement('div'); p.className = 'tr-plan';
+      const l = document.createElement('span'); l.className = 'tr-plan-label'; l.textContent = 'Plan';
+      const b = document.createElement('span'); b.textContent = t.plan;
+      p.appendChild(l); p.appendChild(b); detail.appendChild(p);
+    }
+    row.appendChild(detail);
+
+    line.addEventListener('click', () => {
+      row.classList.toggle('open');
+      if (row.classList.contains('open')) openTasks.add(t.file); else openTasks.delete(t.file);
+    });
+    return row;
+  }
+
+  // ── Filter dropdown menus ──
+  function renderCheckMenu(menuEl, options, selected, onChange, labelFn, allLabel, optRender) {
+    if (!menuEl) return;
+    const temp = new Set(selected);
+    const draw = () => {
+      menuEl.innerHTML = '';
+      const allRow = document.createElement('label'); allRow.className = 'tf-opt tf-opt-all';
+      const allCb = document.createElement('input'); allCb.type = 'checkbox'; allCb.checked = temp.size === 0;
+      allCb.addEventListener('change', () => { temp.clear(); draw(); });
+      allRow.appendChild(allCb); allRow.appendChild(document.createTextNode(' ' + (allLabel || 'All')));
+      menuEl.appendChild(allRow);
+      const sep = document.createElement('div'); sep.className = 'tf-sep'; menuEl.appendChild(sep);
+      const scroll = document.createElement('div'); scroll.className = 'tf-scroll';
+      for (const opt of options) {
+        const row = document.createElement('label'); row.className = 'tf-opt' + (opt === '__none__' ? ' tf-opt-none' : '');
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = temp.has(opt);
+        cb.addEventListener('change', () => { temp.has(opt) ? temp.delete(opt) : temp.add(opt); draw(); });
+        row.appendChild(cb);
+        if (optRender) optRender(row, opt); else row.appendChild(document.createTextNode(' ' + labelFn(opt)));
+        scroll.appendChild(row);
+      }
+      menuEl.appendChild(scroll);
+      const okWrap = document.createElement('div'); okWrap.className = 'tf-ok-wrap';
+      const ok = document.createElement('button'); ok.type = 'button'; ok.className = 'tf-ok'; ok.textContent = 'OK';
+      ok.addEventListener('click', (e) => { e.stopPropagation(); onChange(Array.from(temp)); closeDropdowns(); });
+      okWrap.appendChild(ok); menuEl.appendChild(okWrap);
+    };
+    draw();
+  }
+  function setFilterBtn(btn, sel, base, labelFn) {
+    if (!btn) return;
+    const on = sel && sel.length > 0;
+    btn.classList.toggle('active', on);
+    if (!on) { btn.textContent = base + ' \u25be'; return; }
+    const label = sel.length === 1 ? labelFn(sel[0]) : base + ' (' + sel.length + ')';
+    btn.textContent = label + ' \u25be';
+  }
+  const DATE_OPTS = [['pending','Pending'],['today','Today'],['past','Past'],['no-date','No Date'],['all','All']];
+  function buildDateMenu() {
+    const menu = $('tf-date-menu');
+    if (menu) {
+      menu.innerHTML = '';
+      for (const [val, label] of DATE_OPTS) {
+        const row = document.createElement('label'); row.className = 'tf-opt';
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = taskState.date === val;
+        cb.addEventListener('change', () => { taskState.date = val; saveTaskState(); closeDropdowns(); renderTasks(lastTasks); });
+        row.appendChild(cb); row.appendChild(document.createTextNode(' ' + label));
+        menu.appendChild(row);
+      }
+    }
+    const btn = $('tf-date');
+    if (btn) {
+      const cur = DATE_OPTS.find(o => o[0] === taskState.date);
+      btn.textContent = (cur ? cur[1] : 'Pending') + ' \u25be';
+      btn.classList.toggle('active', taskState.date !== 'pending');
+    }
+  }
+  function buildFilterMenus(tasks) {
+    const noneLabel = v => v === '__none__' ? '(unassigned)' : v;
+    const optsFor = key => {
+      const vals = Array.from(new Set(tasks.map(t => t[key]).filter(Boolean))).sort();
+      return vals.concat(tasks.some(t => !t[key]) ? ['__none__'] : []);
+    };
+    const menuOpen = id => { const m = $(id); return m && !m.classList.contains('hidden'); };
+    if (!menuOpen('tf-status-menu')) renderCheckMenu($('tf-status-menu'),
+      Array.from(new Set(tasks.map(t => t.status))).sort(), taskState.status,
+      sel => { taskState.status = sel; saveTaskState(); renderTasks(lastTasks); }, prettyStatus, 'All Statuses');
+    if (!menuOpen('tf-area-menu')) renderCheckMenu($('tf-area-menu'), optsFor('area'), taskState.area,
+      sel => { taskState.area = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Areas');
+    if (!menuOpen('tf-type-menu')) renderCheckMenu($('tf-type-menu'), optsFor('type'), taskState.type,
+      sel => { taskState.type = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Types',
+      (row, opt) => {
+        if (opt === '__none__') { row.appendChild(document.createTextNode(' (untyped)')); return; }
+        const chip = document.createElement('span');
+        chip.className = 'task-badge tf-chip ' + typeClass(opt);
+        chip.textContent = shortType(opt);
+        row.appendChild(document.createTextNode(' '));
+        row.appendChild(chip);
+        row.appendChild(document.createTextNode(' ' + opt));
+      });
+    if (!menuOpen('tf-person-menu')) renderCheckMenu($('tf-person-menu'), optsFor('person'), taskState.person,
+      sel => { taskState.person = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All People');
+    if (!menuOpen('tf-project-menu')) renderCheckMenu($('tf-project-menu'), optsFor('project'), taskState.project,
+      sel => { taskState.project = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Projects');
+    buildDateMenu();
+    setFilterBtn($('tf-status'), taskState.status, 'Status', prettyStatus);
+    setFilterBtn($('tf-area'), taskState.area, 'Area', noneLabel);
+    setFilterBtn($('tf-type'), taskState.type, 'Type', noneLabel);
+    setFilterBtn($('tf-person'), taskState.person, 'Person', noneLabel);
+    setFilterBtn($('tf-project'), taskState.project, 'Project', noneLabel);
+  }
+
+  // ── Sort-header arrows ──
+  function updateSortHeader() {
+    document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
+      const col = th.getAttribute('data-sort');
+      let base = th.getAttribute('data-label');
+      if (!base) { base = th.textContent.trim(); th.setAttribute('data-label', base); }
+      const active = taskState.sort === col;
+      th.classList.toggle('sorted', active);
+      th.textContent = base + (active ? (taskState.dir === 'desc' ? ' ▼' : ' ▲') : '');
+    });
+  }
+
+  // ── Wire task controls ──
+  function closeDropdowns() { document.querySelectorAll('.tf-menu').forEach(m => m.classList.add('hidden')); }
+  function wireDropdown(btnId, menuId) {
+    const btn = $(btnId), menu = $(menuId);
+    if (!btn || !menu) return;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = !menu.classList.contains('hidden');
+      closeDropdowns();
+      if (!wasOpen) { menu.classList.remove('hidden'); setTimeout(() => document.addEventListener('click', closeDropdowns, { once: true }), 0); }
+    });
+    menu.addEventListener('click', e => e.stopPropagation());
+  }
+  function wireTaskControls() {
+    const search = $('task-search');
+    if (search) search.addEventListener('input', () => { taskSearch = search.value; renderTasks(lastTasks); });
+    wireDropdown('tf-date', 'tf-date-menu');
+    wireDropdown('tf-status', 'tf-status-menu');
+    wireDropdown('tf-area', 'tf-area-menu');
+    wireDropdown('tf-type', 'tf-type-menu');
+    wireDropdown('tf-person', 'tf-person-menu');
+    wireDropdown('tf-project', 'tf-project-menu');
+    buildDateMenu();
+    document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
+      th.addEventListener('click', () => {
+        const col = th.getAttribute('data-sort');
+        if (taskState.sort === col) taskState.dir = taskState.dir === 'asc' ? 'desc' : 'asc';
+        else { taskState.sort = col; taskState.dir = 'asc'; }
+        saveTaskState(); renderTasks(lastTasks);
+      });
+    });
+  }
+  wireTaskControls();
+
+  // ── Render task list ──
+  function renderTasks(tasks) {
+    if (!tasksListEl) return;
+    const pendingCount = tasks.filter(t => t.status !== 'done' && !isFuture(t.scheduled)).length;
+    if (tasksCountEl) tasksCountEl.textContent = pendingCount || '';
+    buildFilterMenus(tasks);
+    updateSortHeader();
+    if (!tasks.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks yet.</div>'; return; }
+    const list = applyTaskView(tasks);
+    if (!list.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks match the current filters.</div>'; return; }
+    tasksListEl.innerHTML = '';
+    for (const t of list) tasksListEl.appendChild(renderTaskRow(t));
+  }
+
+  async function loadTasks() {
+    try {
+      const res = await fetch(API_BASE + '/tasks', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      lastTasks = data.tasks || [];
+      renderTasks(lastTasks);
+    } catch (_) {}
+  }
+
+  // ── Task chat integration ──
+  function startFreshSession() {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+    messagesEl.innerHTML = '';
+    _pendingOlder = []; _olderBtn = null; _restoring = false;   // drop prior room's load-older backlog so it can't refill the new room
+    currentAssistantEl   = null;
+    currentAssistantText = '';
+    lastToolEl = null;
+    setBusy(false);
+    hideContextWarning();
+    setMcpDot('unknown');
+    storedMsgData        = [];
+    lastAssistantDataIdx = -1;
+    lastToolDataIdx      = -1;
+    currentSessionId = null;
+    localStorage.removeItem(SESSION_KEY);
+    if (typeof updateTitlebar === 'function') updateTitlebar();
+  }
+
+  function openTaskChat(t) {
+    if (t.session) {
+      switchToSession(t.session);
+      showToast('Reopened this task\'s chat', 'info');
+      return;
+    }
+    startFreshSession();
+    pendingTaskLink = t.file;
+    let msg = `Let's work on this task: "${t.title}".`;
+    if (t.notes) msg += `\n\nCurrent notes / objective:\n${t.notes}`;
+    if (t.plan)  msg += `\n\nPlan:\n${t.plan}`;
+    msg += `\n\nPlease pick up from here.`;
+    inputEl.value = msg;
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    inputEl.focus();
+    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    showToast('New chat thread for this task — review and send', 'info');
+  }
+
+  async function setTaskStatus(t, status) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        const msg = status === 'done'     ? 'Task marked done'
+                  : status === 'approved' ? 'Plan approved'
+                  : status === 'new'      ? 'Task reopened'
+                  : 'Status updated';
+        showToast(msg, status === 'done' || status === 'approved' ? 'success' : 'info');
+        loadTasks();
+      } else {
+        showToast('Update failed: ' + (data.error || res.status), 'error');
+      }
+    } catch (e) { showToast('Update failed: ' + e.message, 'error'); }
+  }
+
+  // ── New-task form ──
+  const btnTasksNew  = $('btn-tasks-new');
+  const taskNewForm  = $('task-new-form');
+  const taskNewTitle = $('task-new-title');
+  const taskNewDesc  = $('task-new-desc');
+  const taskNewCancel= $('task-new-cancel');
+
+  function toggleNewForm(show) {
+    if (!taskNewForm) return;
+    taskNewForm.classList.toggle('hidden', !show);
+    if (show && taskNewTitle) { taskNewTitle.value = ''; if (taskNewDesc) taskNewDesc.value = ''; taskNewTitle.focus(); }
+  }
+  if (btnTasksNew)   btnTasksNew.addEventListener('click', () => toggleNewForm(taskNewForm && taskNewForm.classList.contains('hidden')));
+  if (taskNewCancel) taskNewCancel.addEventListener('click', () => toggleNewForm(false));
+  if (taskNewForm) taskNewForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const title = taskNewTitle?.value.trim();
+    if (!title) { taskNewTitle?.focus(); return; }
+    try {
+      const res = await fetch(API_BASE + '/tasks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, description: taskNewDesc?.value.trim() || '' }),
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        showToast(`Task ${data.id} created`, 'success');
+        toggleNewForm(false);
+        loadTasks();
+      } else {
+        showToast('Could not create task: ' + (data.error || res.status), 'error');
+      }
+    } catch (err) {
+      showToast('Could not create task: ' + err.message, 'error');
+    }
+  });
+
+  if (btnTasksRefresh) btnTasksRefresh.addEventListener('click', loadTasks);
+  setInterval(() => { if (tasksPanel && tasksPanel.classList.contains('tasks-panel-visible')) loadTasks(); }, 30000);
+
+  // ── Mobile status dropdown ──────────────────────────────────────────────────
+  const btnStatus   = $('btn-status');
+  const statusStack = $('status-stack');
+  const statusDot   = $('status-dot');
+
+  if (btnStatus && statusStack) {
+    btnStatus.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = statusStack.classList.toggle('open');
+      if (open) {
+        const r   = btnStatus.getBoundingClientRect();
+        const w   = Math.min(340, window.innerWidth * 0.92);
+        const top = r.bottom + 6;
+        const left = Math.max(8, r.right - w);
+        statusStack.style.top   = top + 'px';
+        statusStack.style.width = w + 'px';
+        statusStack.style.left  = left + 'px';
+        statusStack.style.right = 'auto';
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (statusStack.classList.contains('open') &&
+          !statusStack.contains(e.target) && !btnStatus.contains(e.target)) {
+        statusStack.classList.remove('open');
+      }
+    });
+  }
+
+  function refreshStatusAlert() {
+    if (!statusDot) return;
+    let alert = false;
+    statusStack && statusStack.querySelectorAll('.cdot').forEach((d) => {
+      if (d.classList.contains('cdot-disconnected') || d.classList.contains('cdot-error')) alert = true;
+    });
+    ['fill-5h', 'fill-7d', 'fill-ctx'].forEach((id) => {
+      const f = $(id);
+      if (f && /--red/.test(f.style.background || '')) alert = true;
+    });
+    statusDot.classList.toggle('alert', alert);
+  }
+  setInterval(refreshStatusAlert, 1500);
+  refreshStatusAlert();
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  loadSessions();
+  updateTitlebar();
+  // History is restored from server via fetchAndRestoreHistory() on first WS connect
+  connect();
+})();

@@ -1,0 +1,20 @@
+#!/bin/bash
+# On-demand PARALLEL test browser stack for Peter ONLY.
+# Isolated display/ports/profile so it never collides with the interactive stack.
+# Purpose: drive/test the bridge app from a SECOND browser, avoiding the noVNC
+# infinite-mirror effect. NOT supervised by any watchdog — start/stop by hand.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export HOME=/home/bridge-peter
+export DISPLAY_NUM=:41
+export VNC_PORT=5941
+export NOVNC_PORT=6193
+export CDP_PORT=9241
+export MCP_PORT=8951
+export SHIM_PORT=8961
+export CHROME_PROFILE_DIR=/home/bridge-peter/.claude/chromium-test-profile
+export LOG_DIR="$SCRIPT_DIR/logs/bridge-peter-test"
+mkdir -p "$LOG_DIR" "$CHROME_PROFILE_DIR"
+chown -R bridge-peter:bridge-peter "$CHROME_PROFILE_DIR" "$LOG_DIR" 2>/dev/null || true
+echo "[test-browser] launching parallel stack (display $DISPLAY_NUM, MCP $MCP_PORT)"
+exec bash "$SCRIPT_DIR/start-browser.sh"

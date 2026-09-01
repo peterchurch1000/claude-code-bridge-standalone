@@ -1,0 +1,312 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Room viewer</title>
+<style>
+  html,body{margin:0;height:100%;background:#202124;color:#ddd;font:13px system-ui,sans-serif;overflow:hidden}
+  #tabs{display:flex;align-items:flex-end;gap:2px;padding:6px 6px 0;background:#202124;height:34px;box-sizing:border-box;overflow-x:auto;overflow-y:hidden;white-space:nowrap}
+  #tabs::-webkit-scrollbar{height:0}
+  .tab{display:inline-flex;align-items:center;gap:6px;max-width:210px;min-width:70px;height:28px;padding:0 10px;background:#2b2c2f;color:#cfcfcf;border-radius:9px 9px 0 0;cursor:pointer;font-size:12px;flex:0 0 auto}
+  .tab:hover{background:#3a3b3f}
+  .tab.active{background:#4a4b50;color:#fff}
+  .tab .ti{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tab .live{width:7px;height:7px;border-radius:50%;background:#34a853;flex:0 0 auto}
+  #bar{display:flex;gap:6px;padding:6px 8px;background:#35363a;align-items:center;box-sizing:border-box}
+  #bar .nav{background:transparent;color:#cfcfcf;border:0;font-size:17px;cursor:pointer;width:30px;height:30px;border-radius:50%;line-height:1}
+  #bar .nav:hover{background:#4a4b4f}
+  #bar input{flex:1;background:#202124;color:#e8eaed;border:1px solid #5f6368;padding:6px 12px;border-radius:16px;font-size:13px;outline:none}
+  #bar input:focus{border-color:#8ab4f8}
+  #bar button.pill{background:#8ab4f8;color:#202124;border:0;padding:6px 12px;border-radius:16px;cursor:pointer;font-weight:600}
+  #follow{cursor:pointer;font-size:11px;padding:4px 9px;border-radius:12px;white-space:nowrap;border:1px solid #5f6368;background:transparent;color:#9aa0a6}
+  #follow.paused{background:#fbbc04;color:#202124;border-color:#fbbc04}
+  #status{font-size:11px;color:#9aa0a6;white-space:nowrap}
+  #wrap{position:absolute;top:78px;bottom:0;left:0;right:0;display:flex;align-items:center;justify-content:center;background:#000}
+  canvas{max-width:100%;max-height:100%;background:#000;cursor:default;outline:none}
+  #vnc-status{display:none}
+    #tabs .tab .x{margin-left:6px;opacity:0;color:#9aa0a6;border-radius:50%;width:16px;height:16px;line-height:15px;text-align:center;font-size:14px;flex:0 0 auto;}
+    #tabs .tab:hover .x{opacity:.85;}
+    #tabs .tab .x:hover{background:#5f6368;color:#fff;opacity:1;}
+    #tabs .newtab{flex:0 0 auto;width:26px;height:26px;line-height:24px;text-align:center;color:#c8ccd0;font-size:18px;border-radius:6px;cursor:pointer;margin-left:2px;}
+    #tabs .newtab:hover{background:#35363a;color:#fff;}
+    #tabs .tab .fav{width:15px;height:15px;margin-right:6px;flex:0 0 auto;border-radius:2px;}
+    #bar .prof{display:none;align-items:center;gap:6px;margin-left:8px;padding:3px 9px;background:#35363a;border-radius:12px;font-size:12px;color:#e8eaed;white-space:nowrap;}
+    #bar .prof .av{width:16px;height:16px;border-radius:50%;background:#1a73e8;color:#fff;font-size:10px;line-height:16px;text-align:center;font-weight:600;flex:0 0 auto;}
+  /* trackpad-style virtual cursor for touch (mobile) */
+  #cv{touch-action:none}
+  #vcursor{position:fixed;display:none;width:22px;height:22px;margin:-11px 0 0 -11px;border:2px solid #8ab4f8;border-radius:50%;background:rgba(138,180,248,.15);box-shadow:0 0 0 1px rgba(0,0,0,.45);pointer-events:none;z-index:99999}
+  #vcursor::after{content:'';position:absolute;left:50%;top:50%;width:3px;height:3px;margin:-1.5px 0 0 -1.5px;background:#8ab4f8;border-radius:50%}
+  #vclick{position:fixed;display:none;width:26px;height:26px;margin:-13px 0 0 -13px;border:2px solid #34a853;border-radius:50%;pointer-events:none;z-index:99999}
+  #vclick.go{animation:vcpop .3s ease-out forwards}
+  @keyframes vcpop{from{transform:scale(.4);opacity:.9}to{transform:scale(1.5);opacity:0}}
+</style>
+</head>
+<body>
+  <div id="tabs"></div>
+  <div id="bar">
+    <button class="nav" id="back" title="Back">&#8249;</button>
+    <button class="nav" id="fwd" title="Forward">&#8250;</button>
+    <button class="nav" id="reload" title="Reload">&#8635;</button>
+    <input id="url" placeholder="https://…  (Enter to navigate)" />
+    <button class="pill" id="go">Go</button>
+    <button id="follow" title="Follow Claude's active tab">&#9679; Live</button>
+    <span id="profile" class="prof" title="Chrome profile"></span>
+    <span id="status">connecting…</span>
+  </div>
+  <div id="wrap"><canvas id="cv" tabindex="0" width="1280" height="800"></canvas></div>
+  <!-- app.js's pollVnc() keys off this element's className, same as vnc_clean.html -->
+  <div id="vnc-status" class="connecting"></div>
+<script>
+(function () {
+  const qs = new URLSearchParams(location.search);
+  const roomId = qs.get('room') || 'default';
+  const target = qs.get('target');
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const stateEl = document.getElementById('vnc-status');
+  const urlEl = document.getElementById('url');
+
+  // page-CSS-px size of the current visual viewport (from screencast metadata)
+  let pageW = 1280, pageH = 800;
+
+  // ── WS URL ────────────────────────────────────────────────────────────────
+  // Two serving modes:
+  //   • Bridge (production): this file is served as .../room-view-client.html by
+  //     the bridge; the live socket is the PROXIED path <prefix>/roomview, which
+  //     bridge-server forwards to the relay's /view/<room>. Mirror vnc_clean.html's
+  //     prefix derivation so it works under a base path (/peter etc.).
+  //   • Relay-direct (standalone test): served at /room on the relay itself; talk
+  //     straight to /view/<room>.
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  function buildWsUrl() {
+    const isBridge = /room-view-client\.html$/.test(location.pathname);
+    if (isBridge) {
+      const parts = location.pathname.split('/').filter(Boolean);
+      const prefix = parts.length > 1 ? '/' + parts[0] : '';
+      let p = prefix + '/roomview?room=' + encodeURIComponent(roomId);
+      if (target) p += '&target=' + encodeURIComponent(target);
+      return proto + '://' + location.host + p;
+    }
+    let p = '/view/' + encodeURIComponent(roomId);
+    if (target) p += '?target=' + encodeURIComponent(target);
+    return proto + '://' + location.host + p;
+  }
+
+  let ws = null;
+  let reconnectTimer = null;
+  let reconnectDelay = 1000;
+  function setStatus(s, cls) { statusEl.textContent = s; if (cls) stateEl.className = cls; }
+
+  function connect() {
+    ws = new WebSocket(buildWsUrl());
+    ws.onopen = () => { reconnectDelay = 1000; setStatus('connected · ' + roomId, 'connecting'); };
+    ws.onclose = () => { setStatus('disconnected', 'disconnected'); scheduleReconnect(); };
+    ws.onerror = () => { setStatus('error', 'error'); };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.t === 'frame') drawFrame(m);
+      else if (m.t === 'meta') renderMeta(m);
+      else if (m.t === 'hello') setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected');
+      else if (m.t === 'error') setStatus('err: ' + m.msg, 'error');
+    };
+  }
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  }
+  // app.js's connected-but-black watchdog calls this; force a clean WS reconnect
+  // (relay re-activates + re-casts the room => a fresh full paint).
+  window.__rfbReconnect = function () { try { if (ws) ws.close(); } catch (e) {} };
+
+  const img = new Image();
+  let painting = false, queued = null;
+  function drawFrame(m) {
+    if (m.meta) { pageW = m.meta.deviceWidth || pageW; pageH = m.meta.deviceHeight || pageH; }
+    const src = 'data:image/jpeg;base64,' + m.data;
+    if (painting) { queued = src; return; }
+    painting = true;
+    img.onload = () => {
+      if (cv.width !== img.naturalWidth || cv.height !== img.naturalHeight) {
+        cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      }
+      ctx.drawImage(img, 0, 0);
+      painting = false;
+      if (queued) { const s = queued; queued = null; img.src = s; painting = true; }
+    };
+    img.src = src;
+  }
+
+  // ---- map a canvas mouse event -> page CSS px --------------------------
+  function toPage(e) {
+    const r = cv.getBoundingClientRect();
+    const sx = cv.width / r.width, sy = cv.height / r.height;     // css->canvas px
+    const cx = (e.clientX - r.left) * sx, cy = (e.clientY - r.top) * sy; // canvas px
+    const px = cx * (pageW / cv.width), py = cy * (pageH / cv.height);   // page css px
+    return { x: Math.round(px), y: Math.round(py) };
+  }
+  function mods(e) {
+    return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+  }
+  function sendJSON(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+  const btn = (b) => (b === 0 ? 'left' : b === 1 ? 'middle' : b === 2 ? 'right' : 'none');
+
+  cv.addEventListener('mousemove', (e) => { const p = toPage(e); sendJSON({ k: 'mouse', type: 'mouseMoved', x: p.x, y: p.y, modifiers: mods(e) }); });
+  cv.addEventListener('mousedown', (e) => { e.preventDefault(); cv.focus(); const p = toPage(e); sendJSON({ k: 'mouse', type: 'mousePressed', x: p.x, y: p.y, button: btn(e.button), clickCount: 1, modifiers: mods(e) }); });
+  cv.addEventListener('mouseup', (e) => { const p = toPage(e); sendJSON({ k: 'mouse', type: 'mouseReleased', x: p.x, y: p.y, button: btn(e.button), clickCount: 1, modifiers: mods(e) }); });
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
+  cv.addEventListener('wheel', (e) => { e.preventDefault(); const p = toPage(e); sendJSON({ k: 'wheel', x: p.x, y: p.y, dx: e.deltaX, dy: e.deltaY }); }, { passive: false });
+
+  // ── Trackpad-style virtual cursor for touch (mobile) ──────────────────────
+  // A tap normally clicks wherever the finger lands, and the finger hides the
+  // target. Instead drive a visible cursor dot: drag anywhere to move it (finger
+  // offset from the dot), tap to click at the dot, two-finger drag to scroll.
+  // Desktop mouse is unaffected — touch events don't fire there.
+  const vcur = document.createElement('div'); vcur.id = 'vcursor';
+  const vclick = document.createElement('div'); vclick.id = 'vclick';
+  document.body.appendChild(vcur); document.body.appendChild(vclick);
+  let curX = 0, curY = 0, curInit = false;
+  const GAIN = 1.5;
+  function clampCursor() {
+    const r = cv.getBoundingClientRect();
+    curX = Math.max(r.left, Math.min(r.right, curX));
+    curY = Math.max(r.top, Math.min(r.bottom, curY));
+  }
+  function drawCursor() { vcur.style.display = 'block'; vcur.style.left = curX + 'px'; vcur.style.top = curY + 'px'; }
+  function curEvt() { return { clientX: curX, clientY: curY, altKey:false, ctrlKey:false, metaKey:false, shiftKey:false }; }
+  function ripple() {
+    vclick.style.left = curX + 'px'; vclick.style.top = curY + 'px';
+    vclick.style.display = 'block'; vclick.classList.remove('go');
+    void vclick.offsetWidth; vclick.classList.add('go');
+    setTimeout(() => { vclick.style.display = 'none'; }, 320);
+  }
+  let tLast = null, tMoved = false, tStartT = 0, twoFinger = false, lastMid = null;
+  cv.addEventListener('touchstart', (e) => {
+    e.preventDefault(); cv.focus();
+    if (!curInit) { const r = cv.getBoundingClientRect(); curX = r.left + r.width/2; curY = r.top + r.height/2; curInit = true; }
+    if (e.touches.length >= 2) {
+      twoFinger = true;
+      lastMid = { x:(e.touches[0].clientX+e.touches[1].clientX)/2, y:(e.touches[0].clientY+e.touches[1].clientY)/2 };
+      return;
+    }
+    twoFinger = false;
+    const t = e.touches[0];
+    tLast = { x:t.clientX, y:t.clientY }; tMoved = false; tStartT = Date.now();
+    drawCursor();
+  }, { passive:false });
+  cv.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (twoFinger && e.touches.length >= 2) {
+      const mid = { x:(e.touches[0].clientX+e.touches[1].clientX)/2, y:(e.touches[0].clientY+e.touches[1].clientY)/2 };
+      if (lastMid) { const p = toPage(curEvt()); sendJSON({ k:'wheel', x:p.x, y:p.y, dx:(lastMid.x-mid.x), dy:(lastMid.y-mid.y) }); }
+      lastMid = mid; return;
+    }
+    if (!tLast) return;
+    const t = e.touches[0];
+    const dx = (t.clientX - tLast.x) * GAIN, dy = (t.clientY - tLast.y) * GAIN;
+    tLast = { x:t.clientX, y:t.clientY };
+    curX += dx; curY += dy; clampCursor();
+    if (Math.abs(dx) + Math.abs(dy) > 2) tMoved = true;
+    drawCursor();
+    const p = toPage(curEvt()); sendJSON({ k:'mouse', type:'mouseMoved', x:p.x, y:p.y, modifiers:0 });
+  }, { passive:false });
+  cv.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    if (twoFinger) { if (e.touches.length === 0) twoFinger = false; return; }
+    if (tLast && !tMoved && (Date.now() - tStartT) < 350) {
+      const p = toPage(curEvt());
+      sendJSON({ k:'mouse', type:'mouseMoved', x:p.x, y:p.y, modifiers:0 });
+      sendJSON({ k:'mouse', type:'mousePressed', x:p.x, y:p.y, button:'left', clickCount:1, modifiers:0 });
+      sendJSON({ k:'mouse', type:'mouseReleased', x:p.x, y:p.y, button:'left', clickCount:1, modifiers:0 });
+      ripple();
+    }
+    tLast = null;
+  }, { passive:false });
+
+  // Capture keys at the WINDOW (capture phase) rather than on the canvas: after a
+  // click, focus can land on the iframe body instead of the <canvas>, so keydown
+  // bubbles to window and never reaches a canvas-scoped listener — that made typing
+  // silently fail while mouse (a direct canvas event) worked. Window capture fires
+  // regardless of which element holds focus. Skip when the URL bar is focused.
+  function keyInField() { const a = document.activeElement; return a && (a.id === 'url' || a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable); }
+  function onKeyDown(e) {
+    if (keyInField()) return;
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) {
+      e.preventDefault();
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        navigator.clipboard.readText().then((t) => { if (t) sendJSON({ k: 'text', text: t }); }).catch(() => {});
+      }
+      return;
+    }
+    e.preventDefault();
+    sendJSON({ k: 'key', type: 'keyDown', key: e.key, code: e.code, vk: e.keyCode, modifiers: mods(e) });
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) sendJSON({ k: 'key', type: 'char', text: e.key, key: e.key, code: e.code, vk: e.keyCode, modifiers: mods(e) });
+  }
+  function onKeyUp(e) { if (keyInField()) return; e.preventDefault(); sendJSON({ k: 'key', type: 'keyUp', key: e.key, code: e.code, vk: e.keyCode, modifiers: mods(e) }); }
+  window.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('keyup', onKeyUp, true);
+  var onPaste = function(e){ var cd = e.clipboardData || window.clipboardData; var t = cd && cd.getData ? cd.getData('text') : ''; if (t) { e.preventDefault(); sendJSON({ k: 'text', text: t }); } };
+  cv.addEventListener('paste', onPaste);
+  document.addEventListener('paste', onPaste);
+
+  function nav() { let u = urlEl.value.trim(); if (!u) return; if (!/^https?:\/\//.test(u)) u = 'https://' + u; sendJSON({ k: 'nav', url: u }); cv.focus(); }
+  document.getElementById('go').addEventListener('click', nav);
+  urlEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') nav(); });
+
+  // ── Chrome-style tab strip + nav buttons (driven by relay 'meta' pushes) ──
+  const tabsEl = document.getElementById('tabs');
+  const followEl = document.getElementById('follow');
+  let urlFocused = false;
+  urlEl.addEventListener('focus', () => { urlFocused = true; });
+  urlEl.addEventListener('blur', () => { urlFocused = false; });
+  document.getElementById('back').addEventListener('click', () => { sendJSON({ k: 'back' }); cv.focus(); });
+  document.getElementById('fwd').addEventListener('click', () => { sendJSON({ k: 'forward' }); cv.focus(); });
+  document.getElementById('reload').addEventListener('click', () => { sendJSON({ k: 'reload' }); cv.focus(); });
+  followEl.addEventListener('click', () => { sendJSON({ k: 'follow' }); cv.focus(); });
+
+  function shortTitle(t, url) {
+    if (t && t.trim()) return t;
+    try { return new URL(url).hostname.replace(/^www\./, ''); } catch (e) { return url || 'New Tab'; }
+  }
+  const profEl = document.getElementById('profile');
+  function renderMeta(m) {
+    if (m.profile && profEl) {
+      const p = m.profile;
+      const label = p.email || p.name || p.dir || '';
+      const initial = (label.trim()[0] || '?').toUpperCase();
+      profEl.style.display = label ? 'inline-flex' : 'none';
+      profEl.innerHTML = '';
+      const av = document.createElement('span'); av.className = 'av'; av.textContent = initial; profEl.appendChild(av);
+      const tx = document.createElement('span'); tx.textContent = label; profEl.appendChild(tx);
+      profEl.title = 'Chrome profile: ' + (p.name || p.dir) + (p.email ? '  (' + p.email + ')' : '');
+    }
+    const tabs = m.tabs || [];
+    const viewed = tabs.find((t) => t.targetId === m.viewing) || tabs[0];
+    if (viewed && !urlFocused) urlEl.value = viewed.url || '';
+    if (m.pinned) { followEl.textContent = '▶ Follow'; followEl.className = 'paused'; followEl.title = 'Resume following Claude’s active tab'; }
+    else { followEl.textContent = '● Live'; followEl.className = ''; followEl.title = 'Following Claude’s active tab'; }
+    tabsEl.innerHTML = '';
+    tabs.forEach((t) => {
+      const d = document.createElement('div');
+      d.className = 'tab' + (t.targetId === m.viewing ? ' active' : '');
+      d.title = (t.title || '') + '  ' + (t.url || '');
+      if (t.targetId === m.claudeCurrent) { const dot = document.createElement('span'); dot.className = 'live'; dot.title = "Claude's active tab"; d.appendChild(dot); }
+      try { var _h = new URL(t.url).hostname; if (_h) { const fav = document.createElement('img'); fav.className = 'fav'; fav.src = 'https://www.google.com/s2/favicons?domain=' + _h + '&sz=32'; fav.onerror = () => { fav.style.visibility = 'hidden'; }; d.appendChild(fav); } } catch (e) {}
+      const ti = document.createElement('span'); ti.className = 'ti'; ti.textContent = shortTitle(t.title, t.url); d.appendChild(ti);
+      d.addEventListener('click', () => sendJSON({ k: 'view-tab', targetId: t.targetId }));
+      const x = document.createElement('span'); x.className = 'x'; x.textContent = '\u00d7'; x.title = 'Close tab';
+      x.addEventListener('click', (e) => { e.stopPropagation(); if (tabs.length > 1) sendJSON({ k: 'close-tab', targetId: t.targetId }); });
+      d.appendChild(x);
+      tabsEl.appendChild(d);
+    });
+    const add = document.createElement('div'); add.className = 'newtab'; add.textContent = '+'; add.title = 'New tab';
+    add.addEventListener('click', () => sendJSON({ k: 'new-tab' }));
+    tabsEl.appendChild(add);
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>

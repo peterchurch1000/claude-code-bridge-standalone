@@ -2253,6 +2253,17 @@
         row.dataset.task = s.taskRoom ? '1' : '';
         row.dataset.archived = s.archived ? '1' : '';
         _sessRows.push(row);
+        // ROOM_OPEN_NEWTAB_V1 — open THIS room in a new browser tab.
+        const open = document.createElement('a');
+        open.className = 'sess-edit';
+        open.target = '_blank';
+        open.rel = 'noopener';
+        open.title = 'Open room in a new tab';
+        open.setAttribute('aria-label', 'Open room in a new tab');
+        open.style.cssText = 'cursor:pointer;flex:0 0 auto;margin-left:2px;opacity:1;color:#fff;text-decoration:none;display:inline-flex;align-items:center;';
+        open.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3h7v7"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
+        try { const _u = new URL(location.href); _u.searchParams.set('room', s.id); open.href = _u.href; } catch { open.href = '?room=' + encodeURIComponent(s.id); }
+        open.onclick = (e) => { e.stopPropagation(); sessionDropdown.classList.add('hidden'); };
         const edit = document.createElement('span');
         edit.className = 'sess-edit';
         edit.textContent = '✎';
@@ -2324,6 +2335,7 @@
             showToast(s.archived ? 'Room unarchived' : 'Room archived', 'success');
           } catch { showToast('Archive failed', 'error'); }
         };
+        row.appendChild(open);
         row.appendChild(edit);
         row.appendChild(del);
         row.appendChild(arch);
@@ -3348,6 +3360,19 @@
       return data;
     } catch (e) { return { error: e.message }; }
   }
+  // [FORCE_RUN_MENU_V1] Force ONE immediate autonomy turn on this task (bypasses the
+  // 15-min queued/usage-pacing cron). Bills whichever Claude account has the most
+  // spare 5h quota and is not the one being chatted on; graceful no-op if none has
+  // quota or the loop is not armed. Backed by POST /tasks/:file/run-now (run-now.sh).
+  async function forceRunTask(t) {
+    try {
+      const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/run-now`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok) showToast('Force-run launched for "' + t.title + '" — runs within ~1 min if a Claude account has spare quota', 'success');
+      else showToast('Force-run failed: ' + (data.error || res.status), 'error');
+    } catch (e) { showToast('Force-run failed: ' + e.message, 'error'); }
+  }
   async function reorderTask(file, move) {
     try {
       const res = await fetch(`${API_BASE}/tasks/${encodeURIComponent(file)}/reorder`, {
@@ -3372,7 +3397,7 @@
     updateTaskFields(t.file, { scheduled: d.toISOString().slice(0, 10) });
     showToast('Scheduled forward ' + days + ' day' + (days > 1 ? 's' : ''), 'info');
   }
-  function scheduleTaskDate(t) {
+  function scheduleTaskDate(t, anchor) {
     document.querySelectorAll('.task-menu, .area-picker, .date-picker').forEach(m => m.remove());
     const menu = document.createElement('div');
     menu.className = 'task-menu date-picker';
@@ -3396,7 +3421,10 @@
     });
     act.appendChild(cancel); act.appendChild(save); menu.appendChild(act);
     document.body.appendChild(menu);
-    menu.style.position = 'fixed'; menu.style.left = '50%'; menu.style.top = '50%'; menu.style.transform = 'translate(-50%,-50%)'; menu.style.zIndex = '100001';
+    menu.style.position = 'fixed'; menu.style.zIndex = '100001';
+    const r = (anchor && anchor.getBoundingClientRect) ? anchor.getBoundingClientRect() : { bottom: window.innerHeight / 2, right: window.innerWidth / 2, left: window.innerWidth / 2 };
+    menu.style.top  = Math.max(8, Math.min(r.bottom + 2, window.innerHeight - menu.offsetHeight - 8)) + 'px';
+    menu.style.left = Math.max(8, Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8)) + 'px';
     setTimeout(() => document.addEventListener('click', onDoc, true), 0);
     inp.focus();
     try { inp.showPicker(); } catch (e) {}
@@ -3578,6 +3606,7 @@
     if (t.session) item('💬 Open chat', () => openTaskChat(t));
     item('📄 View file', () => viewTaskFile(t));
     item('📋 Details', () => openTaskDetails(t));
+    item('⚡ Force run now', () => forceRunTask(t));
     sep();
     item('▲ Move to top', () => reorderTask(t.file, 'top'));
     item('↑ Move up',     () => reorderTask(t.file, 'up'));
@@ -3599,7 +3628,7 @@
     item('⏰ Schedule forward 7 days', () => deferTask(t, 7));
     item('⏰ Schedule forward 15 days', () => deferTask(t, 15));
     item('⏰ Schedule forward 30 days', () => deferTask(t, 30));
-    item('📅 Schedule forward to date…', () => scheduleTaskDate(t));
+    item('📅 Schedule forward to date…', () => scheduleTaskDate(t, anchor));
     sep();
     if (t.status === 'done') item('↺ Reopen', () => setTaskStatus(t, 'new'));
     else                     item('✓ Completed', () => setTaskStatus(t, 'done'));
@@ -3669,13 +3698,14 @@
       const ta = el('textarea', 'flex:1 1 auto;font-family:inherit;font-size:13px;line-height:1.4;padding:8px 10px;min-height:96px;resize:vertical'); ta.placeholder = 'Type your answer…'; if (q.answer) ta.value = q.answer;
       const btn = el('button', 'flex:0 0 auto', 'Submit'); btn.className = 'tc-ok';
       const btnRun = el('button', 'flex:0 0 auto', 'Submit & Run'); btnRun.className = 'q-run'; btnRun.title = 'Save the answer and run this task now if any Claude quota is free';
-      const btnApprove = el('button', 'flex:0 0 auto', 'Approve'); btnApprove.className = 'q-approve'; btnApprove.title = 'Approve: submits the exact word APPROVE (what the autonomy broker needs) and runs it now';
+      const btnApprove = el('button', 'flex:0 0 auto', 'Approve'); btnApprove.className = 'q-approve'; btnApprove.title = 'Approve: submits the exact word APPROVE (what the autonomy broker needs) without running now';
+      const btnApproveRun = el('button', 'flex:0 0 auto', 'Approve & Run'); btnApproveRun.className = 'q-approve q-approve-run'; btnApproveRun.title = 'Approve the proposed procedure (submits APPROVE) and run it immediately';
       const submit = async (opts) => {
         opts = opts || {};
         const v = opts.approve ? 'APPROVE' : ta.value.trim();
         if (!v) return;
-        btn.disabled = btnRun.disabled = btnApprove.disabled = true;
-        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = btnApprove.disabled = false; return; }
+        btn.disabled = btnRun.disabled = btnApprove.disabled = btnApproveRun.disabled = true;
+        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = btnApprove.disabled = btnApproveRun.disabled = false; return; }
         // Reflect the answer on the row dot at once (don't wait for the list poll), then close.
         if (q.status !== 'answered') {
           const o = Math.max(0, (Number(t.open_questions) || 0) - 1);
@@ -3693,7 +3723,7 @@
         // [RUN_NOW_V1] kick an immediate autonomy turn on this task (server-side
         // no-op if no account has spare quota or the loop is not armed).
         if (opts.approve && t.status === 'planned') { try { await jsend(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, 'POST', { status: 'approved' }); } catch (e) {} }
-        if (opts.run || opts.approve) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
+        if (opts.run) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
         // Several questions can be pending at once — refresh the list in place and keep
         // the modal open until every one is answered; only auto-close on the last.
         await renderQuestions();
@@ -3702,11 +3732,12 @@
       btn.onclick = () => submit();
       btnRun.onclick = () => submit({ run: true });
       btnApprove.onclick = () => submit({ approve: true });
-      const btnCol = el('div', 'display:flex;flex-direction:column;gap:6px;flex:0 0 auto');
+      btnApproveRun.onclick = () => submit({ approve: true, run: true });
+      const btnCol = el('div', 'display:grid;grid-template-columns:1fr 1fr;gap:6px;flex:0 0 auto;align-content:start');
       btnCol.appendChild(btn); btnCol.appendChild(btnRun);
       // Only offer Approve when the question is an approval request — the broker
       // always includes the literal token APPROVE (e.g. "Reply APPROVE to run").
-      if (/\bAPPROVE\b/.test(q.question || '')) btnCol.appendChild(btnApprove);
+      if (/\bapprove\b/i.test(q.question || '')) { btnCol.appendChild(btnApprove); btnCol.appendChild(btnApproveRun); }
       box.appendChild(ta); box.appendChild(btnCol); row.appendChild(box);
     }
     async function renderQuestions(){
@@ -4166,7 +4197,19 @@
   }
 
   // ── Wire task controls ──
-  function closeDropdowns() { document.querySelectorAll('.tf-menu').forEach(m => m.classList.add('hidden')); }
+  function alignMenu(menu) { /* MENU_ALIGN_V2: fixed overlay, paints above the chat pane */
+    const btn = menu.parentElement && menu.parentElement.querySelector('.tf-btn');
+    if (!btn) return;
+    const b = btn.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth;
+    menu.style.position = 'fixed';
+    menu.style.zIndex = '9999';
+    menu.style.top = (b.bottom + 3) + 'px';
+    menu.style.left = b.left + 'px';
+    menu.style.right = 'auto';
+    const r = menu.getBoundingClientRect();      // clamp only at the true window edge
+    if (r.right > vw - 6) { menu.style.left = 'auto'; menu.style.right = Math.max(6, vw - b.right) + 'px'; }
+  }  function closeDropdowns() { document.querySelectorAll('.tf-menu').forEach(m => m.classList.add('hidden')); }
   function wireDropdown(btnId, menuId) {
     const btn = $(btnId), menu = $(menuId);
     if (!btn || !menu) return;
@@ -4174,7 +4217,7 @@
       e.stopPropagation();
       const wasOpen = !menu.classList.contains('hidden');
       closeDropdowns();
-      if (!wasOpen) { menu.classList.remove('hidden'); setTimeout(() => document.addEventListener('click', closeDropdowns, { once: true }), 0); }
+      if (!wasOpen) { menu.classList.remove('hidden'); alignMenu(menu); setTimeout(() => document.addEventListener('click', closeDropdowns, { once: true }), 0); }
     });
     menu.addEventListener('click', e => e.stopPropagation());
   }

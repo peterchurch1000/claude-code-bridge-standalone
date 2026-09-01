@@ -1,0 +1,134 @@
+  async function loadSessions() {
+    sessionList.innerHTML = '';
+    const newBtn = document.createElement('button');
+    newBtn.className = 'sess-new';
+    newBtn.textContent = '+ New room';
+    newBtn.onclick = () => { sessionDropdown.classList.add('hidden'); newRoom(); };
+    sessionList.appendChild(newBtn);
+    try {
+      const res = await fetch(API_BASE + '/sessions', { cache: 'no-store' });
+      const data = await res.json();
+      if (!data.sessions || data.sessions.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'sess-empty';
+        empty.textContent = 'No rooms yet';
+        sessionList.appendChild(empty);
+        return;
+      }
+      // Build one session row element (identical for normal + autonomy task rooms).
+      const makeRow = (s) => {
+        sessionNameById[s.id] = s.name || s.preview || '';
+        const row = document.createElement('div');
+        row.className = 'sess-row';
+        const btn = document.createElement('button');
+        btn.className = 'sess-item';
+        const time = document.createElement('span');
+        time.className = 'sess-time';
+        time.textContent = fmtSessionDate(s.updatedAt);
+        const sid = document.createElement('span');
+        sid.textContent = (s.id || '').slice(0, 8);
+        sid.title = s.id || '';
+        sid.style.cssText = 'float:right;opacity:0.5;font-family:monospace;font-size:10px;';
+        time.appendChild(sid);
+        const preview = document.createElement('span');
+        preview.className = 'sess-preview';
+        preview.textContent = s.name || s.preview || (s.taskRoom ? s.taskRoom : '(empty)');
+        btn.appendChild(time);
+        btn.appendChild(preview);
+        const subText = s.lastMessage || (s.name ? s.preview : '');
+        if (subText && subText !== preview.textContent) {
+          const sub = document.createElement('span');
+          sub.className = 'sess-sub';
+          sub.textContent = subText;
+          btn.appendChild(sub);
+        }
+        btn.onclick = () => enterRoom(s.id, s.id);
+        const edit = document.createElement('span');
+        edit.className = 'sess-edit';
+        edit.textContent = '✎';
+        edit.title = 'Rename room';
+        edit.onclick = async (e) => {
+          e.stopPropagation();
+          const name = prompt('Room name:', s.name || '');
+          if (name === null) return;
+          try {
+            await fetch(`${API_BASE}/sessions/${s.id}/name`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name })
+            });
+            loadSessions();
+          } catch { showToast('Rename failed', 'error'); }
+        };
+        row.appendChild(btn);
+        if (s.active) {
+          const live = document.createElement('span');
+          live.className = 'sess-live';
+          live.style.cssText = 'flex:0 0 auto;margin:0 4px;display:inline-flex;align-items:center;';
+          if (s.busy) {
+            const sp = document.createElement('span');
+            sp.className = 'spinner spinner-sm';
+            live.appendChild(sp);
+            live.title = 'Active — running now';
+          } else {
+            live.textContent = '●';                 // green dot = live room
+            live.style.color = '#22c55e';
+            live.style.fontSize = '22px';
+            live.style.lineHeight = '1';
+            live.title = s.viewers
+              ? `Active — ${s.viewers} device(s) connected`
+              : 'Active — running in background';
+          }
+          row.appendChild(live);
+        }
+        const del = document.createElement('span');
+        del.className = 'sess-edit';
+        del.textContent = '🗑';
+        del.title = 'Delete room';
+        del.style.cssText = 'cursor:pointer;flex:0 0 auto;margin-left:2px;opacity:0.7;';
+        del.onclick = async (e) => {
+          e.stopPropagation();
+          if (!confirm('Delete this room and its entire conversation history? This cannot be undone.')) return;
+          try {
+            const r = await fetch(`${API_BASE}/sessions/${s.id}`, { method: 'DELETE' });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { showToast(d.error || 'Delete failed', 'error'); return; }
+            if (s.id === currentSessionId) newSession();
+            loadSessions();
+            showToast('Room deleted', 'success');
+          } catch { showToast('Delete failed', 'error'); }
+        };
+        row.appendChild(edit);
+        row.appendChild(del);
+        return row;
+      };
+      // Autonomy per-task/pool rooms are kept OUT of the main list and tucked into
+      // a collapsible "Task rooms" section so they never flood the dropdown.
+      const taskRooms = data.sessions.filter(s => s.taskRoom);
+      const normal    = data.sessions.filter(s => !s.taskRoom);
+      for (const s of normal) sessionList.appendChild(makeRow(s));
+      if (taskRooms.length) {
+        const toggle = document.createElement('button');
+        toggle.className = 'sess-new';
+        toggle.style.opacity = '0.85';
+        const box = document.createElement('div');
+        box.style.display = 'none';
+        let built = false;
+        const setLabel = (open) => { toggle.textContent = `${open ? '▾' : '▸'} Task rooms (${taskRooms.length})`; };
+        setLabel(false);
+        toggle.onclick = () => {
+          const open = box.style.display === 'none';
+          box.style.display = open ? 'block' : 'none';
+          setLabel(open);
+          if (open && !built) { for (const s of taskRooms) box.appendChild(makeRow(s)); built = true; }
+        };
+        sessionList.appendChild(toggle);
+        sessionList.appendChild(box);
+      }
+      updateTitlebar();
+    } catch {
+      const empty = document.createElement('div');
+      empty.className = 'sess-empty';
+      empty.textContent = 'Failed to load rooms';
+      sessionList.appendChild(empty);
+    }
+  }

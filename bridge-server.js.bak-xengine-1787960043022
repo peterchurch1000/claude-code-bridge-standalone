@@ -1,0 +1,2656 @@
+const express = require('express');
+const { WebSocketServer, WebSocket } = require('ws');
+const { spawn, execFile, execFileSync } = require('child_process');
+const path = require('path');
+const http = require('http');
+const os = require('os');
+const fs = require('fs');
+
+  const BRIDGE_PORT  = parseInt(process.env.BRIDGE_PORT  || '3467');
+  const NOVNC_URL    = process.env.NOVNC_URL   ||
+  'https://claude-bridge.procyss-automation.com/vnc';
+  const NOVNC_WEB    = process.env.NOVNC_WEB   || '/usr/share/novnc';
+  const NOVNC_PORT   = parseInt(process.env.NOVNC_PORT   || '6093');
+  const CLAUDE_CWD   = process.env.CLAUDE_CWD  || __dirname;
+  const MCP_PORT     = parseInt(process.env.MCP_PORT || '8931');
+  // Per-room browser shim: when SHIM_PORT is set, each room's Claude is pointed at
+  // http://localhost:<SHIM_PORT>/mcp/<roomKey> (via --mcp-config --strict-mcp-config)
+  // so it drives its own tab in the shared Chrome. Unset => classic single-tab
+  // behaviour (Claude uses the global playwright MCP from settings.json). No-op in prod.
+  // Falls back to ~/.claude/shim-port so a tenant can be flipped by writing one file
+  // (no start.sh edit / full restart needed — the per-user watchdog picks it up).
+  let SHIM_PORT      = process.env.SHIM_PORT ? parseInt(process.env.SHIM_PORT) : null;
+  if (!SHIM_PORT) {
+    try {
+      const _sp = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'shim-port'), 'utf8').trim();
+      if (_sp) SHIM_PORT = parseInt(_sp);
+    } catch {}
+  }
+  // Blip recovery: when RESUME_TURNS is enabled, each in-flight user turn is
+  // journalled to disk so a bridge-server restart (a "blip") can re-inject the
+  // dropped turn against the resumed session instead of silently losing the
+  // half-generated answer. Off unless RESUME_TURNS=1 (env or ~/.claude/resume-turns).
+  // Mirrors the SHIM_PORT gate — zero behaviour change when unset.
+  let RESUME_TURNS = process.env.RESUME_TURNS === '1';
+  if (!RESUME_TURNS) {
+    try {
+      const _rt = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'resume-turns'), 'utf8').trim();
+      if (_rt === '1') RESUME_TURNS = true;
+    } catch {}
+  }
+  // Per-room isolated browsers (task 190): each room drives its OWN Chrome+noVNC+MCP
+  // stack (own persistent profile on disk) instead of the shared-Chrome shim. Gated
+  // per-user by ~/.claude/per-room-browsers (or PER_ROOM_BROWSERS=1). When off,
+  // roomStack stays null and every code path below falls back to the exact prior
+  // behaviour (shim/global MCP + shared noVNC), so tenants without the flag are
+  // byte-for-byte unaffected. The require is wrapped: a broken module cannot stop
+  // the server booting — it just disables the feature.
+  let PER_ROOM = process.env.PER_ROOM_BROWSERS === '1';
+  if (!PER_ROOM) {
+    try {
+      const _pr = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'per-room-browsers'), 'utf8').trim();
+      if (_pr === '1') PER_ROOM = true;
+    } catch {}
+  }
+  let roomStack = null;
+  if (PER_ROOM) {
+    try {
+      roomStack = require(path.join(process.env.HOME || os.homedir(), 'room-browser', 'room-stack.js'));
+      console.log('[Bridge] Per-room isolated browsers ENABLED');
+    } catch (e) { console.error('[Bridge] room-stack load failed (feature disabled):', e.message); roomStack = null; }
+  }
+  // Per-room live viewer (task 190): when a roomview relay port is configured
+  // (ROOMVIEW_PORT env or ~/.claude/roomview-port), the pane streams each room's
+  // own browser window via /roomview -> relay /view/<room>. Unset => classic noVNC.
+  let ROOMVIEW_PORT = process.env.ROOMVIEW_PORT || '';
+  if (!ROOMVIEW_PORT) {
+    try { ROOMVIEW_PORT = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'roomview-port'), 'utf8').trim(); } catch {}
+  }
+  const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-8';
+  // LLM engine for this tenant: 'claude' (default) or 'codex'. Unset => the bridge
+  // behaves EXACTLY as before (Claude), so live panes are unaffected. Flip one pane
+  // with the ENGINE env var or by writing 'codex' into ~/.claude/engine.
+  let ENGINE = (process.env.ENGINE || '').trim().toLowerCase();
+  if (!ENGINE) { try { ENGINE = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'engine'), 'utf8').trim().toLowerCase(); } catch {} }
+  if (ENGINE !== 'codex') ENGINE = 'claude';
+  console.log('[Bridge] LLM engine:', ENGINE);
+  const BASE_PATH    = (process.env.BASE_PATH || '').replace(/\/$/, '');
+  const CHAT_DB_PATH = process.env.CHAT_DB || path.join(__dirname, 'chat.db');
+
+const app = express();
+app.use(express.json({ limit: '12mb' })); // task #237: base64 image uploads via task proxy
+  // Serve noVNC static files at /vnc so the iframe works without a separate proxy
+app.use('/vnc', express.static(NOVNC_WEB));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('/config.js', (req, res) => {
+  res.type('application/javascript');
+  res.send(`window.BRIDGE_CONFIG = ${JSON.stringify({ novncUrl: NOVNC_URL, basePath: BASE_PATH, perRoomBrowsers: !!roomStack, roomViewer: !!ROOMVIEW_PORT })};`);
+});
+
+app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// [ROOMTABS_V1] Per-room tab-health diagnostic + live screenshot for Settings > Room
+// browser health. The room-view relay binds localhost only (reachable from here, not
+// from the client), so proxy its /roomtabs (JSON) and /shot (JPEG) through the bridge.
+app.get('/roomtabs', async (req, res) => {
+  if (!ROOMVIEW_PORT) return res.json({ error: 'roomview off', tabs: [], orphans: [], multiRoom: [], counts: {} });
+  try {
+    const room = req.query.room ? String(req.query.room) : '';
+    const r = await fetch(`http://127.0.0.1:${ROOMVIEW_PORT}/roomtabs?room=${encodeURIComponent(room)}`);
+    res.set('Cache-Control', 'no-store');
+    res.status(r.status).type('application/json').send(await r.text());
+  } catch (e) { res.status(502).json({ error: String(e && e.message || e) }); }
+});
+app.get('/roomshot', (req, res) => {
+  if (!ROOMVIEW_PORT) return res.status(404).end();
+  const room = req.query.room ? String(req.query.room) : '';
+  const preq = http.get(`http://127.0.0.1:${ROOMVIEW_PORT}/shot?room=${encodeURIComponent(room)}`, (pr) => {
+    res.set('Cache-Control', 'no-store'); res.status(pr.statusCode || 200);
+    if (pr.headers['content-type']) res.set('Content-Type', pr.headers['content-type']);
+    pr.pipe(res);
+  });
+  preq.on('error', () => { try { res.status(502).end(); } catch {} });
+  preq.setTimeout(4000, () => { preq.destroy(); try { res.status(504).end(); } catch {} });
+});
+
+// ── Per-room background colour: recent-colours store (shared across this user's browsers) ──
+const ROOMBG_RECENTS_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'roombg-recents.json');
+app.get('/roombg/recents', (req, res) => {
+  try { const a = JSON.parse(fs.readFileSync(ROOMBG_RECENTS_FILE, 'utf8')); res.json(Array.isArray(a) ? a : []); }
+  catch { res.json([]); }
+});
+app.post('/roombg/recents', (req, res) => {
+  const seen = new Set();
+  const colors = ((req.body && Array.isArray(req.body.colors)) ? req.body.colors : [])
+    .filter(c => typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.test(c))
+    .map(c => c.toLowerCase())
+    .filter(c => (seen.has(c) ? false : (seen.add(c), true)))
+    .slice(0, 12);
+  try { fs.writeFileSync(ROOMBG_RECENTS_FILE, JSON.stringify(colors)); res.json({ ok: true, colors }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// [INFRA_HEALTH_V1] Serve the daily infra-health snapshot for Settings > Infra Health.
+// infra-health-check.sh (cron, 04:00 BA) writes ~/.claude/autonomy/infra-health-status.json
+// (latest per-check snapshot) + appends infra-health-history.jsonl (one line per run).
+app.get('/infra-health', (req, res) => {
+  const dir = path.join(process.env.HOME || os.homedir(), '.claude', 'autonomy');
+  let status = null, history = [];
+  try { status = JSON.parse(fs.readFileSync(path.join(dir, 'infra-health-status.json'), 'utf8')); } catch {}
+  try {
+    const lines = fs.readFileSync(path.join(dir, 'infra-health-history.jsonl'), 'utf8').trim().split('\n').filter(Boolean);
+    history = lines.slice(-30).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean).reverse();
+  } catch {}
+  res.json({ status, history });
+});
+
+// ── Task panel: list/create/update/delete tasks in ~/workspace/tasks/ ─────────
+// Each task is a markdown file with YAML-ish frontmatter. Tasks are per-user
+// because each bridge process runs with a different HOME (bridge-peter/roy/john).
+const TASKS_DIR = path.join(os.homedir(), 'workspace', 'tasks');
+try { fs.mkdirSync(TASKS_DIR, { recursive: true }); } catch {}
+
+function parseTaskFile(full) {
+  let raw;
+  try { raw = fs.readFileSync(full, 'utf8'); } catch { return null; }
+  const fm = {};
+  const m = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (m) {
+    for (const line of m[1].split('\n')) {
+      const kv = line.match(/^([a-zA-Z_]+):\s*(.*)$/);
+      if (kv) fm[kv[1]] = kv[2].trim();
+    }
+  }
+  let notes = '';
+  const nm = raw.match(/##\s*Notes[^\n]*\n([\s\S]*?)(?:\n##\s|\s*$)/);
+  if (nm) notes = nm[1].replace(/<!--[\s\S]*?-->/g, '').trim();
+  let plan = '';
+  const pm = raw.match(/##\s*Plan[^\n]*\n([\s\S]*?)(?:\n##\s|\s*$)/);
+  if (pm) plan = pm[1].replace(/<!--[\s\S]*?-->/g, '').trim();
+  let description = '';
+  const dm = raw.match(/##\s*Task \(as entered\)[^\n]*\n([\s\S]*?)(?:\n##\s|\s*$)/);
+  if (dm) description = dm[1].replace(/<!--[\s\S]*?-->/g, '').trim();
+  let objective = '';
+  const osec = raw.match(/##\s*Objective[^\n]*\n([\s\S]*?)(?:\n##\s|\s*$)/);
+  if (osec) objective = osec[1].replace(/<!--[\s\S]*?-->/g, '').trim();
+  if (!objective) {
+    const om = description.match(/^\s*OBJECTIVE:\s*(.+)$/im);
+    if (om) objective = om[1].trim();
+  }
+  return {
+    file: path.basename(full),
+    id: fm.id || '',
+    title: isJunkTitle(fm.title) ? titleFromSlug(path.basename(full)) : fm.title,
+    status: (fm.status || 'new').toLowerCase(),
+    objective_clarity: (fm.objective_clarity || 'unknown').toLowerCase(),
+    updated: fm.updated || '',
+    session: (fm.session && fm.session.toLowerCase() !== 'unknown') ? fm.session : '',
+    area: fm.area || '', type: fm.type || '', person: fm.person || '',
+    duration: fm.duration || '', priority: fm.priority || '', project: fm.project || '',
+    scheduled: fm.scheduled || '', order: fm.order || '', queued: fm.queued || '', queued_autonomous: fm.queued_autonomous || '', requires_desktop: fm.requires_desktop || '', completed_at: fm.completed_at || '',
+    notes, plan,
+    description, objective, location: full,
+  };
+}
+function setFm(content, key, value) {
+  const line = `${key}: ${value}`;
+  const re = new RegExp(`^${key}:.*$`, 'm');
+  if (re.test(content)) return content.replace(re, line);
+  if (/^title:.*$/m.test(content)) return content.replace(/^(title:.*)$/m, `$1\n${line}`);
+  return content.replace(/^---\n/, `---\n${line}\n`);
+}
+const JUNK_TITLE_RE = /(hit your (session|usage) limit|session limit|usage limit|rate limit|resets?\s*\d|try again (later|in)|temporarily unavailable|overloaded|service unavailable|api error|context.{0,20}exceeded)/i;
+function isJunkTitle(s) { const t = String(s || '').trim(); return !t || JUNK_TITLE_RE.test(t); }
+function titleFromSlug(file) {
+  const m = String(file).match(/^task-\d+-(.+)\.md$/);
+  const slug = (m ? m[1] : String(file).replace(/\.md$/, '')).replace(/-/g, ' ').trim();
+  return slug ? slug.charAt(0).toUpperCase() + slug.slice(1) : 'Untitled task';
+}
+
+// --- Bridge task store: MariaDB via Laravel API (flag-gated per pane) -------
+// If ~/.claude/bridge-task-jwt exists for THIS pane, its task panel reads/writes
+// the shared MariaDB `tasks` table through the Laravel bridge API instead of the
+// local .md files. Without the file every /tasks route falls through to the
+// original file-based handlers below (other panes unchanged). Reversible: delete
+// the JWT file to revert instantly. [BRIDGE_TASK_PROXY_V1]
+const BRIDGE_TASK_JWT_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-task-jwt');
+const BRIDGE_TASK_API = (process.env.BRIDGE_TASK_API || 'http://127.0.0.1:8000/api/bridge/tasks').replace(/\/$/, '');
+function bridgeTaskJwt() {
+  try { return fs.readFileSync(BRIDGE_TASK_JWT_FILE, 'utf8').trim(); } catch { return ''; }
+}
+// [PENDING_DRAFT_BADGE_V1] Fold autonomy-loop outbox drafts into the task list.
+// The loop queues email drafts + WhatsApp-to-self messages under
+// ~/.claude/autonomy/outbox/{drafts,whatsapp}/<id>.json (task_key = task file minus
+// .md). Drained items move to a done/ subfolder, so anything still in the top-level
+// folder whose status is not "done" is awaiting Peter. Each task gets a
+// `pending_draft` field ('', 'email', 'whatsapp', 'both') the panel renders as a glyph.
+const OUTBOX_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'autonomy', 'outbox');
+function pendingDraftsByTask() {
+  const map = {};
+  const scan = (kind, sub) => {
+    let files = [];
+    try { files = fs.readdirSync(path.join(OUTBOX_DIR, sub)).filter(f => f.endsWith('.json')); } catch { return; }
+    for (const f of files) {
+      try {
+        const o = JSON.parse(fs.readFileSync(path.join(OUTBOX_DIR, sub, f), 'utf8'));
+        if (!o || !o.task_key) continue;
+        if (String(o.status || '').toLowerCase() === 'done') continue;
+        const key = (String(o.task_key).match(/^(task-\d+)/) || [])[1];
+        if (!key) continue;
+        (map[key] = map[key] || {})[kind] = true;
+      } catch {}
+    }
+  };
+  scan('email', 'drafts');
+  scan('whatsapp', 'whatsapp');
+  return map;
+}
+
+// [RUN_NOW_V1] Submit & Run: fire ONE immediate autonomy turn on this task so a
+// freshly-answered question is acted on within ~1 min instead of waiting for the
+// 15-min usage-pacing cron. Registered BEFORE the /tasks proxy so it is not
+// forwarded to the Laravel task API. Spawns ~/run-now.sh detached and returns at
+// once; that script picks a spare-quota account and runs the actuator (graceful
+// no-op if no account has quota or the loop is not armed).
+app.post('/tasks/:file/run-now', (req, res) => {
+  const file = path.basename(String(req.params.file || ''));
+  if (!/^task-[\w.-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file' });
+  try {
+    const home = process.env.HOME || os.homedir();
+    const child = require('child_process').spawn('/bin/bash', [path.join(home, 'run-now.sh'), file], {
+      detached: true, stdio: 'ignore', env: process.env,
+    });
+    child.unref();
+    return res.json({ ok: true, file });
+  } catch (e) {
+    console.error('[run-now]', e && e.message);
+    return res.status(500).json({ error: 'failed to launch run-now' });
+  }
+});
+
+app.use('/tasks', async (req, res, next) => {
+  const jwt = bridgeTaskJwt();
+  if (!jwt) return next();                         // file-based fallback
+  try {
+    const sub = (req.url === '/' ? '' : req.url);   // Express strips the mount path
+    const target = BRIDGE_TASK_API + sub;
+    const method = req.method.toUpperCase();
+    const opts = { method, headers: { Authorization: 'Bearer ' + jwt } };
+    if (!['GET', 'HEAD', 'DELETE'].includes(method)) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(req.body || {});
+    }
+    const up = await fetch(target, opts);
+    const text = await up.text();
+    const ct = up.headers.get('content-type');
+    // [PENDING_DRAFT_BADGE_V1] Annotate the task list with outbox draft flags.
+    if (method === 'GET' && sub === '' && up.ok && ct && ct.includes('application/json')) {
+      try {
+        const data = JSON.parse(text);
+        if (data && Array.isArray(data.tasks)) {
+          const dmap = pendingDraftsByTask();
+          for (const t of data.tasks) {
+            const p = dmap[(String(t.file || '').match(/^(task-\d+)/) || [])[1]];
+            t.pending_draft = p ? (p.email && p.whatsapp ? 'both' : (p.email ? 'email' : 'whatsapp')) : '';
+          }
+          res.status(up.status).set('Content-Type', ct);
+          return res.send(JSON.stringify(data));
+        }
+      } catch {}
+    }
+    res.status(up.status);
+    if (ct) res.set('Content-Type', ct);
+    return res.send(text);
+  } catch (e) {
+    console.error('[bridge-task-proxy]', e && e.message);
+    return res.status(502).json({ error: 'bridge task api unreachable' });
+  }
+});
+
+// Read-only raw .md of one task (Notes + Plan + Loop Log). The panel task
+// list is proxied to MariaDB which does NOT hold the Loop Log, so this route
+// always reads the actual file to expose the autonomous loop's journal. [TASKFILE_VIEWER_V1]
+app.get('/taskfile/:file', (req, res) => {
+  const file = path.basename(String(req.params.file || ''));
+  if (!/^task-[\w.-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file' });
+  let content;
+  try { content = fs.readFileSync(path.join(TASKS_DIR, file), 'utf8'); }
+  catch { return res.status(404).json({ error: 'not found' }); }
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  return res.send(content);
+});
+
+app.get('/tasks', (req, res) => {
+  let files = [];
+  try { files = fs.readdirSync(TASKS_DIR).filter(f => f.endsWith('.md') && !f.endsWith('.bak')); }
+  catch { return res.json({ tasks: [] }); }
+  const tasks = files.map(f => parseTaskFile(path.join(TASKS_DIR, f))).filter(Boolean);
+  const rank = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3, 'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
+  const ord = t => { const n = parseInt(t.order, 10); return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n; };
+  tasks.sort((a, b) => ord(a) - ord(b) || (rank[a.status] ?? 5) - (rank[b.status] ?? 5) ||
+    String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  res.json({ tasks });
+});
+
+app.post('/tasks', (req, res) => {
+  const title = String((req.body && req.body.title) || '').replace(/[\r\n]+/g, ' ').trim();
+  const description = String((req.body && req.body.description) || '').trim();
+  if (isJunkTitle(title)) return res.status(400).json({ error: 'title is empty or looks like an error message' });
+  try { fs.mkdirSync(TASKS_DIR, { recursive: true }); } catch {}
+  let maxId = 0;
+  try { for (const f of fs.readdirSync(TASKS_DIR)) { const t = f.match(/^task-(\d+)-/); if (t) maxId = Math.max(maxId, parseInt(t[1], 10)); } } catch {}
+  const id = String(maxId + 1).padStart(3, '0');
+  const slug = (title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40)) || 'task';
+  const file = `task-${id}-${slug}.md`;
+  // Local calendar date (avoids the UTC off-by-one for UTC-3 / Buenos Aires).
+  const _d = new Date();
+  const today = new Date(_d.getTime() - _d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  // Honor optional fields so a task can be created already scheduled forward
+  // (e.g. follow-up in 6 months). Previously these were dropped and scheduled
+  // was always today, so scheduled-forward tasks wrongly showed as pending.
+  const b = req.body || {};
+  const clean = v => String(v == null ? '' : v).replace(/[\r\n]+/g, ' ').trim();
+  const sRaw = clean(b.scheduled);
+  const scheduled = /^\d{4}-\d{2}-\d{2}$/.test(sRaw) ? sRaw : today;
+  const area = clean(b.area);
+  const priority = /^[0123]$/.test(clean(b.priority)) ? clean(b.priority) : '';
+  const duration = /^\d+$/.test(clean(b.duration)) ? clean(b.duration) : '';
+  const project = clean(b.project);
+  const content = `---\nid: ${id}\ntitle: ${title}\nstatus: new\nobjective_clarity: unknown\nupdated: ${today}\nscheduled: ${scheduled}\npriority: ${priority}\narea: ${area}\ntype:\nperson:\nduration: ${duration}\nproject: ${project}\norder:\ncompleted_at:\n---\n\n## Task (as entered)\n\n${description || '(no description provided)'}\n\n## Notes — Objective\n\n<!-- The loop fills this in. -->\n\n## Plan\n\n<!-- Step 2. -->\n\n## Loop Log\n`;
+  try { fs.writeFileSync(path.join(TASKS_DIR, file), content); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file, id, title, scheduled });
+});
+
+const VALID_STATUS = ['new', 'needs-clarification', 'objective-clear', 'planned', 'approved', 'in-progress', 'blocked', 'done'];
+app.post('/tasks/:file/status', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const status = String((req.body && req.body.status) || '').toLowerCase();
+  if (!VALID_STATUS.includes(status)) return res.status(400).json({ error: 'invalid status' });
+  const full = path.join(TASKS_DIR, file);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'task not found' });
+  let content;
+  try { content = fs.readFileSync(full, 'utf8'); } catch (e) { return res.status(500).json({ error: e.message }); }
+  const today = new Date().toISOString().slice(0, 10);
+  content = content.replace(/^status:.*$/m, 'status: ' + status);
+  content = content.replace(/^updated:.*$/m, 'updated: ' + today);
+  content = setFm(content, 'completed_at', status === 'done' ? new Date().toISOString() : '');
+  content = content.replace(/\s*$/, '') + `\n- ${today}: status set to \`${status}\` (manual, via UI).\n`;
+  try { fs.writeFileSync(full, content); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file, status });
+});
+
+app.post('/tasks/:file/session', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const sessionId = String((req.body && req.body.sessionId) || '').trim();
+  if (!/^[a-zA-Z0-9_-]{6,64}$/.test(sessionId)) return res.status(400).json({ error: 'invalid sessionId' });
+  const full = path.join(TASKS_DIR, file);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'task not found' });
+  let content;
+  try { content = fs.readFileSync(full, 'utf8'); } catch (e) { return res.status(500).json({ error: e.message }); }
+  if (/^session:.*$/m.test(content)) content = content.replace(/^session:.*$/m, 'session: ' + sessionId);
+  else if (/^title:.*$/m.test(content)) content = content.replace(/^(title:.*)$/m, `$1\nsession: ${sessionId}`);
+  else content = content.replace(/^---\n/, `---\nsession: ${sessionId}\n`);
+  try { fs.writeFileSync(full, content); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file, session: sessionId });
+});
+
+const UPDATABLE_FIELDS = ['area', 'type', 'person', 'duration', 'priority', 'project', 'scheduled', 'order', 'queued', 'queued_autonomous', 'requires_desktop'];
+app.post('/tasks/:file/update', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const fields = (req.body && req.body.fields) || {};
+  const full = path.join(TASKS_DIR, file);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'task not found' });
+  let content;
+  try { content = fs.readFileSync(full, 'utf8'); } catch (e) { return res.status(500).json({ error: e.message }); }
+  let changed = 0;
+  for (const [k, v] of Object.entries(fields)) {
+    if (!UPDATABLE_FIELDS.includes(k)) continue;
+    content = setFm(content, k, String(v == null ? '' : v).replace(/[\r\n]+/g, ' ').trim());
+    changed++;
+  }
+  if (!changed) return res.status(400).json({ error: 'no updatable fields' });
+  content = setFm(content, 'updated', new Date().toISOString().slice(0, 10));
+  try { fs.writeFileSync(full, content); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file });
+});
+
+app.post('/tasks/:file/reorder', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const move = String((req.body && req.body.move) || '');
+  if (!['top', 'up', 'down', 'bottom'].includes(move)) return res.status(400).json({ error: 'bad move' });
+  let files;
+  try { files = fs.readdirSync(TASKS_DIR).filter(f => f.endsWith('.md') && !f.endsWith('.bak')); }
+  catch { return res.status(404).json({ error: 'no tasks' }); }
+  const rank = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3, 'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
+  const ord = t => { const n = parseInt(t.order, 10); return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n; };
+  const tasks = files.map(f => parseTaskFile(path.join(TASKS_DIR, f))).filter(Boolean)
+    .sort((a, b) => ord(a) - ord(b) || (rank[a.status] ?? 5) - (rank[b.status] ?? 5) ||
+      String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
+  const idx = tasks.findIndex(t => t.file === file);
+  if (idx < 0) return res.status(404).json({ error: 'task not found' });
+  const [moved] = tasks.splice(idx, 1);
+  let ni = idx;
+  if (move === 'top') ni = 0; else if (move === 'bottom') ni = tasks.length;
+  else if (move === 'up') ni = Math.max(0, idx - 1); else if (move === 'down') ni = Math.min(tasks.length, idx + 1);
+  tasks.splice(ni, 0, moved);
+  const errs = [];
+  tasks.forEach((t, i) => {
+    const full = path.join(TASKS_DIR, t.file);
+    try { fs.writeFileSync(full, setFm(fs.readFileSync(full, 'utf8'), 'order', String(i))); }
+    catch { errs.push(t.file); }
+  });
+  if (errs.length) return res.status(500).json({ error: 'reorder write failed: ' + errs.join(',') });
+  res.json({ ok: true, file, move });
+});
+
+app.delete('/tasks/:file', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const full = path.join(TASKS_DIR, file);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'task not found' });
+  try { fs.unlinkSync(full); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file });
+});
+
+app.post('/tasks/:file/title', (req, res) => {
+  const file = String(req.params.file || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
+  const title = String((req.body && req.body.title) || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 120);
+  if (isJunkTitle(title)) return res.status(400).json({ error: 'invalid title' });
+  const full = path.join(TASKS_DIR, file);
+  if (!fs.existsSync(full)) return res.status(404).json({ error: 'task not found' });
+  let content;
+  try { content = fs.readFileSync(full, 'utf8'); } catch (e) { return res.status(500).json({ error: e.message }); }
+  content = setFm(content, 'title', title);
+  content = setFm(content, 'updated', new Date().toISOString().slice(0, 10));
+  try { fs.writeFileSync(full, content); } catch (e) { return res.status(500).json({ error: e.message }); }
+  res.json({ ok: true, file, title });
+});
+
+// ── Auto-compaction ────────────────────────────────────────────────────────────
+// Compact once token occupancy crosses the threshold; absolute token budget wins
+// over the % fallback. Set both to 0 to disable.
+const AUTO_COMPACT_TOKENS = parseInt(process.env.AUTO_COMPACT_TOKENS || '100000', 10);
+const AUTO_COMPACT_PCT = parseInt(process.env.AUTO_COMPACT_PCT || '50', 10);
+const AUTO_COMPACT_COOLDOWN_MS = parseInt(process.env.AUTO_COMPACT_COOLDOWN_MS || '120000', 10);
+
+// ── Chat history persistence (file-based, no compilation required) ──────────
+let chatData = {};
+try {
+  if (fs.existsSync(CHAT_DB_PATH)) {
+    chatData = JSON.parse(fs.readFileSync(CHAT_DB_PATH, 'utf8'));
+  }
+} catch (e) {
+  // Likely a stale legacy SQLite chat.db baked into the image — discard it and
+  // start fresh so the file is rewritten as JSON on the next save.
+  console.warn(`Resetting unreadable chat history (${e.message})`);
+  chatData = {};
+  try { fs.unlinkSync(CHAT_DB_PATH); } catch (_) {}
+}
+
+function saveChatData() {
+  try {
+    fs.writeFileSync(CHAT_DB_PATH, JSON.stringify(chatData, null, 2));
+  } catch (e) {
+    console.warn(`Failed to save chat history: ${e.message}`);
+  }
+}
+
+// Claude's own transcripts (~/.claude/projects/<cwd-dashes>/<id>.jsonl) are the
+// persisted source of truth and survive container recreation. The bridge's chat.db
+// (UI-history index) does NOT survive `docker compose --force-recreate` unless it
+// lives under a bind-mounted dir, so we surface sessions straight from the
+// transcripts — the menu stays correct even when chat.db is wiped.
+function transcriptsDir() {
+  return path.join(os.homedir(), '.claude', 'projects', CLAUDE_CWD.replace(/\//g, '-'));
+}
+function firstUserText(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(131072);             // first user msg sits near the top
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    for (const line of buf.slice(0, n).toString('utf8').split('\n')) {
+      if (line.indexOf('"role":"user"') === -1) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+          const t = extractText(ev.message.content);
+          if (t) return t.replace(/\s+/g, ' ').trim().slice(0, 80);
+        }
+      } catch {}
+    }
+  } catch {}
+  return '';
+}
+function lastUserText(file) {
+  try {
+    const CHUNK = 524288;                          // final user turn lives in the last 512KB
+    const fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - CHUNK);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    let tail = buf.toString('utf8');
+    if (start > 0) { const nl = tail.indexOf('\n'); if (nl !== -1) tail = tail.slice(nl + 1); }
+    const lines = tail.split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (line.indexOf('"role":"user"') === -1) continue;
+      let ev; try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+        const t = stripPlumbing(extractText(ev.message.content));
+        if (t) return t.replace(/\s+/g, ' ').trim().slice(0, 80);
+      }
+    }
+  } catch {}
+  return '';
+}
+// Register of per-transcript preview/lastMessage keyed by file mtime so the
+// session dropdown never re-reads an unchanged .jsonl (transcripts are append-
+// only + huge, so a blind rescan froze Node ~15s per open). Only changed files
+// are re-parsed; deleted ones are evicted.
+const _sessMetaCache = new Map();
+function listTranscriptSessions() {
+  const out = {};
+  let files = [];
+  try { files = fs.readdirSync(transcriptsDir()).filter(f => f.endsWith('.jsonl')); } catch { return out; }
+  const seen = new Set();
+  for (const f of files) {
+    const id = f.slice(0, -6);
+    seen.add(id);
+    const full = path.join(transcriptsDir(), f);
+    let mt = 0;
+    try { mt = fs.statSync(full).mtimeMs; } catch {}
+    let c = _sessMetaCache.get(id);
+    if (!c || c.mtime !== mt) {
+      c = { mtime: mt, preview: firstUserText(full), lastMessage: lastUserText(full) };
+      _sessMetaCache.set(id, c);
+    }
+    out[id] = { updatedAt: mt, preview: c.preview, lastMessage: c.lastMessage };
+  }
+  for (const id of _sessMetaCache.keys()) if (!seen.has(id)) _sessMetaCache.delete(id);
+  return out;
+}
+// Claude transcripts store message content as either a plain string (simple text
+// turns) or an array of typed blocks. Normalize both so callers never call array
+// methods on a string (which 500s the /history endpoint and blanks the chat box).
+function extractText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(x => x.type === 'text').map(x => x.text).join('');
+  return '';
+}
+// Claude writes context-management plumbing into the transcript as synthetic
+// "user" turns: the /compact (and other slash) command wrappers, their stdout,
+// and the local-command caveat banner. These are not real communications, so we
+// strip the tagged blocks for display — but a single user turn can carry the
+// plumbing AND a genuine instruction appended after it, so we strip the blocks
+// rather than dropping the whole message, preserving any real trailing text.
+function stripPlumbing(t) {
+  return String(t || '')
+    .replace(/<command-name>[\s\S]*?<\/command-name>/g, '')
+    .replace(/<command-message>[\s\S]*?<\/command-message>/g, '')
+    .replace(/<command-args>[\s\S]*?<\/command-args>/g, '')
+    .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, '')
+    .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/g, '')
+    .trim();
+}
+
+// The full, unaltered conversation rebuilt from the transcript .jsonl — every
+// genuine user/assistant turn, with compaction artifacts removed. Compaction is
+// thus invisible to the chatbot: the giant "This session is being continued…"
+// continuation summary (isCompactSummary) and auto-compact status lines are
+// hidden, but no real turn is ever lost. The .jsonl is append-only, so this is
+// the complete record even after the live client trims its own in-memory view.
+function transcriptToMessages(id) {
+  const file = path.join(transcriptsDir(), `${id}.jsonl`);
+  const msgs = [];
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return msgs; }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev.isCompactSummary === true) continue; // drop the continuation summary
+    if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+      const t = stripPlumbing(extractText(ev.message.content));
+      if (t) msgs.push({ type: 'user', text: t });
+    } else if (ev.type === 'assistant' && ev.message && ev.message.content) {
+      const t = extractText(ev.message.content);
+      if (t.trim() && !t.includes('🗜')) msgs.push({ type: 'assistant', text: t });
+    }
+  }
+  return msgs;
+}
+
+// Ordered assistant text bubbles as the UI would have created them: one per
+// assistant event, split on tool_use, consecutive text blocks concatenated.
+function assistantBubblesFromTranscript(id) {
+  const file = path.join(transcriptsDir(), `${id}.jsonl`);
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  const out = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+      let cur = null;
+      for (const b of ev.message.content) {
+        if (b.type === 'text') cur = (cur || '') + b.text;
+        else if (b.type === 'tool_use') { if (cur && cur.trim()) out.push(cur); cur = null; }
+      }
+      if (cur && cur.trim()) out.push(cur);
+    }
+  }
+  return out;
+}
+
+// Legacy client bug saved assistant text that preceded a tool_use as an empty
+// bubble (only the turn's final bubble was persisted), so reloads showed blank
+// thin lines. Backfill those blanks from the transcript at read time — only fill
+// empties, and only when the existing non-empty bubbles still line up by ordinal,
+// so we never reorder or corrupt a conversation.
+function healEmptyAssistantText(id, messages) {
+  const stored = messages.filter(m => m && m.type === 'assistant');
+  if (!stored.some(m => !String(m.text || '').trim())) return messages;
+  const bubbles = assistantBubblesFromTranscript(id);
+  if (!bubbles.length) return messages;
+  for (let i = 0; i < stored.length; i++) {
+    const cur = String(stored[i].text || '').trim();
+    const r = String(bubbles[i] || '').trim();
+    if (cur && r && cur !== r) return messages; // misaligned — leave untouched
+  }
+  let ord = 0;
+  for (const m of messages) {
+    if (m && m.type === 'assistant') {
+      if (!String(m.text || '').trim() && bubbles[ord] != null) m.text = bubbles[ord];
+      ord++;
+    }
+  }
+  return messages;
+}
+
+// Same idea as healEmptyAssistantText but for USER bubbles: a client save bug
+// (and pre-alias session forks) persisted blank user turns. Backfill them from the
+// transcript at read time, ordinal-aligned, bailing if any non-empty entry
+// disagrees so a conversation is never reordered or corrupted.
+function healEmptyUserText(id, messages) {
+  const stored = messages.filter(m => m && m.type === 'user');
+  if (!stored.some(m => !String(m.text || '').trim())) return messages;
+  const tu = transcriptToMessages(id).filter(m => m.type === 'user');
+  if (!tu.length) return messages;
+  for (let i = 0; i < stored.length; i++) {
+    const cur = String(stored[i].text || '').trim();
+    const r = String((tu[i] || {}).text || '').trim();
+    if (cur && r && cur !== r) return messages; // misaligned — leave untouched
+  }
+  let ord = 0;
+  for (const m of messages) {
+    if (m && m.type === 'user') {
+      if (!String(m.text || '').trim() && tu[ord] != null) m.text = tu[ord].text;
+      ord++;
+    }
+  }
+  return messages;
+}
+
+app.get('/history/:sessionId', (req, res) => {
+  const id = req.params.sessionId;
+  const data = chatData[id];
+  const fromTranscript = transcriptToMessages(id);
+  if (data && Array.isArray(data.messages) && data.messages.length) {
+    let healed = healEmptyAssistantText(id, data.messages);
+    healed = healEmptyUserText(id, healed);
+    // The append-only transcript is the complete, unaltered record. If the stored
+    // UI copy is shorter, it was truncated (e.g. a post-compaction client POSTed a
+    // shrunken view) — serve the full transcript so no history ever disappears.
+    if (fromTranscript.length > healed.length) return res.json({ messages: fromTranscript });
+    return res.json({ messages: healed });
+  }
+  // No saved UI history for this id (e.g. after a recreate) — rebuild the bubbles
+  // from the persisted transcript so the conversation still opens in full.
+  res.json({ messages: fromTranscript });
+});
+
+app.post('/history/:sessionId', (req, res) => {
+  try {
+    const msgs = req.body?.messages;
+    if (!Array.isArray(msgs)) return res.status(400).json({ error: 'messages array required' });
+    // Guard against destructive truncation: after a compaction the live client
+    // rebuilds its view from only the post-compaction window and POSTs that back.
+    // A blind replace here is what wiped 525 stored turns down to 4. Never let a
+    // shorter payload overwrite a longer stored history — only grow or match. The
+    // transcript backstops GET regardless, but this keeps the index intact too.
+    const existing = chatData[req.params.sessionId];
+    const prevLen = (existing && Array.isArray(existing.messages)) ? existing.messages.length : 0;
+    if (prevLen > msgs.length) {
+      return res.json({ ok: true, kept: prevLen, ignored: msgs.length, note: 'shrink-ignored' });
+    }
+    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now() };
+    saveChatData();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/history/:sessionId', (req, res) => {
+  try {
+    delete chatData[req.params.sessionId];
+    saveChatData();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Session display names (user-editable labels) ────────────────────
+const SESSION_NAMES_PATH = path.join(os.homedir(), '.claude', 'bridge-session-names.json');
+let sessionNames = {};
+try { if (fs.existsSync(SESSION_NAMES_PATH)) sessionNames = JSON.parse(fs.readFileSync(SESSION_NAMES_PATH, 'utf8')); } catch { sessionNames = {}; }
+function saveSessionNames() {
+  try { fs.writeFileSync(SESSION_NAMES_PATH, JSON.stringify(sessionNames, null, 2)); }
+  catch (e) { console.warn(`Failed to save session names: ${e.message}`); }
+}
+app.post('/sessions/:id/name', (req, res) => {
+  try {
+    const name = (req.body && typeof req.body.name === 'string') ? req.body.name.trim().slice(0, 80) : '';
+    if (name) sessionNames[req.params.id] = name; else delete sessionNames[req.params.id];
+    saveSessionNames();
+    res.json({ ok: true, name });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Archived rooms (user-collapsed into a sub-menu) ──────────────────
+const SESSION_ARCHIVED_PATH = path.join(os.homedir(), '.claude', 'bridge-session-archived.json');
+let archivedSessions = {};
+try { if (fs.existsSync(SESSION_ARCHIVED_PATH)) archivedSessions = JSON.parse(fs.readFileSync(SESSION_ARCHIVED_PATH, 'utf8')); } catch { archivedSessions = {}; }
+function saveArchivedSessions() {
+  try { fs.writeFileSync(SESSION_ARCHIVED_PATH, JSON.stringify(archivedSessions, null, 2)); }
+  catch (e) { console.warn(`Failed to save archived sessions: ${e.message}`); }
+}
+app.post('/sessions/:id/archive', (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    const on = !(req.body && req.body.archived === false);
+    if (on) archivedSessions[id] = true; else delete archivedSessions[id];
+    saveArchivedSessions();
+    res.json({ ok: true, archived: on });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Permanently delete a session: its transcript (removes it from the dropdown),
+// cached history, and saved name. Refuses while a turn is actively running so we
+// never yank a session out from under live work; a live-but-idle room is closed.
+app.delete('/sessions/:id', (req, res) => {
+  try {
+    const id = String(req.params.id || '').replace(/[^A-Za-z0-9._-]/g, '');
+    if (!id) return res.status(400).json({ error: 'Bad session id' });
+    const room = clientSessions.get(id);
+    if (room && room.processing) {
+      return res.status(409).json({ error: 'Session is running — stop it before deleting.' });
+    }
+    if (room) { try { room.killCurrentProc('session deleted'); } catch {} clientSessions.delete(id); }
+    try {
+      const f = path.join(transcriptsDir(), `${id}.jsonl`);
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    } catch (e) { console.warn('[Bridge] transcript unlink failed:', e.message); }
+    if (chatData[id]) { delete chatData[id]; saveChatData(); }
+    if (sessionNames[id]) { delete sessionNames[id]; saveSessionNames(); }
+    if (archivedSessions[id]) { delete archivedSessions[id]; saveArchivedSessions(); }
+    console.log('[Bridge] Session deleted:', id);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Claude Code re-authentication (per-user, self-service) ───────────────────
+// Runs `claude setup-token` under a PTY (util-linux `script`; node-pty isn't
+// installed), captures the OAuth authorize URL it prints, brokers the manual
+// code paste-back, and saves the resulting 1-year token to
+// ~/.claude/bridge-oauth-token (consumed via CLAUDE_CODE_OAUTH_TOKEN at spawn).
+// Each bridge runs as its own OS user with its own HOME, so this only ever
+// touches the current user's credentials.
+const OAUTH_TOKEN_PATH = path.join(os.homedir(), '.claude', 'bridge-oauth-token');
+let authProc = null, authBuf = '', authUrl = '', authDone = false, authResult = null, authToken = '', authId = '';
+function stripAnsiSeq(s) {
+  return String(s)
+    .replace(/\x1B\[[0-9;?]*[A-Za-z]/g, '')
+    .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+    .replace(/\x1B[()][0-9A-Za-z]/g, '')
+    .replace(/\x1B[=>]/g, '');
+}
+function parseAuthUrl(buf) {
+  const lines = stripAnsiSeq(buf).replace(/\r/g, '\n').split('\n').map(l => l.trim());
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/https:\/\/claude\.com\/cai\/oauth\/authorize\S*/);
+    if (!m) continue;
+    let url = m[0];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nxt = lines[j];
+      if (nxt && !/\s/.test(nxt) && /^[A-Za-z0-9%=&_.:\/-]+$/.test(nxt)) url += nxt; else break;
+    }
+    return url;
+  }
+  return '';
+}
+function scanAuthToken(buf) {
+  const lines = stripAnsiSeq(buf).replace(/\r/g, '\n').split('\n');
+  let best = '';
+  for (const ln of lines) {
+    const m = ln.match(/sk-ant-oat[0-9]*-[A-Za-z0-9_-]{20,}/);
+    if (m && m[0].length > best.length) best = m[0];
+  }
+  return best;
+}
+// Kill leftover `claude auth login` / `setup-token` PTY brokers for THIS user that
+// leaked across a bridge restart or a superseded sign-in. Sign-in is single-flight
+// per HOME, so clearing the field on a fresh start is always safe — and it stops a
+// stale broker (holding a different PKCE verifier) from later mismatching the code.
+function reapStrayBrokers() {
+  try { execFileSync('pkill', ['-u', String(process.getuid()), '-f', 'claude (auth login|setup-token)'], { timeout: 5000 }); } catch (e) {}
+}
+function killAuth() {
+  if (authProc) {
+    try { process.kill(-authProc.pid, 'SIGKILL'); }   // kill the whole PTY group (script + claude)
+    catch { try { authProc.kill('SIGKILL'); } catch {} }
+  }
+  authProc = null;
+}
+app.post('/auth/start', (req, res) => {
+  try {
+    killAuth();
+    authBuf = ''; authUrl = ''; authDone = false; authResult = null; authToken = '';
+    const env = { ...process.env };
+    delete env.DISPLAY;                 // force the manual "copy this URL" mode
+    delete env.CLAUDE_CODE_OAUTH_TOKEN; // don't let an existing token short-circuit login
+    authProc = spawn('script', ['-qfc', 'stty cols 400 rows 60; claude setup-token', '/dev/null'],
+      { env, cwd: os.homedir(), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const onData = d => {
+      authBuf += d.toString('utf8');
+      if (!authUrl) authUrl = parseAuthUrl(authBuf);
+      if (!authToken) authToken = scanAuthToken(authBuf);
+    };
+    authProc.stdout.on('data', onData);
+    authProc.stderr.on('data', onData);
+    authProc.on('exit', () => {
+      authDone = true;
+      if (!authToken) authToken = scanAuthToken(authBuf);
+      if (authToken) {
+        try { fs.writeFileSync(OAUTH_TOKEN_PATH, authToken, { mode: 0o600 }); fs.chmodSync(OAUTH_TOKEN_PATH, 0o600); } catch (e) {}
+      }
+      authResult = authToken
+        ? { ok: true, message: 'Authenticated — credentials saved.' }
+        : { ok: false, message: 'Sign-in did not complete (no token received).' };
+      authProc = null;
+    });
+    let settled = false; const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (settled) return;
+      if (authUrl) { settled = true; clearInterval(iv); res.json({ ok: true, url: authUrl }); }
+      else if (authDone || Date.now() - t0 > 20000) {
+        settled = true; clearInterval(iv); killAuth();
+        res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in URL.' });
+      }
+    }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/auth/code', (req, res) => {
+  try {
+    const code = (req.body && typeof req.body.code === 'string') ? req.body.code.trim() : '';
+    if (!code) return res.status(400).json({ ok: false, error: 'No code provided.' });
+    if (!authProc) return res.status(409).json({ ok: false, error: 'No sign-in in progress — start again.' });
+    const reqId = String((req.body && req.body.authId) || '');
+    if (authId && reqId && reqId !== authId)
+      return res.status(409).json({ ok: false, error: 'This sign-in was superseded by a newer one — close and start again.' });
+    try {
+      /* paste-mode */ // Only use bracketed paste if the CLI enabled it (?2004h);
+      // `claude auth login` does NOT, and the literal markers would corrupt the code.
+      const bracketed = String(authBuf || '').includes('\x1b[?2004h');
+      authProc.stdin.write(bracketed ? ('\x1b[200~' + code + '\x1b[201~') : code);
+      setTimeout(() => { try { authProc && authProc.stdin.write('\r'); } catch {} }, 400);
+    }
+    catch (e) { return res.status(500).json({ ok: false, error: 'Could not submit code: ' + e.message }); }
+    let settled = false; const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (settled) return;
+      if (authDone) {
+        settled = true; clearInterval(iv);
+        res.json(authResult || { ok: !!authToken, message: authToken ? 'Authenticated.' : 'Done.' });
+      } else if (Date.now() - t0 > 30000) {
+        settled = true; clearInterval(iv);
+        res.status(504).json({ ok: false, error: 'Timed out completing sign-in.' });
+      }
+    }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/auth/cancel', (req, res) => { killAuth(); res.json({ ok: true }); });
+
+// ── Add / sign in to a Claude account (front-end brokered) ───────────────────
+// Runs `claude auth login` under a PTY exactly like /auth/start, but this writes
+// ~/.claude/.credentials.json + ~/.claude.json (the files the account switcher
+// uses) — NOT a bridge-oauth-token, so it never re-pins the pane. On success it
+// auto-saves the new account into ~/.claude/accounts/ so it shows up in the
+// switcher. Reuses the shared authProc state, so /auth/code and /auth/cancel
+// drive it too. `name` (optional) is the short alias to store it under.
+const HOME_DIR   = os.homedir();
+const CRED_PATH  = path.join(HOME_DIR, '.claude', '.credentials.json');
+const CJSON_PATH = path.join(HOME_DIR, '.claude.json');
+function currentEmail() {
+  try { return (JSON.parse(fs.readFileSync(CJSON_PATH, 'utf8')).oauthAccount || {}).emailAddress || ''; } catch (e) { return ''; }
+}
+function credMtime() { try { return fs.statSync(CRED_PATH).mtimeMs; } catch (e) { return 0; } }
+function slugFromEmail(email) {
+  return String(email || '').split('@')[0].replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase().slice(0, 24) || 'account';
+}
+// Full-email → filename-safe name tag (used when the user leaves the name blank):
+// keep the whole address, turning @ and . into hyphens. e.g. a@b.com → a-b-com.
+function nameFromEmail(email) {
+  return String(email || '').toLowerCase().replace(/[@.]+/g, '-').replace(/[^a-z0-9_-]/g, '').replace(/^-+|-+$/g, '').slice(0, 40) || 'account';
+}
+app.post('/auth/login', (req, res) => {
+  try {
+    killAuth();
+    reapStrayBrokers();
+    authBuf = ''; authUrl = ''; authDone = false; authResult = null; authToken = '';
+    authId = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    const alias = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
+    const beforeMtime = credMtime();
+    // Keep the outgoing account's refresh token fresh before login overwrites it.
+    try { if (fs.existsSync(SWITCH_SH)) execFileSync(SWITCH_SH, ['--snapshot'], { timeout: 15000 }); } catch (e) {}
+    const env = { ...process.env };
+    delete env.DISPLAY;                 // force the manual "copy this URL" mode
+    delete env.CLAUDE_CODE_OAUTH_TOKEN; // don't let an existing token short-circuit login
+    authProc = spawn('script', ['-qfc', 'stty cols 400 rows 60; claude auth login --claudeai', '/dev/null'],
+      { env, cwd: HOME_DIR, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+    const onData = d => { authBuf += d.toString('utf8'); if (!authUrl) authUrl = parseAuthUrl(authBuf); };
+    authProc.stdout.on('data', onData);
+    authProc.stderr.on('data', onData);
+    authProc.on('exit', () => {
+      authDone = true;
+      const afterEmail = currentEmail();
+      const succeeded = credMtime() > beforeMtime && !!afterEmail;
+      if (succeeded) {
+        const name = alias || nameFromEmail(afterEmail);
+        let saveMsg = '';
+        try { execFileSync(SWITCH_SH, ['--save', name], { timeout: 15000 }); saveMsg = ' — saved as “' + name + '”'; } catch (e) {}
+        authResult = { ok: true, message: 'Signed in as ' + afterEmail + saveMsg + '.' };
+      } else {
+        /* auth-detail */
+        const clean = String(authBuf || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '\n');
+        const lines = clean.split('\n').map(s => s.trim()).filter(Boolean);
+        const fail = [...lines].reverse().find(l => /fail|error|invalid|expired|denied|status code|already/i.test(l));
+        console.error('[auth/login] exit without creds. tail:\n' + lines.slice(-8).join('\n'));
+        authResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : ' (no new credentials saved).') };
+      }
+      authProc = null;
+    });
+    let settled = false; const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (settled) return;
+      if (authUrl) { settled = true; clearInterval(iv); res.json({ ok: true, url: authUrl, authId }); }
+      else if (authDone || Date.now() - t0 > 20000) {
+        settled = true; clearInterval(iv); killAuth();
+        res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in URL.' });
+      }
+    }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Account switcher (rotate this pane between saved Claude accounts) ────────
+const ACCT_DIR  = path.join(os.homedir(), '.claude', 'accounts');
+const SWITCH_SH = path.join(os.homedir(), '.claude', 'switch-account.sh');
+// Codex (ChatGPT/OpenAI) account store — parallel to the Claude one above. Each
+// login is a snapshot ~/.codex/accounts/<name>.auth.json; the active login is
+// ~/.codex/auth.json; codex-switch.sh rotates between them.
+const CODEX_DIR       = path.join(os.homedir(), '.codex');
+const CODEX_ACCT_DIR  = path.join(CODEX_DIR, 'accounts');
+const CODEX_AUTH      = path.join(CODEX_DIR, 'auth.json');
+const CODEX_SWITCH_SH = path.join(CODEX_DIR, 'codex-switch.sh');
+const ENGINE_FILE     = path.join(os.homedir(), '.claude', 'engine');
+// Live engine for this pane, re-read per call so an account switch (which writes
+// the marker) takes effect on the NEXT turn without restarting the pane.
+function currentEngine() {
+  let e = (process.env.ENGINE || '').trim().toLowerCase();
+  if (!e) { try { e = fs.readFileSync(ENGINE_FILE, 'utf8').trim().toLowerCase(); } catch {} }
+  return e === 'codex' ? 'codex' : 'claude';
+}
+function codexEmail(o) {
+  try {
+    const t = ((o.tokens || {}).id_token) || '';
+    if (t) { const pl = JSON.parse(Buffer.from(t.split('.')[1], 'base64url').toString('utf8')); return pl.email || ''; }
+    if (o.OPENAI_API_KEY) return 'api-key';
+  } catch {}
+  return '';
+}
+function codexAcctId(o) { try { return (o.tokens || {}).account_id || ''; } catch { return ''; } }
+function listCodexAccounts() {
+  let activeId = '';
+  try { activeId = codexAcctId(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+  const accounts = [];
+  try {
+    for (const f of fs.readdirSync(CODEX_ACCT_DIR)) {
+      const m = f.match(/^(.+)\.auth\.json$/); if (!m) continue;
+      let o = {}; try { o = JSON.parse(fs.readFileSync(path.join(CODEX_ACCT_DIR, f), 'utf8')); } catch {}
+      accounts.push({ name: m[1], email: codexEmail(o), type: 'codex', active: !!activeId && codexAcctId(o) === activeId });
+    }
+  } catch {}
+  accounts.sort((a, b) => a.name.localeCompare(b.name));
+  return { accounts, enabled: fs.existsSync(CODEX_SWITCH_SH) };
+}
+// Reset-aware view of a stored usage snapshot: a window's percentage is only
+// meaningful until its reset time. Once `resets_at` has passed the window has
+// rolled over, so the account is fully available (0% used) again — otherwise a
+// stale snapshot keeps reporting the old (e.g. 100%) figure long after reset.
+function normalizeUsage(u) {
+  if (!u) return u;
+  const now = Date.now() / 1000;
+  const out = { ...u };
+  if (out.five_hour_resets_at != null && out.five_hour_resets_at <= now) {
+    out.five_hour_pct = 0; out.five_hour_resets_at = null; out.five_hour_reset_expired = true;
+  }
+  if (out.seven_day_resets_at != null && out.seven_day_resets_at <= now) {
+    out.seven_day_pct = 0; out.seven_day_resets_at = null; out.seven_day_reset_expired = true;
+  }
+  return out;
+}
+function listAccounts() {
+  let active = '';
+  try { active = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount || {}).emailAddress || ''; } catch (e) {}
+  const accounts = [];
+  try {
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
+      let email = '';
+      try { email = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).emailAddress || ''; } catch (e) {}
+      let usage = null;
+      try { usage = JSON.parse(fs.readFileSync(path.join(ACCT_DIR, m[1] + '.usage.json'), 'utf8')); } catch (e) {}
+      let expired = null;
+      try {
+        const c = JSON.parse(fs.readFileSync(path.join(ACCT_DIR, m[1] + '.credentials.json'), 'utf8'));
+        const ex = (c && c.claudeAiOauth && c.claudeAiOauth.expiresAt) || (c && c.expiresAt);
+        if (ex) expired = Date.now() >= Number(ex);
+      } catch (e) {}
+      accounts.push({ name: m[1], email, usage: normalizeUsage(usage), expired });
+    }
+  } catch (e) {}
+  accounts.sort((a, b) => a.name.localeCompare(b.name));
+  /* acct-health */ // Tag accounts the hourly refresh cron reported as failing.
+  try {
+    const al = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'account-refresh-alert.json'), 'utf8'));
+    const bad = {}; (al.failing || []).forEach(x => { if (x && x.name) bad[x.name] = x.reason || 'refresh failing'; });
+    for (const a of accounts) { if (bad[a.name]) { a.health = 'fail'; a.healthReason = bad[a.name]; } }
+  } catch (e) {}
+  return { active, accounts, enabled: fs.existsSync(SWITCH_SH) };
+}
+app.get('/accounts', (req, res) => {
+  const base = listAccounts();
+  const codex = listCodexAccounts();
+  // Tag Claude accounts type:'code'; append Codex accounts. Keep top-level `active`
+  // (Claude email) for backward compatibility with the current UI.
+  const accounts = base.accounts.map(a => ({ ...a, type: 'code' })).concat(codex.accounts);
+  res.json({ ok: true, active: base.active, accounts, enabled: base.enabled, codexEnabled: codex.enabled, engine: currentEngine() });
+});
+app.post('/accounts/switch', (req, res) => {
+  const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  const wantType = String((req.body && req.body.type) || '').toLowerCase();
+  if (!name) return res.status(400).json({ ok: false, error: 'Missing account name.' });
+  // Route to the Codex switcher when the caller says type:'codex' or the name is a
+  // stored Codex account. Also drop an engine marker (~/.claude/engine) so the pane
+  // runs the matching backend on its next spawn.
+  let isCodex = wantType === 'codex';
+  if (!isCodex && wantType !== 'code') { try { isCodex = fs.existsSync(path.join(CODEX_ACCT_DIR, name + '.auth.json')); } catch {} }
+  if (isCodex) {
+    if (!fs.existsSync(CODEX_SWITCH_SH)) return res.status(404).json({ ok: false, error: 'Codex switcher not installed.' });
+    return execFile(CODEX_SWITCH_SH, [name], { timeout: 20000, env: { ...process.env, HOME: os.homedir() } }, (err, stdout, stderr) => {
+      const out = ((stdout || '') + (stderr || '')).trim();
+      if (err) return res.status(500).json({ ok: false, error: out || err.message });
+      try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+      const codex = listCodexAccounts();
+      res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'codex', ...listAccounts(), codexAccounts: codex.accounts });
+    });
+  }
+  if (!fs.existsSync(SWITCH_SH)) return res.status(404).json({ ok: false, error: 'Account switcher not installed.' });
+  execFile(SWITCH_SH, [name], { timeout: 20000 }, (err, stdout, stderr) => {
+    const out = ((stdout || '') + (stderr || '')).trim();
+    if (err) return res.status(500).json({ ok: false, error: out || err.message });
+    try { fs.writeFileSync(ENGINE_FILE, 'claude'); } catch {}
+    res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'claude', ...listAccounts() });
+  });
+});
+
+// Rename a stored account's name tag: the name is a pure label (the switcher matches
+// creds by accountUuid), so this just renames the `<name>.*` file trio in ACCT_DIR.
+app.post('/accounts/rename', (req, res) => {
+  const from = String((req.body && req.body.from) || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  const to   = String((req.body && req.body.to)   || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!from || !to) return res.status(400).json({ ok: false, error: 'Missing name.' });
+  if (from === to)  return res.json({ ok: true, ...listAccounts() });
+  try {
+    if (!fs.existsSync(path.join(ACCT_DIR, from + '.account.json')))
+      return res.status(404).json({ ok: false, error: `No account named "${from}".` });
+    if (fs.existsSync(path.join(ACCT_DIR, to + '.account.json')))
+      return res.status(409).json({ ok: false, error: `An account named "${to}" already exists.` });
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      if (f === from + '.account.json' || f.startsWith(from + '.')) {
+        const rest = f.slice(from.length);            // e.g. ".credentials.json"
+        if (rest[0] === '.') fs.renameSync(path.join(ACCT_DIR, f), path.join(ACCT_DIR, to + rest));
+      }
+    }
+    res.json({ ok: true, message: `Renamed "${from}" to "${to}".`, ...listAccounts() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Delete a stored account: removes its `<name>.*` file trio from ACCT_DIR. This
+// only forgets the saved login used by the switcher — it does NOT touch the live
+// ~/.claude/.credentials.json, so we refuse to delete the currently-active account
+// (switch away first) to avoid a confusing orphaned-but-still-running state.
+app.post('/accounts/delete', (req, res) => {
+  const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!name) return res.status(400).json({ ok: false, error: 'Missing account name.' });
+  // Codex account: a saved login is a single `<name>.auth.json` snapshot in
+  // CODEX_ACCT_DIR. Route here when the caller says type:'codex' or the name is a
+  // known Codex snapshot. Refuse to delete the login this pane is actively running.
+  const wantType = String((req.body && req.body.type) || '').toLowerCase();
+  let isCodex = wantType === 'codex';
+  if (!isCodex && wantType !== 'code') { try { isCodex = fs.existsSync(path.join(CODEX_ACCT_DIR, name + '.auth.json')); } catch {} }
+  if (isCodex) {
+    try {
+      const f = path.join(CODEX_ACCT_DIR, name + '.auth.json');
+      if (!fs.existsSync(f)) return res.status(404).json({ ok: false, error: `No Codex account named "${name}".` });
+      let activeId = ''; try { activeId = codexAcctId(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+      let thisId = '';   try { thisId   = codexAcctId(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch {}
+      if (activeId && thisId && activeId === thisId && currentEngine() === 'codex')
+        return res.status(409).json({ ok: false, error: 'That is the Codex login this pane is running on — switch to another account first, then delete it.' });
+      fs.unlinkSync(f);
+      const codex = listCodexAccounts();
+      return res.json({ ok: true, message: `Deleted Codex account "${name}".`, removed: 1, ...listAccounts(), codexAccounts: codex.accounts });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  }
+  try {
+    const acctFile = path.join(ACCT_DIR, name + '.account.json');
+    if (!fs.existsSync(acctFile))
+      return res.status(404).json({ ok: false, error: `No account named "${name}".` });
+    let activeEmail = '';
+    try { activeEmail = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount || {}).emailAddress || ''; } catch (e) {}
+    let thisEmail = '';
+    try { thisEmail = (JSON.parse(fs.readFileSync(acctFile, 'utf8')) || {}).emailAddress || ''; } catch (e) {}
+    if (activeEmail && thisEmail && activeEmail === thisEmail)
+      return res.status(409).json({ ok: false, error: 'That is the account this pane is running on — switch to another account first, then delete it.' });
+    let removed = 0;
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      if (f === name + '.account.json' || (f.startsWith(name + '.') && f.slice(name.length)[0] === '.')) {
+        try { fs.unlinkSync(path.join(ACCT_DIR, f)); removed++; } catch (e) {}
+      }
+    }
+    res.json({ ok: true, message: `Deleted "${name}".`, removed, ...listAccounts() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── Codex (ChatGPT) re-authentication via browser OAuth [CODEX_BROWSER_AUTH_V2] ─
+// The device-code flow (`codex login --device-auth`) yields a REDUCED-scope token
+// (missing api.connectors.read/invoke) that stalls codex_apps/connector calls and
+// hangs every turn. The full browser flow (`codex login`) requests those scopes and
+// redirects to http://localhost:1455/auth/callback on THIS host. We surface the auth
+// URL, let the user sign in in any browser, and paste back the localhost redirect URL
+// they land on; we relay it to codex's local callback server to finish the exchange
+// (full scopes). Same paste-back shape as the Claude flow; state kept separate.
+let cxProc = null, cxBuf = '', cxUrl = '', cxDone = false, cxResult = null, cxName = 'peter';
+let cxStartAuthMtime = 0, cxFinalized = false;
+function killCodexAuth() {
+  if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
+  cxProc = null;
+}
+// Turn a completed `codex login` into a saved account + success result. Runs at most
+// once per sign-in (cxFinalized guard) whether triggered by the process exiting OR by
+// /complete's auth.json watcher (codex 0.144.x writes the token but may not exit).
+function finalizeCodexAuth() {
+  if (cxFinalized) return;
+  cxFinalized = true; cxDone = true;
+  let ok = false, email = '';
+  try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
+  if (ok) {
+    try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
+    try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+    cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' — saved as “' + cxName + '”.' };
+  } else {
+    const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(x => x.trim()).filter(Boolean);
+    const fail = [...clean].reverse().find(l => /fail|error|invalid|expired|denied|cancel|timed? ?out/i.test(l));
+    cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : '.') };
+  }
+}
+function parseCodexAuthUrl(buf) {
+  const s = stripAnsiSeq(buf).replace(/\r/g, '\n');
+  const m = s.match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?\S+/);
+  return m ? m[0].replace(/["'\)\]\s]+$/, '') : '';
+}
+app.post('/codex/auth/start', (req, res) => {
+  try {
+    killCodexAuth();
+    cxBuf = ''; cxUrl = ''; cxDone = false; cxResult = null; cxFinalized = false;
+    try { cxStartAuthMtime = fs.statSync(CODEX_AUTH).mtimeMs; } catch { cxStartAuthMtime = 0; }
+    cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
+    // Full browser flow (NOT --device-auth): grants api.connectors.* scopes. Starts a
+    // local callback server on 127.0.0.1:1455 and prints the auth URL. BROWSER=/bin/true
+    // + no DISPLAY stop codex trying to spawn a local GUI browser.
+    const env = { ...process.env, BROWSER: '/bin/true' }; delete env.DISPLAY;
+    cxProc = spawn('codex', ['login'], { env, cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const onData = d => { cxBuf += d.toString('utf8'); if (!cxUrl) { const u = parseCodexAuthUrl(cxBuf); if (u) cxUrl = u; } };
+    cxProc.stdout.on('data', onData);
+    cxProc.stderr.on('data', onData);
+    cxProc.on('exit', () => { finalizeCodexAuth(); cxProc = null; });
+    let settled = false; const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (settled) return;
+      if (cxUrl) { settled = true; clearInterval(iv); res.json({ ok: true, url: cxUrl }); }
+      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in URL.' }); }
+    }, 300);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Relay the pasted localhost:1455 redirect URL to codex's local callback server so the
+// running `codex login` finishes the token exchange, writes auth.json and exits (the
+// on-exit handler above turns that into a saved account).
+app.post('/codex/auth/complete', (req, res) => {
+  try {
+    if (!cxProc) return res.status(400).json({ ok: false, error: 'No sign-in in progress — click Start again.' });
+    const raw = String((req.body && req.body.url) || '').trim();
+    let relayPath = '';
+    try { const u = new URL(raw); if (u.port === '1455' || u.hostname === 'localhost' || u.hostname === '127.0.0.1') relayPath = u.pathname + u.search; } catch {}
+    if (!relayPath) { const m = raw.match(/(?:^|[?&])code=[^\s#]+/); if (m) relayPath = '/auth/callback?' + raw.replace(/^[?]/, ''); }
+    if (!/[?&]code=/.test(relayPath)) return res.status(400).json({ ok: false, error: 'That is not the localhost:1455 sign-in URL (no code found). Copy the whole address the browser landed on.' });
+    const req2 = require('http').get({ host: '127.0.0.1', port: 1455, path: relayPath, timeout: 10000 }, resp => {
+      resp.resume(); res.json({ ok: true, relayed: true, status: resp.statusCode || 0 });
+      // codex 0.144.x writes auth.json on a successful exchange but may NOT exit (keeps the
+      // 1455 server open), so the on-exit finalizer never fires and the UI hangs on
+      // "Completing…". Watch auth.json for the fresh token and finalize deterministically.
+      let tries = 0;
+      const w = setInterval(() => {
+        if (cxFinalized) { clearInterval(w); return; }
+        let mt = 0, ok = false;
+        try { mt = fs.statSync(CODEX_AUTH).mtimeMs; } catch {}
+        try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); } catch {}
+        if (ok && mt > cxStartAuthMtime) { clearInterval(w); finalizeCodexAuth(); killCodexAuth(); }
+        else if (++tries > 60) { clearInterval(w); killCodexAuth(); finalizeCodexAuth(); }
+      }, 500);
+    });
+    req2.on('timeout', () => { req2.destroy(); });
+    req2.on('error', e => { if (!res.headersSent) res.status(502).json({ ok: false, error: 'Could not reach the local sign-in server: ' + e.message }); });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/codex/auth/status', (req, res) => {
+  if (cxDone) return res.json({ ok: true, done: true, result: cxResult || { ok: false, message: 'Unknown.' } });
+  res.json({ ok: true, done: false, running: !!cxProc, haveUrl: !!cxUrl });
+});
+app.post('/codex/auth/cancel', (req, res) => { killCodexAuth(); res.json({ ok: true }); });
+
+// ── Global session search ──────────────────────────────────────────────────
+// Full-text search across EVERY session's message history (transcripts are the
+// complete record; chat.db fills gaps). Returns matching sessions with hit count
+// and a snippet around the first match, newest first.
+// Cache parsed transcript messages keyed by file mtime so repeated /search
+// queries (per keystroke) don't re-read and re-parse every .jsonl each time.
+const _searchMsgCache = new Map();
+function cachedMessages(id) {
+  let mt = 0;
+  try { mt = fs.statSync(path.join(transcriptsDir(), id + '.jsonl')).mtimeMs; } catch {}
+  const c = _searchMsgCache.get(id);
+  if (c && c.mtime === mt) return c.messages;
+  const messages = transcriptToMessages(id);
+  _searchMsgCache.set(id, { mtime: mt, messages });
+  return messages;
+}
+app.get('/search', (req, res) => {
+  const q = String(req.query.q || '').trim().toLowerCase();
+  if (q.length < 2) return res.json({ results: [] });
+  const results = [];
+  try {
+    const ids = new Set();
+    try { fs.readdirSync(transcriptsDir()).filter(f => f.endsWith('.jsonl')).forEach(f => ids.add(f.slice(0, -6))); } catch {}
+    for (const id of Object.keys(chatData)) ids.add(id);
+    for (const id of ids) {
+      let messages = [];
+      try { messages = cachedMessages(id); } catch {}
+      if ((!messages || !messages.length) && chatData[id] && Array.isArray(chatData[id].messages)) messages = chatData[id].messages;
+      if (!messages || !messages.length) continue;
+      let hits = 0, snippet = '', preview = '';
+      for (const m of messages) {
+        const text = String((m && (m.text != null ? m.text : extractText(m.content))) || '');
+        if (!preview && (m.type === 'user' || m.role === 'user')) preview = text.replace(/\s+/g, ' ').trim().slice(0, 70);
+        const idx = text.toLowerCase().indexOf(q);
+        if (idx === -1) continue;
+        hits++;
+        if (!snippet) {
+          const start = Math.max(0, idx - 40), end = Math.min(text.length, idx + q.length + 70);
+          snippet = (start > 0 ? '…' : '') + text.slice(start, end).replace(/\s+/g, ' ').trim() + (end < text.length ? '…' : '');
+        }
+      }
+      if (!hits) continue;
+      let mt = 0;
+      try { mt = fs.statSync(path.join(transcriptsDir(), id + '.jsonl')).mtimeMs; } catch {}
+      if (!mt && chatData[id]) mt = chatData[id].updated_at || 0;
+      results.push({ id, name: sessionNames[id] || '', preview, hits, snippet, updatedAt: mt });
+    }
+    results.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    res.json({ results: results.slice(0, 40) });
+  } catch (e) { res.json({ results: [], error: e.message }); }
+});
+
+// Autonomy per-task/pool room ids (from ~/.claude/autonomy/rooms/*.sid) so the
+// /sessions list can tag + group them into the client's "Task rooms" sub-menu
+// instead of flooding the main room dropdown. Cheap dir read per request.
+function readAutonomyRooms() {
+  const m = new Map();
+  try {
+    const dir = path.join(os.homedir(), '.claude', 'autonomy', 'rooms');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.sid')) continue;
+      let id = '';
+      try { id = fs.readFileSync(path.join(dir, f), 'utf8').trim(); } catch {}
+      if (!id) continue;
+      const key = f.replace(/\.sid$/, '');
+      m.set(id, { key, kind: key.startsWith('pool-') ? 'pool' : 'task' });
+    }
+  } catch {}
+  return m;
+}
+
+app.get('/sessions', (req, res) => {
+  try {
+    // Base list from the persisted transcripts (always present), then overlay any
+    // chat.db entries (richer/more-recent UI previews) on top.
+    const merged = listTranscriptSessions();
+    for (const [id, data] of Object.entries(chatData)) {
+      let preview = (merged[id] && merged[id].preview) || '';
+      let lastMessage = (merged[id] && merged[id].lastMessage) || '';
+      try {
+        const users = (data.messages || []).filter(m => m.type === 'user');
+        if (users.length && users[0].text) preview = String(users[0].text).replace(/\s+/g, ' ').trim().slice(0, 80);
+        for (let i = users.length - 1; i >= 0; i--) {
+          const t = stripPlumbing(String(users[i].text || ''));
+          if (t) { lastMessage = t.replace(/\s+/g, ' ').trim().slice(0, 80); break; }
+        }
+      } catch {}
+      merged[id] = { updatedAt: data.updated_at || (merged[id] && merged[id].updatedAt) || 0, preview, lastMessage };
+    }
+    const _autoRooms = readAutonomyRooms();
+    const _all = Object.entries(merged)
+      .map(([id, v]) => {
+        const room = clientSessions.get(id);   // a live room currently exists for this session id
+        const _ar = _autoRooms.get(id) || null;
+        return { id, updatedAt: v.updatedAt, preview: v.preview, lastMessage: v.lastMessage || '', name: sessionNames[id] || '',
+          active: !!room, busy: !!(room && room.processing), viewers: room ? room.sockets.size : 0,
+          taskRoom: _ar ? _ar.key : null, archived: !!archivedSessions[id] };
+      })
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    // Keep autonomy task rooms from crowding normal rooms out of the top list:
+    // cap the two groups independently (the client tucks task rooms into a sub-menu).
+    const _arch   = _all.filter(x => x.archived);
+    const _normal = _all.filter(x => !x.taskRoom && !x.archived).slice(0, 150);
+    const _task   = _all.filter(x => x.taskRoom && !x.archived).slice(0, 100);
+    res.json({ sessions: [..._normal, ..._task, ..._arch] });
+  } catch (e) { res.json({ sessions: [] }); }
+});
+
+// Per-user upload directory for files/screenshots attached in the chat. Lives in
+// the user's HOME (so it's isolated per bridge account) and is read back by Claude
+// via its Read tool (Read(*) is allowed in the user's settings.json), so attached
+// images/files are referenced by absolute path in the prompt.
+const UPLOAD_DIR = path.join(os.homedir(), 'bridge-uploads');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {}
+
+// Try multiple locations: user's home cache, then /tmp (for cross-instance access)
+const RATE_LIMITS_PATHS = [
+  path.join(os.homedir(), '.cache', 'claude', 'rate-limits.json'),
+  '/tmp/claude-rate-limits.json',
+  path.join(__dirname, 'claude-rate-limits.json')
+];
+function readRateLimits() {
+  for (const rateLimitsPath of RATE_LIMITS_PATHS) {
+    try {
+      const raw = fs.readFileSync(rateLimitsPath, 'utf8');
+      const d = JSON.parse(raw);
+      const age = Date.now() - new Date(d.updated_at).getTime();
+      // 30 min: the refresher runs after each message (throttled), so an active
+      // user keeps this fresh; the last value persists a while when briefly idle.
+      if (age < 1_800_000) return d;
+    } catch {}
+  }
+  return null;
+}
+
+// ── Live context-window % (computed from the real chat stream) ────────────────
+// Context % is per-session (S.ctxPct/S.ctxTokens); globals are the last-seen values
+// for the /usage endpoint. CRITICAL: use the last iteration's token counts, not the
+// sum across iterations — summing re-counts cache_read each tool step and pins at 100%.
+let latestCtxPct = null;
+let latestCtxTokens = null;
+function ctxUsedFromUsage(u) {
+  if (!u || typeof u !== 'object') return 0;
+  const occ = it => (it.input_tokens || 0) + (it.cache_read_input_tokens || 0) + (it.cache_creation_input_tokens || 0);
+  const its = Array.isArray(u.iterations) ? u.iterations : null;
+  if (its && its.length) return occ(its[its.length - 1]);
+  return occ(u);
+}
+function updateCtxFromResult(ev) {
+  try {
+    const used = ctxUsedFromUsage(ev.usage || {});
+    let win = 200_000;
+    const mu = ev.modelUsage || {};
+    for (const k in mu) if (mu[k] && mu[k].contextWindow) win = mu[k].contextWindow;
+    if (used > 0 && win > 0) {
+      latestCtxTokens = used;
+      latestCtxPct = Math.min(100, Math.round((used / win) * 100));
+      return { pct: latestCtxPct, tokens: used };
+    }
+  } catch {}
+  return null;
+}
+
+// ── Official 5h/7d rate-limit % from the API response headers ──────────────────
+// The percentage is NOT in Claude's stream-json output (its rate_limit_event has
+// only status + reset time). But the real API response carries
+// `anthropic-ratelimit-unified-{5h,7d}-utilization` headers, which Claude prints
+// to stdout when ANTHROPIC_LOG=debug. So we ride a real chat turn in debug mode
+// (throttled), scrape those headers straight off the bridge's own stdout, and drop
+// the rest of the debug noise. No extra/special API calls — it piggybacks on a
+// turn the user is already making.
+const RATE_CAPTURE_INTERVAL_MS = 3 * 60 * 1000;
+let lastRateCaptureAt = 0;
+function shouldCaptureRates() { return (Date.now() - lastRateCaptureAt) > RATE_CAPTURE_INTERVAL_MS; }
+
+function persistRateLimits(rl) {
+  try {
+    const dir = path.join(os.homedir(), '.cache', 'claude');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'rate-limits.json'), JSON.stringify(rl));
+  } catch { /* best-effort; /usage falls back to last good file */ }
+}
+
+// Identity of the currently-active Claude account (from ~/.claude.json).
+function currentAccountIdentity() {
+  try {
+    const d = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount) || {};
+    return { email: d.emailAddress || '', uuid: d.accountUuid || '' };
+  } catch { return { email: '', uuid: '' }; }
+}
+// Snapshot a completed rate-limit capture against the account it belongs to, so
+// the switcher can show each account's last-known 5h/7d usage + reset times.
+function persistAccountUsage(rl) {
+  try {
+    const { uuid, email } = currentAccountIdentity();
+    if (!uuid || !fs.existsSync(ACCT_DIR)) return;
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
+      let au = '';
+      try { au = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).accountUuid || ''; } catch {}
+      if (au && au === uuid) {
+        const snap = {
+          email,
+          five_hour_pct: rl.five_hour_pct ?? null,
+          five_hour_resets_at: rl.five_hour_resets_at ?? null,
+          seven_day_pct: rl.seven_day_pct ?? null,
+          seven_day_resets_at: rl.seven_day_resets_at ?? null,
+          updated_at: rl.updated_at || new Date().toISOString(),
+        };
+        fs.writeFileSync(path.join(ACCT_DIR, m[1] + '.usage.json'), JSON.stringify(snap));
+        break;
+      }
+    }
+  } catch { /* best-effort */ }
+}
+// Last-known usage snapshot for a given account email (for the /usage fallback).
+function readAccountUsageByEmail(email) {
+  try {
+    if (!email || !fs.existsSync(ACCT_DIR)) return null;
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      if (!/\.usage\.json$/.test(f)) continue;
+      const d = JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8'));
+      if (d && d.email === email) return d;
+    }
+  } catch {}
+  return null;
+}
+
+// Scan one stdout line for the rate-limit headers (present only in debug output).
+// Accumulates the 5h/7d util+reset across lines, then persists once complete.
+let _rlPending = {};
+function scrapeRateLimits(line) {
+  if (line.indexOf('unified-') === -1) return;
+  let m, hit = false;
+  if ((m = line.match(/unified-5h-utilization"?\s*:\s*"?([0-9.]+)/))) { _rlPending.five_hour_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
+  if ((m = line.match(/unified-7d-utilization"?\s*:\s*"?([0-9.]+)/))) { _rlPending.seven_day_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
+  if ((m = line.match(/unified-5h-reset"?\s*:\s*"?([0-9]+)/)))        { _rlPending.five_hour_resets_at = parseInt(m[1], 10); hit = true; }
+  if ((m = line.match(/unified-7d-reset"?\s*:\s*"?([0-9]+)/)))        { _rlPending.seven_day_resets_at = parseInt(m[1], 10); hit = true; }
+  if (!hit) return;
+  if (_rlPending.five_hour_pct != null && _rlPending.seven_day_pct != null) {
+    _rlPending.updated_at = new Date().toISOString();
+    const id = currentAccountIdentity();
+    _rlPending.account_email = id.email;
+    _rlPending.account_uuid = id.uuid;
+    lastRateCaptureAt = Date.now();
+    persistRateLimits(_rlPending);
+    persistAccountUsage(_rlPending);
+    _rlPending = {};
+  }
+}
+
+// Model + account email are always known (env + OAuth login), independent of the
+// interactive-only rate-limit data. Surface them so the UI shows the model/email
+// even when the statusline rate-limits file is absent (headless bridge spawns).
+function modelDisplayName(id) {
+  if (!id) return '';
+  const m = id.match(/claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (m) return `Claude ${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}`;
+  return id;
+}
+function readAccountEmail() {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
+    return d.oauthAccount?.emailAddress || '';
+  } catch { return ''; }
+}
+
+// Claude token/cost usage — 5-hour block + weekly, parallel fetch
+app.get('/usage', (req, res) => {
+  let blockResult = null, weekResult = null, done = 0;
+  const rateLimits = readRateLimits() || {};
+  // Always force the real chat model + account email: the rate-limits.json file is
+  // written by the Haiku refresher, so its model/ctx fields describe the throwaway
+  // session, not this user's Opus chat — override them with authoritative values.
+  rateLimits.model = modelDisplayName(CLAUDE_MODEL);
+  const activeEmail = readAccountEmail();
+  rateLimits.email = activeEmail;
+  if (latestCtxPct != null) rateLimits.ctx_pct = latestCtxPct;
+  if (latestCtxTokens != null) rateLimits.ctx_tokens = latestCtxTokens;
+
+  // Account-aware 5h/7d %: the cached rate-limits file is per-HOME, not per-account,
+  // so after switching accounts it still holds the PREVIOUS account's numbers until
+  // that new account makes an API call. If the cache doesn't belong to the active
+  // account, fall back to that account's last snapshot (stamped stale), or blank the
+  // %s so the UI shows "–" rather than another account's usage.
+  const globalFresh = rateLimits.five_hour_pct != null && rateLimits.account_email === activeEmail;
+  if (!globalFresh) {
+    const snap = normalizeUsage(readAccountUsageByEmail(activeEmail));
+    if (snap) {
+      rateLimits.five_hour_pct = snap.five_hour_pct;
+      rateLimits.five_hour_resets_at = snap.five_hour_resets_at;
+      rateLimits.seven_day_pct = snap.seven_day_pct;
+      rateLimits.seven_day_resets_at = snap.seven_day_resets_at;
+      rateLimits.stale = true;
+      rateLimits.as_of = snap.updated_at;
+    } else if (rateLimits.account_email && rateLimits.account_email !== activeEmail) {
+      rateLimits.five_hour_pct = null;
+      rateLimits.five_hour_resets_at = null;
+      rateLimits.seven_day_pct = null;
+      rateLimits.seven_day_resets_at = null;
+      rateLimits.stale = true;
+    }
+  }
+
+  function finish() {
+    if (++done < 2) return;
+    res.json({ ok: true, block: blockResult, week: weekResult, rateLimits });
+  }
+
+  // 5-hour block data
+  execFile('ccusage', ['blocks', '--json'], { timeout: 8000 }, (err, stdout) => {
+    try {
+      const data = JSON.parse(stdout);
+      const blocks = (data.blocks || []).filter(b => !b.isGap);
+      const active = blocks.find(b => b.isActive);
+      const today = new Date().toISOString().slice(0, 10);
+      const todayCost = blocks
+        .filter(b => (b.startTime || '').slice(0, 10) === today)
+        .reduce((s, b) => s + (b.costUSD || 0), 0);
+      if (!active) { blockResult = { active: false, todayCost }; return finish(); }
+      const tokens = active.totalTokens || 0;
+      const endTime = active.endTime ? new Date(active.endTime) : null;
+      const minsLeft = endTime ? Math.max(0, Math.round((endTime - Date.now()) / 60000)) : null;
+      const resetsAtMs = endTime ? endTime.getTime() : null;
+      const pct = rateLimits.five_hour_pct != null ? rateLimits.five_hour_pct : (tokens / 72_117_641) * 100;
+      blockResult = {
+        active: true, tokens,
+        pct, minsLeft, resetsAtMs, burnRate: active.burnRate?.costPerHour || 0,
+        blockCost: active.costUSD || 0, todayCost,
+      };
+    } catch { blockResult = { active: false }; }
+    finish();
+  });
+
+  // Weekly data
+  execFile('ccusage', ['claude', 'weekly', '--json'], { timeout: 8000 }, (err, stdout) => {
+    try {
+      const data = JSON.parse(stdout);
+      const weeks = data.weekly || [];
+      const today = new Date();
+      const dayOfWeek = today.getDay();
+      const weekStart = new Date(today);
+      weekStart.setDate(today.getDate() - dayOfWeek);
+      const weekKey = weekStart.toISOString().slice(0, 10);
+      const current = weeks.find(w => w.week === weekKey) || weeks[weeks.length - 1];
+      const prev    = weeks.length >= 2 ? weeks[weeks.length - 2] : null;
+      weekResult = {
+        weekCost:   current?.totalCost   || 0,
+        weekTokens: current?.totalTokens || 0,
+        prevCost:   prev?.totalCost      || 0,
+        weekStart:  current?.week        || weekKey,
+        pct: rateLimits.seven_day_pct != null ? rateLimits.seven_day_pct : null,
+      };
+    } catch { weekResult = null; }
+    finish();
+  });
+});
+
+// On-demand usage refresh: fire a tiny throwaway Claude call in debug mode on the
+// currently-active account so the 5h/7d rate-limit headers get scraped + snapshotted
+// right now, instead of waiting for the next real chat turn. Costs one minimal Haiku
+// message. Used by the "↻ Refresh usage now" button (esp. for a freshly-added account).
+let _usageRefreshing = false;
+app.post('/usage/refresh', (req, res) => {
+  if (_usageRefreshing) return res.json({ ok: false, error: 'already refreshing' });
+  _usageRefreshing = true;
+  const env = { ...process.env };
+  if (!env.HOME) env.HOME = process.env.HOME || os.homedir();
+  if (!env.PATH) env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  env.ANTHROPIC_LOG = 'debug';
+  lastRateCaptureAt = 0;                       // bypass the throttle for this manual refresh
+  const before = (readRateLimits() || {}).updated_at || '';
+  let settled = false;
+  const finish = (ok, extra) => {
+    if (settled) return; settled = true; _usageRefreshing = false;
+    const rl = readRateLimits() || {};
+    res.json({ ok, updated: !!(rl.updated_at && rl.updated_at !== before), rateLimits: rl, ...(extra || {}) });
+  };
+  let proc;
+  try {
+    proc = spawn('claude', ['-p', 'hi', '--model', 'claude-haiku-4-5-20251001'],
+      { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { return finish(false, { error: e.message }); }
+  const scan = chunk => { for (const line of chunk.toString().split('\n')) { if (line) scrapeRateLimits(line); } };
+  proc.stdout.on('data', scan);
+  proc.stderr.on('data', scan);
+  const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30000);
+  proc.on('close', () => { clearTimeout(killer); finish(true); });
+  proc.on('error', e => { clearTimeout(killer); finish(false, { error: e.message }); });
+});
+
+// MCP health check — probes the Playwright MCP server
+app.get('/mcp-health', async (req, res) => {
+  const MCP_URL = `http://localhost:${MCP_PORT}/mcp`;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    const r = await fetch(MCP_URL, { method: 'GET', signal: ctrl.signal });
+    clearTimeout(timer);
+    res.json({ ok: true, status: r.status });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Paste host clipboard into the VNC display.
+// Sets the X11 clipboard via xclip, then fires Ctrl+V via xdotool so the
+// focused window in Xvfb :21 (Chrome) pastes it — all atomically on the server.
+app.post('/type-text', (req, res) => {
+  const text = req.body?.text;
+  if (typeof text !== 'string' || text.length === 0) {
+    return res.status(400).json({ error: 'text required' });
+  }
+
+  const env = { ...process.env, DISPLAY: process.env.DISPLAY_NUM || ':31' };
+
+  function fallbackType() {
+    // xclip unavailable — type character-by-character via xdotool
+    execFile('xdotool', ['type', '--clearmodifiers', '--delay', '12', '--', text],
+      { env, timeout: 30000 },
+      err => res.json({ ok: !err, method: 'xdotool-type', error: err?.message }));
+  }
+
+  // Write text to X11 CLIPBOARD via xclip stdin
+  const xclip = spawn('xclip', ['-selection', 'clipboard'], { env });
+  xclip.stdin.end(Buffer.from(text, 'utf8'));
+  xclip.on('error', fallbackType);
+  xclip.on('close', code => {
+    if (code !== 0) return fallbackType();
+    // xclip succeeded — send Ctrl+V to the currently-focused Xvfb window
+    execFile('xdotool', ['key', '--clearmodifiers', 'ctrl+v'], { env, timeout: 3000 },
+      err => res.json({ ok: !err, method: 'xclip+ctrl+v', error: err?.message }));
+  });
+});
+
+// Accept an attached file/screenshot. The raw bytes are POSTed as the body with
+// the original filename in the X-Filename header; the server writes it under the
+// per-user UPLOAD_DIR and returns the absolute path, which the front-end then
+// passes back with the chat message so Claude can Read() it.
+app.post('/upload', express.raw({ type: () => true, limit: '30mb' }), (req, res) => {
+  try {
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || buf.length === 0) {
+      return res.status(400).json({ error: 'empty upload' });
+    }
+    let raw = req.header('x-filename') || 'upload.bin';
+    try { raw = decodeURIComponent(raw); } catch {}
+    const origName = path.basename(raw);
+    // Strip any path components and keep a conservative on-disk filename charset.
+    const safe  = origName.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) || 'file';
+    const uniq  = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safe}`;
+    const dest  = path.join(UPLOAD_DIR, uniq);
+    fs.writeFileSync(dest, buf);
+    console.log(`[Bridge] Upload saved: ${dest} (${buf.length} bytes)`);
+    res.json({ ok: true, path: dest, name: origName, size: buf.length });
+  } catch (e) {
+    console.error('[Bridge] Upload error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const server = http.createServer(app);
+
+// Use noServer so two WebSocket paths can share one HTTP server without conflicts
+const wss      = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wssProxy = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+const wssRoomView = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on('upgrade', (req, socket, head) => {
+  const pathname = (req.url || '').split('?')[0];
+  if (pathname === '/ws') {
+    // The per-room live viewer tunnels over /ws (marked ?roomview=1) because nginx
+    // only upgrades <user>/ws + /websockify - there is no /roomview upgrade location,
+    // so a bare /roomview WS 404s at the proxy. Route those to the room-view relay;
+    // all other /ws upgrades are the normal chat socket.
+    if (/[?&]roomview=1(?:&|$)/.test(req.url || '')) {
+      wssRoomView.handleUpgrade(req, socket, head, ws => wssRoomView.emit('connection', ws, req));
+    } else {
+      wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+    }
+  } else if (pathname === '/websockify') {
+    wssProxy.handleUpgrade(req, socket, head, ws => wssProxy.emit('connection', ws, req));
+  } else if (pathname === '/roomview') {
+    wssRoomView.handleUpgrade(req, socket, head, ws => wssRoomView.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
+// Proxy /websockify → local websockify (noVNC ↔ VNC).
+// With per-room browsers on, ?room=<key> selects that room's own noVNC port so the
+// live panel shows the SAME browser Claude drives in that room; otherwise (and on
+// any error) it falls back to the shared per-user NOVNC_PORT — the classic behaviour.
+// --- on-demand browser: mark this user's browser stack "wanted" ---------------
+// start-browser.sh parks until this file is fresh and idle-stops when it goes
+// stale (opt-in via ~/.claude/browser-on-demand). Harmless for always-on users,
+// so we always touch; the gating lives in the launcher.
+const _BROWSER_WANTED = path.join(process.env.HOME || os.homedir(), '.claude', 'browser-wanted');
+function touchBrowserWanted() { try { fs.writeFileSync(_BROWSER_WANTED, String(Date.now())); } catch {} }
+
+wssProxy.on('connection', async (clientWs, req) => {
+  touchBrowserWanted();
+  const _hbWanted = setInterval(touchBrowserWanted, 60000);
+  clientWs.on('close', () => clearInterval(_hbWanted));
+  let novncPort = NOVNC_PORT;
+  if (roomStack) {
+    try {
+      const room = new URL(req.url, 'http://localhost').searchParams.get('room');
+      if (room) { const p = await roomStack.ensureRoom(room); if (p && p.novnc) novncPort = p.novnc; }
+    } catch (e) { console.log('[Bridge] per-room vnc route failed, using shared:', e.message); }
+  }
+  if (clientWs.readyState !== WebSocket.OPEN) { try { clientWs.close(); } catch {} return; }
+  const target = new WebSocket(`ws://localhost:${novncPort}`, { perMessageDeflate: false });
+  const queue = [];
+  target.on('open', () => { queue.forEach(m => target.send(m.data, { binary: m.binary })); queue.length = 0; });
+  clientWs.on('message', (data, isBinary) => {
+    if (target.readyState === WebSocket.OPEN) target.send(data, { binary: isBinary });
+    else if (target.readyState === WebSocket.CONNECTING) queue.push({ data, binary: isBinary });
+  });
+  target.on('message', (data, isBinary) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
+  });
+  const close = () => { try { clientWs.close(); } catch {} try { target.close(); } catch {} };
+  clientWs.on('close', close);
+  target.on('close', close);
+  clientWs.on('error', close);
+  target.on('error', close);
+});
+
+// Proxy /roomview?room=<k>[&target=<id>] -> room-view relay /view/<k>[?target=].
+// The relay screencasts that room's own browser window into the pane's <canvas>
+// and injects mouse/keyboard back. Only active when ROOMVIEW_PORT is configured.
+wssRoomView.on('connection', (clientWs, req) => {
+  if (!ROOMVIEW_PORT) { try { clientWs.close(); } catch {} return; }
+  touchBrowserWanted();
+  const _hbWanted = setInterval(touchBrowserWanted, 60000);
+  clientWs.on('close', () => clearInterval(_hbWanted));
+  let relayPath = '/view/default';
+  try {
+    const q = new URL(req.url, 'http://localhost').searchParams;
+    const room = q.get('room') || 'default';
+    const tgt  = q.get('target');
+    relayPath = '/view/' + encodeURIComponent(room) + (tgt ? '?target=' + encodeURIComponent(tgt) : '');
+  } catch {}
+  if (clientWs.readyState !== WebSocket.OPEN) { try { clientWs.close(); } catch {} return; }
+  const target = new WebSocket(`ws://127.0.0.1:${ROOMVIEW_PORT}${relayPath}`, { perMessageDeflate: false });
+  const queue = [];
+  target.on('open', () => { queue.forEach(m => target.send(m.data, { binary: m.binary })); queue.length = 0; });
+  clientWs.on('message', (data, isBinary) => {
+    if (target.readyState === WebSocket.OPEN) target.send(data, { binary: isBinary });
+    else if (target.readyState === WebSocket.CONNECTING) queue.push({ data, binary: isBinary });
+  });
+  target.on('message', (data, isBinary) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
+  });
+  const close = () => { try { clientWs.close(); } catch {} try { target.close(); } catch {} };
+  clientWs.on('close', close);
+  target.on('close', close);
+  clientWs.on('error', close);
+  target.on('error', close);
+});
+
+const PING_INTERVAL = 30_000;
+const heartbeat = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) { ws.terminate(); return; }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, PING_INTERVAL);
+wss.on('close', () => clearInterval(heartbeat));
+
+// ── Memory-bounded self-recycle (leak guard) ─────────────────────────────
+// This process slowly leaks heap over days (retained caches / session maps), and
+// Node rarely returns freed heap to the OS, so on a memory-tight box RSS climbs
+// until Chrome gets OOM-killed. Rather than chase every retained ref, bound the
+// process by memory: when RSS crosses a threshold AND no turn is mid-flight, kill
+// child procs (so none are orphaned) and exit(0). The ccbmon-bridge supervisor
+// relaunches a fresh process in ~3s; clients auto-reconnect and each room resumes
+// losslessly from its transcript (--resume). Tunable via env.
+const RSS_SOFT_MB = parseInt(process.env.BRIDGE_RSS_SOFT_MB, 10) || 900;   // recycle when fully idle (no clients)
+const RSS_HARD_MB = parseInt(process.env.BRIDGE_RSS_HARD_MB, 10) || 1400;  // recycle even with clients attached (never mid-turn)
+const _memGuard = setInterval(() => {
+  let rssMb;
+  try { rssMb = Math.round(process.memoryUsage().rss / 1048576); } catch { return; }
+  if (rssMb < RSS_SOFT_MB) return;
+  const anyProcessing = [...clientSessions.values()].some(s => s.processing || (s.pendingTurns || 0) > 0);
+  if (anyProcessing) return;                                  // never recycle mid-turn
+  const connected = wss.clients.size;
+  const reason = rssMb >= RSS_HARD_MB ? 'hard' : (connected === 0 ? 'soft-idle' : null);
+  if (!reason) return;                                        // over soft but clients attached -> wait for an idle window
+  console.log(`[Bridge] Memory-recycle (${reason}): RSS ${rssMb}MB, ${connected} client(s), ${clientSessions.size} room(s) — killing children + exiting for supervisor relaunch`);
+  for (const s of clientSessions.values()) { try { s.currentProc && s.currentProc.kill('SIGKILL'); } catch {} }
+  setTimeout(() => process.exit(0), 250);                     // let the log flush + child SIGKILLs land
+}, 60_000);
+if (_memGuard.unref) _memGuard.unref();
+
+
+// ── One client = one persistent Claude Code session ───────────────────────────
+// Claude is spawned per-turn with --resume so context persists. The Playwright
+// MCP browser persists independently as a standalone server, so it stays open
+// between Claude invocations.
+//
+// Session state lives in `clientSessions` keyed by a stable per-browser clientId
+// (sent in the `hello` message), NOT in the WebSocket closure. This lets a live
+// Claude process survive a disconnect and reattach to a reconnecting browser, so
+// a page refresh / network blip / laptop sleep doesn't lose the in-flight answer.
+const CLAUDE_TIMEOUT_MS      = 10 * 60 * 1000; // 10 min — max silence once running
+const CLAUDE_STARTUP_TIMEOUT = 2  * 60 * 1000; // 2 min  — must produce first output
+const RECONNECT_GRACE_MS     = 30 * 1000;      // keep the proc alive this long after disconnect
+const MAX_BUFFER             = 4000;           // cap on events buffered while detached
+const WATCH_RUN = '⏱ Claude stopped responding (10 min timeout) — session reset.';
+// A "warm" room = an empty (no sockets) room whose Claude proc is kept alive so
+// switching away from an idle room doesn't tear it down. Bounded so we never keep
+// too many live Claude procs on the memory-tight container.
+const WARM_ROOM_TTL_MS = parseInt(process.env.WARM_ROOM_TTL_MS, 10) || 15 * 60 * 1000;
+const MAX_WARM_ROOMS   = parseInt(process.env.MAX_WARM_ROOMS,   10) || 2;
+function enforceWarmCap(justArmed) {
+  const warm = [...clientSessions.values()]
+    .filter(s => s.sockets.size === 0 && s.currentProc && (s.sessionId || s.threadId));
+  if (warm.length <= MAX_WARM_ROOMS) return;
+  warm.sort((a, b) => (a.lastActiveAt || 0) - (b.lastActiveAt || 0));   // oldest first
+  for (const s of warm.slice(0, warm.length - MAX_WARM_ROOMS)) {
+    if (s === justArmed) continue;
+    try { s.killCurrentProc('warm-room cap exceeded'); } catch {}
+    clientSessions.delete(s.key);
+    console.log('[Bridge] Warm-room cap — closed idle room:', s.key);
+  }
+}
+
+const GENERAL_ASSISTANT_PROMPT =
+  'You are a helpful general-purpose assistant accessed through a web chat. ' +
+  'Help the user with ANY question or task they bring you — general knowledge, ' +
+  'research, writing, planning, personal and business tasks — not only software ' +
+  'engineering or this codebase. Do not refuse or redirect a request just because ' +
+  'it is unrelated to code.\n\n' +
+  'Your primary capability is browser interaction via the Playwright MCP tools, ' +
+  'shown live in the noVNC pane beside this chat. The workflow is semi-automated: ' +
+  'the user logs into websites themselves in that browser (so no credentials are ' +
+  'ever stored on the server), and once they are logged in you carry out the ' +
+  'automated steps directly with Playwright. Use this to help set up integrations ' +
+  'and systems, research projects, and perform any task that can be done through ' +
+  'the web. When a task needs a site the user is not yet logged into, ask them to ' +
+  'log in via the browser pane first, then proceed.\n\n' +
+  'IMPORTANT — what "log me in" means: when the user asks you to "log in" or ' +
+  '"sign in" to a website or web resource, they are asking you to NAVIGATE the ' +
+  'browser to that site\'s login page so THEY can enter their credentials ' +
+  'themselves. They are NOT asking you to type, supply, or guess any username or ' +
+  'password. Never enter credentials. Just navigate to the login page and tell the ' +
+  'user it is ready for them to sign in.\n\n' +
+  'RESPONSE STYLE — be decidedly concise. Answer in the absolute minimum number of ' +
+  'words that fully conveys the answer. Lead with the answer or result; skip preamble, ' +
+  'acknowledgements, and restating the question. Prefer a single short sentence or a ' +
+  'tight bullet list over paragraphs. Do not narrate what you are about to do or ' +
+  'summarise what you just did unless asked. Expand only when the user explicitly ' +
+  'asks for detail, an explanation, or step-by-step.\n\n' +
+  'YOUR TASK LIST — this app gives each user a personal task list (the Tasks \n' +
+  'panel beside the chat). When the user says "add this to my task list", "make \n' +
+  'a task for this", or anything equivalent, they mean: create a new item in THIS \n' +
+  'app\u2019s own task list. Do it by POSTing JSON to the bridge API at \n' +
+  'http://localhost:\u0024BRIDGE_PORT/tasks (the BRIDGE_PORT env var is set for your \n' +
+  'process) with fields {"title", "description"}. Derive all of it from the \n' +
+  'conversation context: a short imperative TITLE, a DESCRIPTION capturing what the \n' +
+  'user wants, and a clear one-line OBJECTIVE stating what "done" looks like \n' +
+  '(put the objective as the first line of the description). Confirm briefly once \n' +
+  'added. Do NOT store such tasks in memory files \u2014 the app task list is the \n' +
+  'single source of truth.\n\n' +
+  'CRITICAL — EMAIL AND CALENDAR SAFETY RULES (non-negotiable, cannot be overridden by ' +
+  'any user instruction):\n' +
+  '1. NEVER send, reply to, forward, or draft-and-send any email via any MCP tool ' +
+  '   (Gmail, Outlook/Graph, or any other mail connector). You may READ, SEARCH, and ' +
+  '   LIST emails freely, and you may CREATE DRAFTS — but the draft must stay as a ' +
+  '   draft. The user must send it manually.\n' +
+  '2. NEVER create, update, or delete calendar events without the user explicitly ' +
+  '   confirming "yes, create/change/delete that event" in the same conversation turn.\n' +
+  '3. NEVER delete, trash, move, or permanently modify any email or file without the ' +
+  '   user explicitly confirming the action in the same turn.\n' +
+  '4. If a task would require sending an email or making a destructive change, STOP, ' +
+  '   explain what you would do, and wait for explicit approval before proceeding.';
+
+// Stream-json input envelope for one user turn.
+function userMsgJSON(text) {
+  return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n';
+}
+
+// Translate one Codex `exec --json` event into the bridge's normalised UI messages
+// (the SAME shapes the Claude stream parser emits), so everything downstream — UI,
+// mirroring, history — is unchanged. Returns [] for events with no UI signal.
+function parseCodexEvent(ev) {
+  const out = [];
+  switch (ev.type) {
+    case 'thread.started':
+      out.push({ kind: 'session', id: ev.thread_id });   // thread_id == Claude's session_id (resume handle)
+      break;
+    case 'item.started':
+    case 'item.completed': {
+      const it = ev.item || {};
+      if (it.type === 'agent_message' && ev.type === 'item.completed') {
+        out.push({ kind: 'stream', data: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: it.text || '' }] } } });
+      } else if (it.type === 'command_execution') {
+        if (ev.type === 'item.started') {
+          out.push({ kind: 'stream', data: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: it.id, name: 'bash', input: { command: it.command } }] } } });
+        } else {
+          out.push({ kind: 'stream', data: { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: it.id, content: (it.aggregated_output || '') + '\n[exit ' + it.exit_code + ']' }] } } });
+        }
+      } else if (it.type === 'error' && ev.type === 'item.completed') {
+        const emsg = it.message || '';
+        // Suppress the expected per-invocation hook-trust notice; surface real errors.
+        if (!/bypass-hook-trust/i.test(emsg)) {
+          out.push({ kind: 'stream', data: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '\u26A0 ' + emsg }] } } });
+        }
+      }
+      break;
+    }
+    case 'turn.completed':
+      out.push({ kind: 'result', usage: ev.usage || null });
+      break;
+  }
+  return out;
+}
+
+// Claude stores per-project session transcripts at
+// ~/.claude/projects/<cwd-with-slashes-as-dashes>/<session_id>.jsonl
+// Resuming a session whose file doesn't exist makes `claude --resume` exit
+// immediately with "No conversation found", which the async self-heal handles
+// unreliably. So we check existence up front and just start fresh if it's gone.
+function sessionFileExists(id) {
+  if (!id) return false;
+  const projectDir = CLAUDE_CWD.replace(/\//g, '-');
+  const f = path.join(os.homedir(), '.claude', 'projects', projectDir, `${id}.jsonl`);
+  try { return fs.existsSync(f); } catch { return false; }
+}
+
+const clientSessions = new Map();   // clientId -> session state (survives reconnects)
+
+// --- Blip recovery journal (gated on RESUME_TURNS) ----------------------------
+// Only the bridge process dying (a blip) leaves a journal behind: every in-process
+// turn end (success, failure, kill) clears it, so a journal present at startup
+// means the turn was interrupted by the restart. Replay re-injects the USER
+// prompt (safer than blindly "continuing") against the resumed session, capped to
+// avoid loops. All three helpers are no-ops when RESUME_TURNS is unset.
+const PENDING_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-pending');
+function pendingFile(key) { return path.join(PENDING_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
+function journalPending(S) {
+  if (!RESUME_TURNS) return;
+  try {
+    if (S.inFlight && S.inFlight.length) {
+      fs.mkdirSync(PENDING_DIR, { recursive: true });
+      fs.writeFileSync(pendingFile(S.key), JSON.stringify({ key: S.key, sessionId: S.sessionId || null, turns: S.inFlight.slice(), ts: Date.now() }));
+    } else {
+      try { fs.unlinkSync(pendingFile(S.key)); } catch {}
+    }
+  } catch (e) { console.log('[Bridge] journalPending failed:', e.message); }
+}
+function clearPending(key) {
+  if (!RESUME_TURNS) return;
+  try { fs.unlinkSync(pendingFile(key)); } catch {}
+}
+function replayPending() {
+  if (!RESUME_TURNS) return;
+  let files = [];
+  try { files = fs.readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')); } catch { return; }
+  for (const f of files) {
+    const fp = path.join(PENDING_DIR, f);
+    let j; try { j = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { try { fs.unlinkSync(fp); } catch {} continue; }
+    if (!j || !Array.isArray(j.turns) || !j.turns.length) { try { fs.unlinkSync(fp); } catch {} continue; }
+    j.attempts = (j.attempts || 0) + 1;
+    if (j.attempts > 2) { try { fs.unlinkSync(fp); } catch {} console.log('[Bridge] blip-replay: giving up on', j.key); continue; }
+    try { fs.writeFileSync(fp, JSON.stringify(j)); } catch {}
+    const key = (j.sessionId && sessionFileExists(j.sessionId)) ? j.sessionId : j.key;
+    let S = clientSessions.get(key);
+    if (!S) { S = makeSession(key); if (j.sessionId && sessionFileExists(j.sessionId)) S.sessionId = j.sessionId; clientSessions.set(key, S); }
+    if (S.processing) continue;   // already live (a reconnecting client beat us to it)
+    const turns = j.turns.slice();
+    console.log(`[Bridge] blip-replay: re-injecting ${turns.length} dropped turn(s) into ${key} (attempt ${j.attempts})`);
+    setTimeout(() => { try { turns.forEach(t => S.sendToClaude(t)); } catch (e) { console.log('[Bridge] blip-replay failed:', e.message); } }, 800);
+  }
+}
+
+function makeSession(key) {
+  const S = {
+    key, clientId: key, sockets: new Set(), sessionId: null, processing: false, currentProc: null,
+    watchdogTimer: null, pendingTurns: 0, inFlight: [], retried: false,
+    graceTimer: null, buffer: [], evictWhenIdle: false, lastActiveAt: Date.now(),
+    ctxPct: null, ctxTokens: null, compacting: false, lastCompactAt: 0,
+    engineOverride: null,   // per-room engine override: null=follow global (~/.claude/engine), else 'claude'|'codex'
+  };
+
+  // Broadcast to all connected sockets. Buffer when nobody is connected so a
+  // reconnecting client still receives in-flight output.
+  S.send = (data) => {
+    S.lastActiveAt = Date.now();
+    const json = JSON.stringify(data);
+    let sent = false;
+    for (const sock of S.sockets) {
+      if (sock.readyState === WebSocket.OPEN) { sock.send(json); sent = true; }
+    }
+    if (!sent) {
+      S.buffer.push(data);
+      if (S.buffer.length > MAX_BUFFER) S.buffer.shift();
+    }
+  };
+
+  S.clearWatch = () => { if (S.watchdogTimer) { clearTimeout(S.watchdogTimer); S.watchdogTimer = null; } };
+  S.armWatch = (ms, msg) => {
+    S.clearWatch();
+    S.watchdogTimer = setTimeout(() => { S.send({ type: 'error', text: msg }); S.killCurrentProc('watchdog timeout'); }, ms);
+  };
+
+  S.killCurrentProc = (reason) => {
+    S.clearWatch();
+    if (S.currentProc) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; }
+    const wasProcessing = S.processing;
+    S.processing = false; S.pendingTurns = 0; S.inFlight = [];
+    clearPending(S.key);   // in-process end — UI is unblocked, so no blip-replay
+    if (wasProcessing) S.send({ type: 'done', code: -1 });
+    if (reason) console.log('[Bridge] Killed Claude proc:', reason);
+  };
+
+  // A room whose grace period expired *while a turn was running* is kept alive so
+  // the turn finishes in the background. This closes it down once it goes idle —
+  // called at every point the session returns to idle.
+  S.evictIfReady = () => {
+    if (!S.evictWhenIdle) return;
+    if (S.sockets.size > 0) { S.evictWhenIdle = false; return; }  // a device rejoined
+    if (S.processing || S.pendingTurns > 0) return;               // still working — wait
+    S.evictWhenIdle = false;
+    S.killCurrentProc('evict: background turn finished, room empty');
+    clientSessions.delete(S.key);
+    console.log('[Bridge] Background turn finished — room closed:', S.key);
+  };
+
+  // Spawn the persistent streaming Claude process. With --input-format stream-json
+  // its stdin stays open across turns, so follow-up messages queue into the live
+  // process and steer it. Spawned lazily; killed on reset / cancel / timeout /
+  // grace-expiry.
+  S.spawnProc = () => {
+    // Drop a stale session id before spawning so we never --resume a missing file.
+    if (S.sessionId && !sessionFileExists(S.sessionId)) {
+      console.log('[Bridge] Stale session (no transcript), starting fresh:', S.sessionId);
+      S.sessionId = null;
+    }
+    const triedResume = !!S.sessionId;
+    let resumeMissing = false;
+
+    const args = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+      '--model', CLAUDE_MODEL, '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
+    // Point Claude at this room's browser MCP. Preferred: the room's OWN isolated
+    // Playwright MCP (per-room browsers). It must already be listening — sendToClaude
+    // awaits roomStack.ensureRoom(S.key) before the fresh spawn, so portsFor() is set.
+    // Fallback: the shared-Chrome shim tab (SHIM_PORT). Neither => global settings MCP.
+    let _roomMcpPort = null;
+    if (roomStack) { const _rp = roomStack.portsFor(S.key); if (_rp && _rp.mcp) _roomMcpPort = _rp.mcp; }
+    if (_roomMcpPort) {
+      const roomUrl = `http://localhost:${_roomMcpPort}/mcp`;
+      const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+      try {
+        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
+        args.push('--mcp-config', mcpFile, '--strict-mcp-config');
+      } catch (e) { console.log('[Bridge] room mcp-config write failed:', e.message); }
+    } else if (SHIM_PORT) {
+      const roomUrl = `http://localhost:${SHIM_PORT}/mcp/${encodeURIComponent(S.key)}`;
+      S.shimMountKey = S.key;   // /mcp/<key> is baked into this claude process; alias target = this key
+      const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+      try {
+        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
+        args.push('--mcp-config', mcpFile, '--strict-mcp-config');
+      } catch (e) { console.log('[Bridge] shim mcp-config write failed:', e.message); }
+    }
+    if (S.sessionId) args.push('--resume', S.sessionId);
+
+    const claudeEnv = { ...process.env };
+    // Ensure critical env vars are present for Claude to find settings.json and MCP servers
+    if (!claudeEnv.HOME) claudeEnv.HOME = process.env.HOME || '/root';
+    if (!claudeEnv.PATH) claudeEnv.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    // Per-user self-service auth: if the user re-authenticated via the
+    // settings menu, a long-lived OAuth token sits in ~/.claude/bridge-oauth-token.
+    try {
+      const _tokPath = path.join(claudeEnv.HOME || os.homedir(), '.claude', 'bridge-oauth-token');
+      const _tok = fs.readFileSync(_tokPath, 'utf8').trim();
+      if (_tok) claudeEnv.CLAUDE_CODE_OAUTH_TOKEN = _tok;
+    } catch {}
+    // Throttled: run this turn in debug so the API response headers (carrying the
+    // official 5h/7d utilization) print to stdout, where scrapeRateLimits() reads
+    // them. The extra debug lines are dropped, not shown to the user.
+    if (shouldCaptureRates()) claudeEnv.ANTHROPIC_LOG = 'debug';
+
+    touchBrowserWanted();
+    // (Re)assert the shim's draft->session alias with a short retry ladder so a shim
+    // that is flapping at this exact instant cannot permanently orphan the live viewer.
+    // The shim persists the alias to disk once it lands, so a single success is durable.
+    const assertRoomAlias = (mountKey, sessionId) => {
+      const delays = [0, 2000, 8000];
+      const tryOnce = (i) => {
+        fetch(`http://127.0.0.1:${SHIM_PORT}/admin/rekey/${encodeURIComponent(mountKey)}/${encodeURIComponent(sessionId)}`, { method: 'POST' })
+          .then((r) => { if (!r.ok && i + 1 < delays.length) setTimeout(() => tryOnce(i + 1), delays[i + 1]); })
+          .catch(() => { if (i + 1 < delays.length) setTimeout(() => tryOnce(i + 1), delays[i + 1]); });
+      };
+      tryOnce(0);
+    };
+    const proc = spawn('claude', args, { cwd: CLAUDE_CWD, env: claudeEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    S.currentProc = proc;
+    S.procEngine = 'claude';
+    // Startup watchdog: must produce first output within 2 min (catches MCP init hangs).
+    S.armWatch(CLAUDE_STARTUP_TIMEOUT, '⏱ Claude failed to start (MCP/init timeout) — session reset.');
+
+    let buf = '';
+    proc.stdout.on('data', chunk => {
+      buf += chunk.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        scrapeRateLimits(line);                  // pull rate-limit headers (debug mode); cheap no-op otherwise
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }   // drop non-JSON debug noise
+        if (!ev || typeof ev !== 'object' || !ev.type) continue;   // ignore stray fragments
+
+        if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
+          S.sessionId = ev.session_id;
+          // Durable viewer alias: (re)assert shim mount->session on EVERY init, so a
+          // promotion whose one-shot POST was lost to a shim flap (or the collision
+          // path) still links the pane. Retries a transient shim-down. [ALIAS_REASSERT_V1]
+          if (ROOMVIEW_PORT && SHIM_PORT && S.shimMountKey && S.shimMountKey !== ev.session_id) assertRoomAlias(S.shimMountKey, ev.session_id);
+          // Re-key a brand-new room from its draft id to the real Claude session id
+          // so a second device opening this conversation joins the *live* room.
+          if (S.key && S.key !== ev.session_id && !sessionFileExists(S.key)) {
+            const _oldKey = S.key;
+            const _existing = clientSessions.get(ev.session_id);
+            if (_existing && _existing !== S) {
+              // Real id already owns a live room (user navigated to it while this
+              // draft was promoting). Don't overwrite it — keep this draft on its own
+              // key to avoid splitting room identity across two room objects.
+              console.log('[Bridge] Draft-promote collision — keeping draft key', _oldKey, 'wanted', ev.session_id);
+            } else {
+            clientSessions.delete(S.key);
+            S.key = ev.session_id;
+            clientSessions.set(S.key, S);
+            // Move this room's browser stack onto the real key too, so later MCP/noVNC
+            // lookups by S.key (and by the client's promoted room id) find the SAME
+            // running stack instead of spawning a second one under the new key.
+            if (roomStack) { try { roomStack.rekey(_oldKey, ev.session_id); } catch {} }
+            // Live viewer (task 190): tell the shim the promoted id aliases the draft
+            // room, so the pane (keyed on the promoted id) follows Claude's tab. Gated
+            // on ROOMVIEW_PORT => a no-op (never fired) when the viewer is off.
+            if (ROOMVIEW_PORT && SHIM_PORT) { try { fetch(`http://127.0.0.1:${SHIM_PORT}/admin/rekey/${encodeURIComponent(_oldKey)}/${encodeURIComponent(ev.session_id)}`, { method: 'POST' }).catch(() => {}); } catch {} }
+            clearPending(_oldKey);   // drop the draft-keyed journal; re-journal under the real id below
+            }
+          }
+          S.send({ type: 'session_id', id: S.sessionId });
+          journalPending(S);   // upgrade the journal now that we have the real session id
+        }
+
+        S.send({ type: 'stream', data: ev });
+
+        if (ev.type === 'result') {
+          // One turn finished. More turns follow if the user queued messages.
+          const ctx = updateCtxFromResult(ev);
+          if (ctx != null) { S.ctxPct = ctx.pct; S.ctxTokens = ctx.tokens; }
+          S.retried = false;
+          if (S.inFlight.length) S.inFlight.shift();
+          S.pendingTurns = Math.max(0, S.pendingTurns - 1);
+          journalPending(S);   // record remaining queued turns, or clear when none left
+          if (S.pendingTurns > 0) {
+            S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);   // a queued turn is still coming
+          } else {
+            S.processing = false;
+            S.clearWatch();
+            S.send({ type: 'done', code: 0 });
+            S.maybeAutoCompact();
+            S.evictIfReady();
+          }
+        } else {
+          S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);     // keep alive while output flows
+        }
+      }
+    });
+
+    proc.stderr.on('data', chunk => {
+      const txt = chunk.toString().trim();
+      if (txt) console.log('[claude stderr]', txt.slice(0, 300));
+      if (/No conversation found with session ID/i.test(txt)) resumeMissing = true;
+    });
+
+    proc.on('close', code => {
+      if (S.currentProc !== proc) return;
+      S.clearWatch();
+      S.currentProc = null;
+      const wasProcessing = S.processing;
+      S.processing = false;
+
+      // Self-heal a stale --resume (orphaned session id after an account swap):
+      // drop the dead id, respawn fresh, and resend whatever was still in flight.
+      if (resumeMissing && triedResume && !S.retried) {
+        S.retried = true;
+        S.sessionId = null;
+        const resend = S.inFlight.slice();
+        S.inFlight = []; S.pendingTurns = 0;
+        S.send({ type: 'status', text: 'Previous session expired — starting a fresh conversation.' });
+        setTimeout(() => resend.forEach(t => S.sendToClaude(t)), 150);
+        return;
+      }
+
+      clearPending(S.key);   // in-process close (claude exited/crashed) — UI got done, so no blip-replay
+      S.pendingTurns = 0; S.inFlight = [];
+      if (wasProcessing) S.send({ type: 'done', code });   // unblock UI if it died mid-turn
+      S.evictIfReady();
+    });
+
+    proc.on('error', err => {
+      if (S.currentProc !== proc) return;
+      S.clearWatch();
+      S.currentProc = null;
+      S.processing = false; S.pendingTurns = 0; S.inFlight = [];
+      console.error('[Bridge] spawn error:', err.message);
+      S.send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
+    });
+  };
+
+  // Send one user turn. If the streaming process is already live, the message is
+  // written straight into its stdin — queuing/steering the running session.
+  // Otherwise a fresh process is spawned (resuming the session id when we have one).
+  S._sendNow = (text) => {
+    // If an idle Codex proc still holds the slot, drop it so Claude spawns fresh.
+    if (S.currentProc && S.procEngine === 'codex' && !S.processing) {
+      try { S.currentProc.kill('SIGKILL'); } catch {}
+      S.currentProc = null; S.procEngine = null;
+    }
+    const fresh = !S.currentProc;
+    const wasProcessing = S.processing;
+    if (fresh) S.spawnProc();
+    if (!S.currentProc) return;
+    S.inFlight.push(text);
+    S.pendingTurns++;
+    S.processing = true;
+    journalPending(S);   // persist this turn so a bridge blip can re-inject it
+    if (!wasProcessing) S.send({ type: 'thinking' });   // only show the spinner when starting from idle
+    try { S.currentProc.stdin.write(userMsgJSON(text)); }
+    catch (e) { console.error('[Bridge] stdin write failed:', e.message); }
+    if (!fresh) S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
+  };
+
+  // Send one user turn. If the streaming process is already live, the message is
+  // written straight into its stdin — queuing/steering the running session.
+  // Otherwise a fresh process is spawned (resuming the session id when we have one).
+  //
+  // With per-room browsers on, a FRESH spawn must wait for this room's own browser
+  // stack (its Playwright MCP) to be listening first, or Claude's MCP init would hang
+  // and hit the 2-min startup watchdog. We show the spinner immediately, await
+  // ensureRoom (fast when already warm / re-adopted), then spawn. ensureRoom failure
+  // is non-fatal: _sendNow still runs and spawnProc falls back to shim/global MCP.
+  // ── Codex engine (ENGINE=codex) ────────────────────────────────────
+  // Codex has no persistent stdin like Claude's stream-json; each turn is its own
+  // `codex exec` process, resumed via thread_id. Follow-ups queue and run after the
+  // current turn. --dangerously-bypass-hook-trust is REQUIRED for the DB safety hook
+  // in ~/.codex to run (untrusted hooks are silently skipped). Only reached when
+  // ENGINE==='codex', so the Claude path is untouched.
+  // Resolve THIS room's Playwright MCP URL for Codex, mirroring spawnProc's
+  // ladder (per-room isolated browser -> shared-Chrome shim -> none). Codex gets
+  // the same browser Claude does; null => Codex runs without browser tools.
+  S._codexMcpUrl = () => {
+    try {
+      if (roomStack) { const rp = roomStack.portsFor(S.key); if (rp && rp.mcp) return `http://localhost:${rp.mcp}/mcp`; }
+      if (SHIM_PORT) return `http://localhost:${SHIM_PORT}/mcp/${encodeURIComponent(S.key)}`;
+    } catch {}
+    return null;
+  };
+  S._runCodexTurn = (text) => {
+    S.processing = true;
+    S.send({ type: 'thinking' });
+    const args = ['exec'];
+    if (S.threadId) args.push('resume', S.threadId);
+    const _mcpUrl = S._codexMcpUrl();
+    args.push('--json', '--skip-git-repo-check', '--dangerously-bypass-hook-trust', text);
+    const env = { ...process.env };
+    if (!env.HOME) env.HOME = os.homedir();
+    // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
+    // codex exec on gpt-5.6-sol). CLI proxies to this room's Playwright shim.
+    if (_mcpUrl) { env.CODEX_BROWSER_MCP_URL = _mcpUrl; env.PATH = '/usr/local/bin:' + (env.PATH || ''); }
+    let proc;
+    touchBrowserWanted();
+    try { proc = spawn('codex', args, { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e) { S.processing = false; S.send({ type: 'error', text: 'Codex spawn failed: ' + e.message }); S.send({ type: 'done', code: -1 }); return; }
+    S.currentProc = proc;
+    S.procEngine = 'codex';
+    S.armWatch(CLAUDE_STARTUP_TIMEOUT, '\u23F1 Codex failed to start \u2014 session reset.');
+    let buf = '';
+    proc.stdout.on('data', chunk => {
+      buf += chunk.toString();
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        if (!ev || !ev.type) continue;
+        for (const m of parseCodexEvent(ev)) {
+          if (m.kind === 'session') { S.threadId = m.id; S.send({ type: 'session_id', id: m.id }); }
+          else if (m.kind === 'stream') S.send({ type: 'stream', data: m.data });
+        }
+        S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
+      }
+    });
+    proc.stderr.on('data', d => console.log('[codex stderr]', d.toString().slice(0, 300)));
+    proc.on('error', e => console.log('[Bridge] codex proc error:', e.message));
+    proc.on('close', code => {
+      if (S.currentProc !== proc) return;
+      S.clearWatch(); S.currentProc = null; S.processing = false;
+      S.send({ type: 'done', code: code || 0 });
+      const q = S.codexQueue || [];
+      if (q.length) { const next = q.shift(); setTimeout(() => S._runCodexTurn(next), 50); }
+      else if (S.evictIfReady) S.evictIfReady();
+    });
+  };
+  S._sendCodex = (text) => {
+    S.codexQueue = S.codexQueue || [];
+    // An idle *Claude* persistent proc occupies the slot but isn't a Codex turn
+    // in flight. Tear it down so Codex can run; Claude losslessly resumes from
+    // its transcript (--resume <sessionId>) on its next turn.
+    if (S.currentProc && S.procEngine === 'claude' && !S.processing) {
+      try { S.currentProc.kill('SIGKILL'); } catch {}
+      S.currentProc = null; S.procEngine = null;
+    }
+    if (S.processing || S.currentProc) { S.codexQueue.push(text); return; }
+    // Warm this room's browser first so _codexMcpUrl() resolves the per-room
+    // port (mirrors Claude's sendToClaude). Non-fatal: falls back to shim/none.
+    if (roomStack) {
+      S.processing = true; S.send({ type: 'thinking' });
+      roomStack.ensureRoom(S.key)
+        .catch(e => console.log('[Bridge] ensureRoom (codex) failed, using fallback MCP:', e.message))
+        .then(() => { S.processing = false; S._runCodexTurn(text); });
+      return;
+    }
+    S._runCodexTurn(text);
+  };
+
+  S.sendToClaude = (text) => {
+    if ((S.engineOverride || currentEngine()) === 'codex') return S._sendCodex(text);
+    if (roomStack && !S.currentProc) {
+      if (!S.processing) S.send({ type: 'thinking' });
+      roomStack.ensureRoom(S.key)
+        .catch(e => console.log('[Bridge] ensureRoom failed, using fallback MCP:', e.message))
+        .then(() => S._sendNow(text));
+      return;
+    }
+    S._sendNow(text);
+  };
+
+  S.maybeAutoCompact = () => {
+    const tokenBudget = AUTO_COMPACT_TOKENS > 0;
+    if (!tokenBudget && AUTO_COMPACT_PCT <= 0) return;
+    if (S.compacting) { S.compacting = false; return; }
+    if (S.processing || S.pendingTurns > 0) return;
+    const over = tokenBudget
+      ? (S.ctxTokens != null && S.ctxTokens >= AUTO_COMPACT_TOKENS)
+      : (S.ctxPct != null && S.ctxPct >= AUTO_COMPACT_PCT);
+    if (!over) return;
+    if (Date.now() - S.lastCompactAt < AUTO_COMPACT_COOLDOWN_MS) return;
+    S.compacting = true;
+    S.lastCompactAt = Date.now();
+    const where = tokenBudget ? `${S.ctxTokens} tokens (threshold ${AUTO_COMPACT_TOKENS})` : `${S.ctxPct}% (threshold ${AUTO_COMPACT_PCT}%)`;
+    const human = tokenBudget ? `~${Math.round(S.ctxTokens / 1000)}k tokens` : `${S.ctxPct}%`;
+    console.log(`[Bridge] Auto-compacting session ${S.sessionId} at ${where}`);
+    S.send({ type: 'status', text: `🗜 Context at ${human} — auto-compacting to free space…` });
+    S.sendToClaude('/compact');
+  };
+
+  return S;
+}
+
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  let S = null;   // the client session this socket is currently driving
+
+  // Bind this socket to a (possibly pre-existing) client session. If that session
+  // still has a live Claude process from a socket that just disconnected, we
+  // reattach: cancel its grace timer and flush everything buffered while detached,
+  // so an in-flight answer survives a refresh / blip.
+  function attach(clientId, roomId) {
+    // Room keyed by roomId: devices sharing a roomId share the room object and
+    // mirror; a different roomId gets its own room + Claude process. Default
+    // 'shared' preserves single-room behaviour for clients that send no roomId.
+    const key = (typeof roomId === 'string' && roomId.slice(0, 80)) || 'shared';
+    S = clientSessions.get(key);
+    if (!S) {
+      S = makeSession(key);
+      // If the room key is an existing Claude transcript, resume it on next turn.
+      if (sessionFileExists(key)) S.sessionId = key;
+      clientSessions.set(key, S);
+    }
+    if (S.graceTimer) { clearTimeout(S.graceTimer); S.graceTimer = null; }
+    S.evictWhenIdle = false;
+    S.sockets.add(ws);
+    S.lastActiveAt = Date.now();
+    console.log('[Bridge] Client attached:', clientId, 'room', key, `(${S.sockets.size} socket(s))`, S.processing ? '(reattached mid-turn)' : '');
+    // Send status/session/state directly to this socket only (others are already up to date).
+    ws.send(JSON.stringify({ type: 'status', text: 'Connected to Claude Code bridge. Ready.' }));
+    if (S.buffer.length) { const b = S.buffer; S.buffer = []; for (const d of b) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(d)); } }
+    if (S.sessionId) {
+      ws.send(JSON.stringify({ type: 'session_id', id: S.sessionId }));
+      // Push saved history so a second device loads the same conversation.
+      const hist = chatData[S.sessionId];
+      if (hist && Array.isArray(hist.messages) && hist.messages.length) {
+        ws.send(JSON.stringify({ type: 'history_sync', messages: hist.messages }));
+      }
+    }
+    if (S.processing) ws.send(JSON.stringify({ type: 'thinking' }));
+  }
+
+  // Remove a socket from its room; when the room empties, start the grace timer
+  // and evict the room afterwards so the Map can't grow without bound.
+  function detach(sock, sess) {
+    if (!sess) return;
+    sess.sockets.delete(sock);
+    if (sess.sockets.size > 0) {
+      console.log('[Bridge] Socket left room', sess.key, '—', sess.sockets.size, 'still connected');
+      return;
+    }
+    sess.lastActiveAt = Date.now();
+    // Session-backed rooms stay warm far longer so switching away from an idle
+    // room doesn't tear it down; anon/draft rooms keep the short reconnect grace.
+    // The warm-room cap bounds how many live idle procs we keep on the container.
+    const graceMs = sess.sessionId ? WARM_ROOM_TTL_MS : RECONNECT_GRACE_MS;
+    console.log('[Bridge] Room', sess.key, `empty — grace ${Math.round(graceMs / 1000)}s`);
+    if (sess.sessionId) enforceWarmCap(sess);
+    clearTimeout(sess.graceTimer);
+    sess.graceTimer = setTimeout(() => {
+      if (sess.processing || sess.pendingTurns > 0) {
+        // A turn is still running with no devices attached. Don't kill it —
+        // let it finish in the background; evict once it goes idle (evictIfReady).
+        sess.evictWhenIdle = true;
+        console.log('[Bridge] Grace expired but turn in flight — keeping room alive:', sess.key);
+        return;
+      }
+      sess.killCurrentProc('grace expired');
+      clientSessions.delete(sess.key);
+      console.log('[Bridge] Grace expired — room closed:', sess.key);
+    }, graceMs);
+  }
+
+  ws.on('message', raw => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // The client announces its stable id first so we can reattach a live session.
+    if (msg.type === 'hello') {
+      const cid = (typeof msg.clientId === 'string' && msg.clientId.slice(0, 64)) || ('anon-' + Date.now());
+      ws._clientId = cid;
+      const room = (typeof msg.roomId === 'string' && msg.roomId.slice(0, 80)) || 'shared';
+      attach(cid, room);
+      return;
+    }
+    // Fallback for older/cached clients that don't send hello: shared room.
+    if (!S) { ws._clientId = ws._clientId || ('anon-' + Math.random().toString(36).slice(2)); attach(ws._clientId, 'shared'); }
+
+    if (msg.type === 'ping') {
+      S.send({ type: 'pong', ts: Date.now() });
+    } else if (msg.type === 'status_query') {
+      // Client stall-watchdog liveness probe: report this room's real turn
+      // state so the UI can self-recover a missed 'done' (permanent spinner).
+      ws.send(JSON.stringify({ type: 'room_status', processing: !!S.processing, pendingTurns: S.pendingTurns || 0 }));
+    } else if (msg.type === 'chat') {
+      // Guard against socket drift: reconnect races can leave this socket bound to
+      // a different room than the UI shows. Re-bind to the room the client says it
+      // is in before dispatching, so a message never lands in the wrong room.
+      if (typeof msg.roomId === 'string' && msg.roomId && S && S.key !== msg.roomId.slice(0, 80)) {
+        const _want = msg.roomId.slice(0, 80);
+        console.log('[Bridge] chat room drift: socket in', S.key, 'but client says', _want, '— re-binding');
+        detach(ws, S);
+        attach(ws._clientId, _want);
+      }
+      // Only accept attachment paths that the server itself created under
+      // UPLOAD_DIR — never let a client point Claude at an arbitrary file.
+      const atts = (Array.isArray(msg.attachments) ? msg.attachments : [])
+        .filter(a => a && typeof a.path === 'string'
+          && path.resolve(a.path).startsWith(UPLOAD_DIR + path.sep)
+          && fs.existsSync(a.path));
+      let prompt = (msg.text || '').trim();
+      if (atts.length) {
+        const list = atts.map(a => `- ${a.path}`).join('\n');
+        prompt += `${prompt ? '\n\n' : ''}[The user attached ${atts.length} file(s). ` +
+          `Use your Read tool to open ${atts.length > 1 ? 'each path' : 'the path'} below ` +
+          `(images render visually) before responding:\n${list}\n]`;
+      }
+      if (!prompt.trim()) return;
+      // Broadcast the user's text to all OTHER sockets so every device shows the prompt.
+      const displayText = (msg.text || '').trim();
+      for (const sock of S.sockets) {
+        if (sock !== ws && sock.readyState === WebSocket.OPEN) {
+          sock.send(JSON.stringify({ type: 'user_msg', text: displayText }));
+        }
+      }
+      // Per-room override rides on the chat msg: 'claude'/'codex' pins THIS room;
+      // 'global' (or absent) clears the pin so the room follows the pane engine.
+      if (msg.engineMode === 'claude' || msg.engineMode === 'codex') S.engineOverride = msg.engineMode;
+      else if (msg.engineMode === 'global') S.engineOverride = null;
+      S.sendToClaude(prompt);
+    } else if (msg.type === 'resume_session') {
+      // Join the room for this conversation (idempotent if already there).
+      const target = (typeof msg.id === 'string' && msg.id.slice(0, 80)) || null;
+      if (target && (!S || S.key !== target)) { detach(ws, S); attach(ws._clientId, target); }
+    } else if (msg.type === 'adopt_session') {
+      // Attach a specific Claude session id to the CURRENT (named/pinned) room
+      // WITHOUT re-rooming, so a pinned-room client resumes its conversation after
+      // a reconnect/restart while keeping its stable room key. Gentle: never
+      // clobbers a live turn or an already-set session.
+      const id = (typeof msg.id === 'string' && msg.id.slice(0, 80)) || null;
+      if (id && S && !S.processing && !S.sessionId) {
+        S.sessionId = id;
+        S.send({ type: 'session_id', id });
+      }
+    } else if (msg.type === 'compact') {
+      console.log('[Bridge] Compacting session:', S.sessionId);
+      S.sendToClaude('/compact');
+    } else if (msg.type === 'cancel') {
+      S.killCurrentProc('user cancel');
+      S.send({ type: 'status', text: 'Cancelled.' });
+    } else if (msg.type === 'reset') {
+      S.killCurrentProc('user reset');
+      S.sessionId = null;
+      S.send({ type: 'status', text: 'Session reset — next message starts a fresh Claude session.' });
+    } else if (msg.type === 'switch_session') {
+      // Move this socket to another room. The old room keeps running for any other
+      // devices on it (grace-evicted if it empties) — we do NOT kill it here.
+      const target = (typeof msg.id === 'string' && msg.id.slice(0, 80)) || 'shared';
+      if (!S || S.key !== target) {
+        detach(ws, S);
+        attach(ws._clientId, target);
+        console.log('[Bridge] Socket switched to room:', target);
+      }
+    } else if (msg.type === 'save_history') {
+      if (msg.sessionId && Array.isArray(msg.messages)) {
+        try {
+          chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now() };
+          saveChatData();
+        } catch (e) {
+          console.error('[Bridge] History save error:', e.message);
+        }
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    detach(ws, S);
+  });
+
+  ws.on('error', err => console.error('[Bridge] WS error:', err.message));
+});
+
+server.on('error', (err) => {
+  // If the port is already held (e.g. an orphaned sibling), exit instead of
+  // lingering as a zombie — the watchdog will free the port and relaunch cleanly.
+  console.error(`[Bridge] Server error on port ${BRIDGE_PORT}: ${err.code || err.message}`);
+  process.exit(1);
+});
+
+server.listen(BRIDGE_PORT, '0.0.0.0', () => {
+  console.log(`\n✅ Claude Code Bridge running`);
+  console.log(`   HTTP:      http://0.0.0.0:${BRIDGE_PORT}`);
+  console.log(`   WebSocket: ws://0.0.0.0:${BRIDGE_PORT}/ws`);
+  console.log(`   noVNC URL: ${NOVNC_URL}`);
+  console.log(`   Claude CWD: ${CLAUDE_CWD}\n`);
+  // Re-inject any turns that were in flight when a previous instance was killed
+  // (a blip). No-op unless RESUME_TURNS is enabled.
+  try { replayPending(); } catch (e) { console.log('[Bridge] replayPending failed:', e.message); }
+});

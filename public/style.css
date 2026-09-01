@@ -533,6 +533,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 .task-details .q-run:hover  { filter: brightness(1.1); }
 .task-details .q-approve  { background: #16a34a; border-color: #16a34a; color: #fff; }
 .task-details .q-approve:hover  { filter: brightness(1.1); }
+.task-details .q-approve-run  { background: #15803d; border-color: #15803d; }
+.task-details .q-approve-run:hover  { filter: brightness(1.1); }
 .task-details .tc-cancel { background: none; color: var(--text-dim); font-weight: 500; }
 .task-details .tc-cancel:hover { color: var(--text); border-color: var(--text-dim); }
 

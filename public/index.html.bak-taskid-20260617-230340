@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-visual" />
+  <title>Claude Code Bridge</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <script src="config.js"></script>
+  <link rel="stylesheet" href="style.css?v=20260617c" />
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Left: Chat panel ── -->
+  <aside id="chat-panel">
+    <header id="chat-header">
+      <div id="header-title">
+        <span class="logo">⬡</span>
+        <span>Claude Code Bridge</span>
+      </div>
+      <div id="header-controls">
+        <div id="menu-wrap">
+          <button id="btn-menu" title="Sessions">☰</button>
+          <div id="session-dropdown" class="hidden">
+            <div id="session-list"></div>
+            <button id="btn-logout" class="sess-logout">Sign Out</button>
+          </div>
+        </div>
+        <button id="btn-status" title="Status"><span id="status-dot"></span></button>
+        <button id="btn-tasks" title="Toggle task panel">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <rect x="5" y="3" width="14" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            <path d="M9 3h6v2a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.6"/>
+            <line x1="8" y1="11" x2="16" y2="11" stroke="currentColor" stroke-width="1.6"/>
+            <line x1="8" y1="15" x2="16" y2="15" stroke="currentColor" stroke-width="1.6"/>
+          </svg>
+        </button>
+        <div id="settings-wrap">
+          <button id="btn-settings" title="Settings">⚙</button>
+          <div id="settings-dropdown" class="hidden">
+            <a href="connectors.html" id="btn-connectors" title="MCP Connectors">⚡ Connectors</a>
+            <button id="btn-open-settings">⚙ Settings</button>
+            <button id="btn-claude-auth" title="Set up your own Claude Code credentials">🔑 Authenticate Claude Code</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Status stack: conn bar + usage + activity line (collapses into mobile dropdown) -->
+    <div id="status-stack">
+    <!-- Connection status bar -->
+    <div id="conn-bar">
+      <div class="conn-item">
+        <span class="cdot cdot-connecting" id="cdot-ws" title="Chat / WebSocket"></span>
+        <span class="clabel">Chat</span>
+        <button class="cbtn hidden" id="cbtn-ws" title="Reconnect chat">↻</button>
+      </div>
+      <span class="cdivider">|</span>
+      <div class="conn-item">
+        <span class="cdot cdot-unknown" id="cdot-vnc" title="Browser / noVNC"></span>
+        <span class="clabel">Browser</span>
+        <button class="cbtn hidden" id="cbtn-vnc" title="Reconnect browser display">↻</button>
+      </div>
+      <span class="cdivider">|</span>
+      <div class="conn-item">
+        <span class="cdot cdot-unknown" id="cdot-mcp" title="Playwright MCP server"></span>
+        <span class="clabel">MCP</span>
+        <button class="cbtn hidden" id="cbtn-mcp" title="Reset MCP connection">↻</button>
+      </div>
+      <span id="conn-time" class="conn-time"></span>
+    </div>
+
+    <!-- Usage section: 5h / 7d / ctx bars + model/email -->
+    <div id="usage-section">
+      <div class="ubar-row">
+        <span class="ubar-label">5h</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-5h"></div></div>
+        <span class="ubar-pct" id="pct-5h">–</span>
+        <span class="ubar-time" id="time-5h"></span>
+      </div>
+      <div class="ubar-row">
+        <span class="ubar-label">7d</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-7d"></div></div>
+        <span class="ubar-pct" id="pct-7d">–</span>
+        <span class="ubar-time" id="time-7d"></span>
+      </div>
+      <div class="ubar-row">
+        <span class="ubar-label">ctx</span>
+        <div class="ubar-track"><div class="ubar-fill" id="fill-ctx"></div></div>
+        <span class="ubar-pct" id="pct-ctx">–</span>
+      </div>
+      <div id="ubar-meta">
+        <span id="meta-model"></span>
+        <span id="meta-sep" class="ubar-sep">·</span>
+        <span id="meta-email"></span>
+      </div>
+    </div>
+
+    <!-- Activity line ("Done in X s", "Message queued…") — bottom of the status panel -->
+    <div id="status-bar"><span id="busy-spin" class="spinner busy-hidden"></span><span id="status-text"></span></div>
+    </div><!-- /#status-stack -->
+
+    <div id="messages"></div>
+
+    <!-- Pending attachments (screenshots / files) shown as chips before sending -->
+    <div id="attach-bar" class="hidden"></div>
+
+    <div id="input-row">
+      <input type="file" id="file-input" multiple hidden
+        accept="image/*,application/pdf,text/*,.txt,.md,.csv,.json,.log,.xml,.yml,.yaml" />
+      <textarea
+        id="chat-input"
+        placeholder="Message Claude Code… (Enter to send, Shift+Enter for newline)"
+        rows="3"
+        autofocus
+      ></textarea>
+      <div id="input-buttons">
+        <button id="btn-attach" title="Attach a file or screenshot">+</button>
+        <button id="btn-send" title="Send (Enter)" aria-label="Send" disabled>
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" fill="currentColor"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── Tasks panel (hidden by default; toggle via #btn-tasks) ── -->
+  <div id="tasks-panel" class="tasks-panel-hidden">
+    <header id="tasks-header">
+      <span class="tasks-title">Tasks <span id="tasks-count" class="tasks-count"></span></span>
+      <div class="tasks-actions">
+        <button id="btn-tasks-new" title="New task">+</button>
+        <button id="btn-tasks-refresh" title="Refresh task list">↻</button>
+      </div>
+    </header>
+    <form id="task-new-form" class="hidden">
+      <input id="task-new-title" type="text" placeholder="Task title" maxlength="120" autocomplete="off" />
+      <textarea id="task-new-desc" rows="3" placeholder="Description (optional)"></textarea>
+      <div class="task-new-buttons">
+        <button type="button" id="task-new-cancel">Cancel</button>
+        <button type="submit" id="task-new-add">Add task</button>
+      </div>
+    </form>
+    <!-- Search + filters + sortable column headers -->
+    <div id="tasks-controls">
+      <input id="task-search" type="search" placeholder="Search tasks…" autocomplete="off" />
+      <div id="task-filter-bar">
+        <button id="tf-date" class="tf-btn" title="Toggle Pending / All">Pending</button>
+        <div class="tf-dd">
+          <button id="tf-status" class="tf-btn" title="Filter by status">Status ▾</button>
+          <div id="tf-status-menu" class="tf-menu hidden"></div>
+        </div>
+        <div class="tf-dd">
+          <button id="tf-area" class="tf-btn" title="Filter by area">Area ▾</button>
+          <div id="tf-area-menu" class="tf-menu hidden"></div>
+        </div>
+      </div>
+      <div id="tasks-thead">
+        <span class="th" data-sort="priority" title="Sort by priority">Pri</span>
+        <span class="th" data-sort="area" title="Sort by area">Area</span>
+        <span class="th th-title" data-sort="title" title="Sort by title">Title</span>
+        <span class="th" data-sort="status" title="Sort by status">Status</span>
+        <span class="th-more"></span>
+      </div>
+    </div>
+    <div id="tasks-list"><div class="tasks-empty">Loading…</div></div>
+  </div>
+
+  <!-- Settings panel -->
+  <div id="settings-panel" class="hidden">
+    <div id="settings-header"><span>Settings</span><button id="btn-close-settings">✕</button></div>
+    <div id="settings-body"></div>
+  </div>
+
+  <!-- ── Resizable divider ── -->
+  <div id="divider"></div>
+
+  <!-- ── Right: Browser panel ── -->
+  <main id="browser-panel">
+    <iframe id="vnc-frame" title="Live browser view" frameborder="0" allowfullscreen
+      allow="clipboard-read; clipboard-write"></iframe>
+  </main>
+
+  <!-- ── Mobile-only: live-browser zoom slider (pan via two fingers) ── -->
+  <div id="zoom-bar">
+    <span class="zoom-icon" aria-hidden="true">🔍</span>
+    <input type="range" id="zoom-slider" min="100" max="500" step="5" value="100"
+           aria-label="Zoom live browser" />
+    <span id="zoom-pct">100%</span>
+    <button id="kbd-btn" type="button" title="Keyboard" aria-label="Show keyboard">⌨</button>
+  </div>
+
+  <!-- Hidden editable field: focusing it raises the phone soft-keyboard, whose
+       keystrokes are forwarded into the remote session (see app.js). -->
+  <textarea id="kbd-capture" inputmode="text" autocomplete="off" autocorrect="off"
+            autocapitalize="off" spellcheck="false" tabindex="-1" aria-hidden="true"></textarea>
+
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="app.js?v=20260617c"></script>
+</body>
+</html>
