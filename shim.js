@@ -21,7 +21,28 @@ const PORT      = parseInt(process.env.SHIM_PORT || '8961');
 
 let upstreamSid = null, toolsCache = null;
 const rooms = new Map();               // roomId -> { targetId }
-const roomAlias = new Map();           // viewer key (promoted session id) -> canonical (draft) roomId
+const roomAlias = new Map();
+// [CONFERENCE_V2] ---- central browser mutation gate for conference rooms ----
+const _CONF_DIR = require('path').join(process.env.HOME || require('os').homedir(), '.claude', 'bridge-conference');
+const _CONF_MUT = new Set(['browser_navigate','browser_navigate_back','browser_click','browser_type','browser_press_key','browser_fill_form','browser_select_option','browser_file_upload','browser_upload','browser_drag','browser_drop','browser_hover','browser_handle_dialog','browser_evaluate','browser_run_code_unsafe','browser_close']);
+function _confSanKey(k){ return String(k).replace(/[^A-Za-z0-9_-]/g,'_'); }
+function _confState(key){ try { return JSON.parse(require('fs').readFileSync(require('path').join(_CONF_DIR, _confSanKey(key)+'.json'),'utf8')); } catch { return null; } }
+function _confMode(c){ if(!c||(c.status!=='running'&&c.status!=='paused'))return null; if(c.stage==='implementation')return 'write'; if(c.stage==='verification')return 'verify'; return 'readonly'; }
+// Resolve every candidate key (raw + alias both directions + tombstone hop) and
+// decide. Fail-closed: mutation allowed ONLY when a running write-stage state exists
+// and nothing (paused / non-write / another conf) blocks it.
+function confGate(room){
+  const base = new Set([room]);
+  const canon = roomAlias.get(room); if (canon) base.add(canon);
+  for (const [a,c] of roomAlias) { if (c===room) base.add(a); }
+  const all = new Set(base);
+  for (const k of base) { const st=_confState(k); if (st && st.status==='superseded' && st.supersededBy) all.add(st.supersededBy); }
+  let anyConf=false, sawWrite=false, block=false, blockStage=null;
+  for (const k of all) { const st=_confState(k); if(!st)continue; if(st.status==='running'||st.status==='paused'){ anyConf=true; const m=_confMode(st); if(st.status==='running'&&m==='write')sawWrite=true; else { block=true; blockStage=st.stage||'discussion'; } } }
+  return { conf:anyConf, allow: anyConf ? (sawWrite && !block) : true, stage:blockStage, keys:[...all] };
+}
+function confRecordDenial(keys, tool){ for(const k of keys){ try{ require('fs').mkdirSync(_CONF_DIR,{recursive:true}); require('fs').appendFileSync(require('path').join(_CONF_DIR,_confSanKey(k)+'.deny.jsonl'), JSON.stringify({ts:Date.now(),tool})+'\n'); }catch{} } }
+// -------------------------------------------------------------------------------           // viewer key (promoted session id) -> canonical (draft) roomId
 const evictedTabs = new Set();         // targetIds detached by LRU eviction; reaper CDP-closes any whose Playwright close failed
 // Persist roomAlias across shim restarts/flaps. The bridge POSTs the draft->session
 // alias only once (at promotion), so an in-memory-only map is silently lost on every
@@ -73,6 +94,11 @@ const persistedReapedByRoom = new Map();    // roomId -> [{url,at}] restored fro
 // upstream MCP's single "active tab" pointer can't be raced between rooms.
 const lock = (fn) => { const r = chain.then(fn, fn); chain = r.then(() => {}, () => {}); return r; };
 const log = (...a) => console.log('[shim]', ...a);
+// [SHIM_CRASHGUARD_V1]
+const _CRASHLOG = require('path').join(process.env.HOME || '/home/bridge-peter', '.claude', 'shim-crash.log');
+function _crash(kind, e) { try { require('fs').appendFileSync(_CRASHLOG, '[' + new Date().toISOString() + '] ' + kind + ': ' + ((e && e.stack) || e) + '\n'); } catch {} }
+process.on('unhandledRejection', (e) => { _crash('unhandledRejection', e); log('unhandledRejection (non-fatal):', String((e && e.message) || e)); });
+process.on('uncaughtException', (e) => { _crash('uncaughtException', e); log('FATAL uncaughtException:', String((e && e.stack) || e)); setTimeout(() => process.exit(1), 100); });
 
 /* ---------- CDP target tracking (page-target order == MCP tab index order) ---------- */
 let pageTargets = [];                   // ordered targetIds of type 'page'
@@ -109,6 +135,9 @@ async function connectCDP() {
   });
   // setDiscoverTargets replays targetCreated for all existing targets (seeds order).
   await cdpSend('Target.setDiscoverTargets', { discover: true });
+  // [SHIM_SELECT_VERIFY_V9] Kick the batch URL-fallback settle once discovery has replayed, so
+  // the one-to-one rebind is computed over the complete authoritative target set (race-free).
+  if (persistedOwnerByUrl.size) scheduleBootUrlSettle();
   log('CDP connected;', pageTargets.length, 'page target(s)');
 }
 function addTarget(ti) {
@@ -140,16 +169,52 @@ const REBIND_WINDOW_MS = parseInt(process.env.SHIM_REBIND_WINDOW_MS || '60000', 
 const _ownBootTs = Date.now();
 const persistedOwnerByUrl = new Map();   // url -> roomId (only URLs with a single prior owner)
 const persistedCurByRoom  = new Map();   // roomId -> its current tab's url
+// [SHIM_OWNERSHIP_PERSIST_V2] Persist the targetId of each owned tab too. When only the
+// shim restarts (Chrome survives), targetIds are STABLE, so we can rebind every tab to
+// its exact prior room by targetId — authoritative even for same-URL twins, which the
+// URL-only rebind had to drop (they orphaned on every restart — Codex finding #7).
+const persistedOwnerByTargetId = new Map();  // targetId -> roomId
+const persistedCurIdByRoom     = new Map();  // roomId -> its current tab's targetId
+// [SHIM_TESTHOOK_V1] Adversarial-ordering barriers for the conference verification suite.
+// Armed one-shot via POST /test/arm; fires ONLY for rooms whose id starts with 'conf-it-'
+// (the integration-test namespace), so it is completely inert for every real room even if
+// left armed. Lets the harness force the exact races Codex asked to see: (a) topology
+// divergence BETWEEN sentinel correlation and MCP selection, (b) closing the proven target
+// DURING the transaction (after proof, before the action).
+const _armed = new Map();   // `${room}:${phase}` -> { action }
+const _isTestRoom = (r) => typeof r === 'string' && r.startsWith('conf-it-');
+// Test hooks are DISABLED in production. They only exist when an explicit, out-of-band opt-in
+// is present: env SHIM_TEST_HOOKS=1 or the flag file ~/.claude/shim-test-hooks. A room-name
+// prefix is NOT an authorization boundary, so it is never sufficient on its own. The endpoint
+// only listens on loopback (the shim binds 127.0.0.1). Absent the opt-in, the /test route 404s
+// and every barrier is inert even for conf-it-* rooms.
+const _HOOKS_FLAG = require('path').join(process.env.HOME || '/home/bridge-peter', '.claude', 'shim-test-hooks');
+function _testHooksOn() { return process.env.SHIM_TEST_HOOKS === '1' || (() => { try { return require('fs').existsSync(_HOOKS_FLAG); } catch { return false; } })(); }
+async function _testHook(phase, room, ctx) {
+  if (!_testHooksOn() || !_isTestRoom(room)) return null;
+  const key = room + ':' + phase;
+  const a = _armed.get(key); if (!a) return null;
+  _armed.delete(key);   // one-shot
+  try {
+    if (a.action === 'closeTarget' && ctx && ctx.tid) {
+      await cdpCloseTarget(ctx.tid);
+      log('[TESTHOOK]', phase, 'closed proven target', String(ctx.tid).slice(0, 12), 'for', room);
+    }
+    return a;
+  } catch (e) { log('[TESTHOOK] error', e && e.message); return a; }
+}
 try {
   const raw = JSON.parse(require('fs').readFileSync(OWNERSHIP_FILE, 'utf8'));
   const owners = new Map();               // url -> Set(roomId)
   for (const [rid, o] of raw) {
     if (o && o.cur) persistedCurByRoom.set(rid, o.cur);
+    if (o && o.curId) persistedCurIdByRoom.set(rid, o.curId);
     if (o && Array.isArray(o.reaped) && o.reaped.length) persistedReapedByRoom.set(rid, o.reaped);
+    for (const t of (o && o.tabIds) || []) { if (t) persistedOwnerByTargetId.set(t, rid); }
     for (const u of (o && o.urls) || []) { if (!u || u === 'about:blank') continue; if (!owners.has(u)) owners.set(u, new Set()); owners.get(u).add(rid); }
   }
   for (const [u, set] of owners) if (set.size === 1) persistedOwnerByUrl.set(u, [...set][0]);
-  if (persistedOwnerByUrl.size) log('loaded', persistedOwnerByUrl.size, 'persisted tab-ownership URL(s) for post-restart re-bind');
+  if (persistedOwnerByTargetId.size || persistedOwnerByUrl.size) log('loaded', persistedOwnerByTargetId.size, 'targetId +', persistedOwnerByUrl.size, 'URL tab-ownership record(s) for post-restart re-bind');
 } catch (e) {}
 function saveOwnership() {
   try {
@@ -159,13 +224,52 @@ function saveOwnership() {
       const urls = rt.tabs.map(t => targetUrl.get(t)).filter(u => u && u !== 'about:blank');
       const reaped = (rt.reaped && rt.reaped.length) ? rt.reaped : null;
       if (!urls.length && !reaped) continue;
-      out.push([rid, { urls, cur: (rt.current && targetUrl.get(rt.current)) || null, reaped: reaped || [] }]);
+      out.push([rid, { urls, tabIds: rt.tabs.slice(), cur: (rt.current && targetUrl.get(rt.current)) || null, curId: rt.current || null, reaped: reaped || [] }]);
     }
     require('fs').writeFileSync(OWNERSHIP_FILE, JSON.stringify(out), 'utf8');
   } catch (e) {}
 }
 const _ownTimer = setInterval(saveOwnership, 5000); if (_ownTimer.unref) _ownTimer.unref();
 function ownedByAny(tid) { for (const [, rt] of rooms) if (rt.tabs && rt.tabs.includes(tid)) return true; return false; }
+// [SHIM_SELECT_VERIFY_V9] Batch URL-fallback rebind, run once after boot discovery settles.
+// Recomputes one-to-one URL ownership over a FRESH authoritative /json snapshot, so a persisted
+// single-owner URL is rebound only when EXACTLY ONE live unclaimed target holds it — and a URL
+// shared by >1 live target is refused for all of them. Race-free vs. sequential targetCreated
+// replay (a twin that arrives mid-burst is still counted). Debounced; re-armed by each candidate.
+let _bootSettleTimer = null;
+function scheduleBootUrlSettle() {
+  if (_bootSettleTimer) clearTimeout(_bootSettleTimer);
+  _bootSettleTimer = setTimeout(() => { _bootSettleTimer = null; runBootUrlSettle().catch(() => {}); }, 400);
+  if (_bootSettleTimer.unref) _bootSettleTimer.unref();
+}
+async function runBootUrlSettle() {
+  if ((Date.now() - _ownBootTs) >= REBIND_WINDOW_MS || !persistedOwnerByUrl.size) return;
+  let live;
+  try { live = (await (await fetch(`${CDP_URL}/json`)).json()).filter(t => t.type === 'page'); } catch { return; }
+  // Authoritative current unclaimed-target set, grouped by URL.
+  const byUrl = new Map();   // url -> [targetId,...] (live AND not already owned)
+  for (const t of live) {
+    if (!t.url || t.url === 'about:blank') continue;
+    if (ownedByAny(t.id)) continue;
+    if (!byUrl.has(t.url)) byUrl.set(t.url, []);
+    byUrl.get(t.url).push(t.id);
+  }
+  for (const [url, rid] of [...persistedOwnerByUrl]) {
+    const cands = byUrl.get(url) || [];
+    if (cands.length !== 1) {
+      if (cands.length > 1) log('boot settle: URL', (url || '').slice(0, 60), 'has', cands.length, 'live unclaimed targets — AMBIGUOUS, not rebinding any (fail-closed)');
+      continue;   // 0 = nothing to bind; >1 = ambiguous, leave all orphan
+    }
+    const tid = cands[0];
+    let rt = rooms.get(rid);
+    if (!rt) { rt = { tabs: [], current: null, lastUrl: null, lastUsed: 0 }; rooms.set(rid, rt); }
+    if (!rt.tabs.includes(tid)) rt.tabs.push(tid);
+    if (persistedCurByRoom.get(rid) === url || !rt.current) rt.current = tid;
+    rt.lastUrl = url;
+    persistedOwnerByUrl.delete(url);
+    log('boot settle: re-bound orphan tab', String(tid).slice(0, 12), 'url', (url || '').slice(0, 60), '-> room', rid, '(one-to-one, fresh snapshot)');
+  }
+}
 // [SHIM_STICKY_DOMAINS_V1] Authenticated / session-bearing tabs (webmail, OAuth, WhatsApp)
 // must never be silently LRU-evicted or re-attributed to another room — losing one drops a
 // live login and forces a re-auth. Configurable via SHIM_STICKY_DOMAINS (comma list).
@@ -195,20 +299,30 @@ function attributeNewTab(ti) {
       }
     }
   }
-  // [SHIM_OWNERSHIP_PERSIST_V1] Re-bind by URL to the room that owned this tab before a
-  // restart — takes priority over active-room attribution so a resuming room can't steal
-  // a concurrent room's tab. Only within the post-boot adoption window, only for an
-  // unambiguous single-owner URL, never mid explicit 'new'. Consume the URL (re-bind one).
-  if (!expectingNewTab && (Date.now() - _ownBootTs) < REBIND_WINDOW_MS && ti.url && persistedOwnerByUrl.has(ti.url)) {
-    const rid = persistedOwnerByUrl.get(ti.url);
+  // [SHIM_OWNERSHIP_PERSIST_V2] Exact targetId rebind first. When only the shim restarted,
+  // Chrome (and thus every targetId) survived, so this re-attaches each tab to its exact
+  // prior room — authoritative even for same-URL twins that the URL rebind below must drop.
+  if (!expectingNewTab && (Date.now() - _ownBootTs) < REBIND_WINDOW_MS && persistedOwnerByTargetId.has(ti.targetId)) {
+    const rid = persistedOwnerByTargetId.get(ti.targetId);
     let rt = rooms.get(rid);
     if (!rt) { rt = { tabs: [], current: null, lastUrl: null, lastUsed: 0 }; rooms.set(rid, rt); }
-    rt.tabs.push(ti.targetId);
-    if (persistedCurByRoom.get(rid) === ti.url || !rt.current) rt.current = ti.targetId;
-    rt.lastUrl = ti.url;
-    persistedOwnerByUrl.delete(ti.url);
-    log('re-bound orphan tab', ti.targetId, 'url', (ti.url || '').slice(0, 60), '-> room', rid, '(post-restart ownership)');
+    if (!rt.tabs.includes(ti.targetId)) rt.tabs.push(ti.targetId);
+    if (persistedCurIdByRoom.get(rid) === ti.targetId || !rt.current) rt.current = ti.targetId;
+    if (ti.url != null) { rt.lastUrl = ti.url; }
+    persistedOwnerByTargetId.delete(ti.targetId);
+    if (persistedOwnerByUrl.get(ti.url) === rid) persistedOwnerByUrl.delete(ti.url);   // don't double-rebind
+    log('re-bound tab', String(ti.targetId).slice(0, 12), 'by targetId -> room', rid, '(post-restart, exact)');
     return;
+  }
+  // [SHIM_SELECT_VERIFY_V9] Re-bind by URL to the room that owned this tab before a restart.
+  // Do NOT rebind inline: sequential targetCreated replay means a same-URL twin may not have
+  // arrived yet, so any point-in-time uniqueness check (partial pageTargets OR a boot snapshot)
+  // can be fooled into binding the first of two. Instead DEFER to a single batch pass that runs
+  // after discovery settles and recomputes one-to-one URL fallback over a fresh authoritative
+  // /json snapshot — so an ambiguous URL is refused for ALL its twins, race-free.
+  if (!expectingNewTab && (Date.now() - _ownBootTs) < REBIND_WINDOW_MS && ti.url && persistedOwnerByUrl.has(ti.url) && !ownedByAny(ti.targetId)) {
+    scheduleBootUrlSettle();
+    return;   // leave unowned for now; the settle pass binds it iff its URL is unambiguous
   }
   // (b) active-room attribution (skip while an explicit 'new' is being added by its handler)
   if (!expectingNewTab && activeRoom) {
@@ -260,6 +374,7 @@ function attributeNewTab(ti) {
 function removeTarget(id) {
   const i = pageTargets.indexOf(id); if (i >= 0) { pageTargets.splice(i, 1); orderDirty = true; }
   targetUrl.delete(id);
+  _dropWs(id);   // [SHIM_SELECT_VERIFY_V5] close any cached page socket for the gone target
   for (const [room, rt] of rooms) {
     if (rt.tabs && rt.tabs.includes(id)) {
       rt.tabs = rt.tabs.filter(t => t !== id);
@@ -439,7 +554,15 @@ async function newTab() {
   // (two rooms sharing one targetId => cross-room clobber + spurious "freed").
   for (let i = 0; i < 200; i++) {                // up to ~10s
     const added = pageTargets.filter(t => !before.has(t));
-    if (added.length) return added[added.length - 1];
+    if (added.length) {
+      // [SHIM_SELECT_VERIFY_V6] Strictly fail-closed: bind ONLY when the before/after
+      // target-ID difference for THIS creation transaction is exactly one target. No
+      // "unique blank" fallback — that could bind a concurrently-created foreign tab or
+      // a pre-existing blank surfaced late by CDP discovery. Anything else throws; the
+      // whole tools/call runs inside lock(), so a legitimate `new` yields exactly one.
+      if (added.length === 1) return added[0];
+      throw new Error('ambiguous new-tab attribution (' + added.length + ' new targets in creation window) — fail-closed');
+    }
     // Every ~1s, reconcile against Chrome's /json in case the websocket dropped
     // the Target.targetCreated event for this new page.
     if (i > 0 && i % 20 === 0) await refreshTargetsHTTP();
@@ -477,10 +600,10 @@ async function evictIfNeeded(keepRoom) {
     }
     if (!victim) break;   // nothing idle to evict -> allow briefly over cap rather than deadlock
     for (const tid of victim.tabs.slice()) {
-      const g = pageTargets.indexOf(tid);
-      if (g >= 0) { try { await tool('browser_tabs', { action: 'select', index: g }); await tool('browser_tabs', { action: 'close' }); } catch {} }
-      evictedTabs.add(tid);   // if the Playwright close above silently failed (browser slow/wedged),
-                              // the reaper CDP-closes it later so evicted tabs can't leak + accumulate
+      // Evict by targetId over CDP (authoritative — never an inferred index that could
+      // close a foreign tab). [SHIM_SELECT_VERIFY_V2]
+      if (pageTargets.includes(tid)) { try { await cdpCloseTarget(tid); } catch {} }
+      evictedTabs.add(tid);   // reaper CDP-closes later if the close above silently failed
     }
     victim.tabs = []; victim.current = null; orderDirty = true;
     log('evicted idle room', vkey, '(LRU) to stay within', MAX_ROOM_TABS, 'tabs; restores', victim.lastUrl || 'about:blank', 'on next use');
@@ -502,16 +625,186 @@ async function ensureRoomTab(room) {
   log('room', room, '-> tab', tid, '(index', pageTargets.indexOf(tid) + ')', rt.lastUrl ? 'restored ' + restore : '');
   return rt;
 }
-async function selectCurrent(rt) {
-  // Re-sync index order ONLY when the target set changed since the last select
-  // (orderDirty). Steady-state navigate/click on an unchanged tab set pays no
-  // upstream round-trip here — the drift fix without the per-call cost that
-  // regressed the earlier attempt.
+// ── [SHIM_SELECT_VERIFY_V2] authoritative, fail-closed tab selection ──────────
+// The upstream Playwright MCP selects a tab only by POSITIONAL INDEX, but the shim
+// owns tabs by stable CDP targetId. Translating targetId->index by URL matching
+// (resyncOrder) is an INFERENCE that drifts on stale/duplicate URLs or a reinit; a
+// wrong index silently drives/closes a FOREIGN tab invisible to the room's strip —
+// the reported bug. V2 makes selection PROVABLE and FAIL-CLOSED:
+//   1. cheap path: select the inferred index, then read the select response's full
+//      tab list. If the (current) URL equals the target's expected URL AND that URL
+//      is UNIQUE across all listed tabs, the selection is proven — no extra cost.
+//   2. authoritative path (only when the cheap proof fails — dup URL, blank, stale,
+//      or parse miss): stamp a random sentinel into the target's document.title over
+//      its OWN CDP page socket, read the MCP list, and take the index whose title ==
+//      sentinel. This identifies the tab by targetId regardless of URL collisions.
+//   3. fail closed: if neither path can PROVE the index, THROW — never forward,
+//      navigate, or close on an unproven tab.
+// Parse a browser_tabs list result into [{index,title,url,current}]. Robust to URLs
+// containing parentheses: the URL is the markdown-link tail `](...)` at EOL, and the
+// title is the last `[...]` group, so a literal "(current)" is never mis-taken.
+const { parseTabsFull } = require('./shim-tabparse');  // [SHIM_SELECT_VERIFY_V4] production parser (unit-tested)
+// Cheap proof: the response's (current) tab is our target AND its URL is globally
+// unique in the list (so a URL match is unambiguous). Uses the LIVE URLs from the
+// select response itself, so a stale local targetUrl cache can't create a false
+// positive — at worst it fails the proof and we fall to the sentinel path.
+function provenByUniqueUrl(sel, tid) {
+  const expected = targetUrl.get(tid);
+  if (!expected || expected === 'about:blank') return false;
+  const rows = parseTabsFull(sel);
+  const cur = rows.find(r => r.current);
+  if (!cur || cur.url !== expected) return false;
+  return rows.filter(r => r.url === expected).length === 1;
+}
+async function pageWsFor(tid) {
+  try {
+    const list = await (await fetch(`${CDP_URL}/json`)).json();
+    const p = list.find(x => x.id === tid && x.type === 'page');
+    return (p && p.webSocketDebuggerUrl) || null;
+  } catch { return null; }
+}
+function pageRpc(ws, method, params, timeoutMs) {
+  return new Promise((res, rej) => {
+    const id = Math.floor(Math.random() * 1e6);
+    const to = setTimeout(() => { ws.off('message', onMsg); rej(new Error('cdp page rpc timeout')); }, timeoutMs || 4000);
+    const onMsg = (d) => { let m; try { m = JSON.parse(d); } catch { return; } if (m.id !== id) return; clearTimeout(to); ws.off('message', onMsg); m.error ? rej(new Error(m.error.message)) : res(m.result); };
+    ws.on('message', onMsg);
+    try { ws.send(JSON.stringify({ id, method, params: params || {} })); } catch (e) { clearTimeout(to); ws.off('message', onMsg); rej(e); }
+  });
+}
+// Authoritatively resolve the MCP list index for a targetId via a title sentinel.
+// Returns the index, or -1 if it cannot be proven (page socket dead, sentinel not
+// echoed by the MCP list). Restores the original title afterwards. Best-effort but
+// SAFE: a -1 makes the caller fail closed rather than act on a guess.
+// ── [SHIM_SELECT_VERIFY_V3] mandatory per-action sentinel identity proof ───────
+// Consensus (conference round 3): a URL can be stale, duplicated, or change under us,
+// so URL matching NEVER authorizes an action. Identity is proven on EVERY tab-scoped
+// operation by an unforgeable per-transaction title SENTINEL stamped over the target's
+// OWN CDP page socket. The sentinel stays installed THROUGH select+verify; we confirm
+// the SELECTED (current) tab carries it (not merely that some index does), closing the
+// list->select reorder gap. Cleanup is COMPARE-AND-RESTORE: the original title is only
+// put back if the tab still exists and still shows our sentinel, so a navigation or an
+// intentional title change during selection is never clobbered. Fail-closed throughout:
+// if identity can't be proven we THROW and the caller must not forward/navigate/close.
+async function pageTitle(ws) {
+  const r = await pageRpc(ws, 'Runtime.evaluate', { expression: 'document.title', returnByValue: true });
+  return (r && r.result && typeof r.result.value === 'string') ? r.result.value : null;
+}
+async function setPageTitle(ws, t) {
+  await pageRpc(ws, 'Runtime.evaluate', { expression: `document.title=${JSON.stringify(t)};`, returnByValue: true });
+}
+function repairOrder(tid, idx) {
+  const at = pageTargets.indexOf(tid);
+  if (at !== idx) { if (at >= 0) pageTargets.splice(at, 1); pageTargets.splice(Math.min(idx, pageTargets.length), 0, tid); orderDirty = true; }
+}
+// [SHIM_SELECT_VERIFY_V4] The sentinel's lifecycle is owned by the OUTER locked dispatch
+// transaction (see tools/call). `_txnCleanups` is the per-transaction list of installed
+// sentinels; proveSelect REGISTERS a cleanup and leaves the sentinel in place THROUGH the
+// upstream action; the dispatch finally runs restoreSentinel() (compare-and-restore) AFTER
+// the action. Defensive fallback: if there is no active txn, restore inline.
+let _txnCleanups = null;
+// [SHIM_SELECT_VERIFY_V5] Reused per-target DevTools page sockets (no per-action churn).
+const _pageWsCache = new Map();   // targetId -> OPEN ws
+function _dropWs(tid) { const w = _pageWsCache.get(tid); if (w) { _pageWsCache.delete(tid); try { w.close(); } catch {} } }
+async function getPageWs(tid) {
+  const ex = _pageWsCache.get(tid);
+  if (ex && ex.readyState === WebSocket.OPEN) { ex._lastUsed = Date.now(); return ex; }
+  if (ex) { _pageWsCache.delete(tid); try { ex.close(); } catch {} }
+  const wsUrl = await pageWsFor(tid);
+  if (!wsUrl) return null;
+  const ws = await new Promise((res, rej) => { const so = new WebSocket(wsUrl, { perMessageDeflate: false }); const to = setTimeout(() => rej(new Error('ws open timeout')), 4000); so.on('open', () => { clearTimeout(to); res(so); }); so.on('error', (e) => { clearTimeout(to); rej(e); }); });
+  ws._lastUsed = Date.now();
+  ws.on('error', () => _dropWs(tid));
+  ws.on('close', () => { if (_pageWsCache.get(tid) === ws) _pageWsCache.delete(tid); });
+  _pageWsCache.set(tid, ws);
+  return ws;
+}
+{ const _wt = setInterval(() => { const now = Date.now(); for (const [tid, ws] of _pageWsCache) if (now - (ws._lastUsed || 0) > 60000) _dropWs(tid); }, 30000); if (_wt.unref) _wt.unref(); }
+async function restoreSentinel(c) {
+  try {
+    if (c && c.ws) {
+      const now = await pageTitle(c.ws).catch(() => null);
+      if (now === c.sentinel && c.orig != null) await setPageTitle(c.ws, c.orig).catch(() => {});
+    }
+  } catch {}
+  // NB [V5]: do NOT close the ws here — it is cached and reused; _dropWs / idle-evictor own it.
+}
+// Prove that Playwright's CURRENT tab is the one owned as `tid`. `candidateIdx` is only a
+// HINT; proof is the sentinel on the SELECTED (current) row. Registers a compare-and-restore
+// cleanup owned by the outer txn (sentinel persists through the action). Throws (fail-closed)
+// if identity can't be proven — caller must NOT forward/navigate/close.
+async function proveSelect(tid, candidateIdx) {
+  const sentinel = '__SHIMSEL_' + Math.random().toString(36).slice(2, 10) + '__';
+  let ws = null, orig = null, handedOff = false;
+  try {
+    ws = await getPageWs(tid);   // [V5] reused cached page socket (no per-action churn)
+    if (!ws) throw new Error('cannot open CDP page socket for tab ' + String(tid).slice(0, 12) + ' — refusing to drive/close an unproven tab');
+    // Retry-safe: if this txn already stamped this tid (withRetry re-ran select), reclaim the
+    // TRUE original from the prior cleanup and restore/close it, so we never stamp sentinel
+    // over sentinel or restore a sentinel as if it were the original title.
+    if (_txnCleanups) {
+      for (let k = _txnCleanups.length - 1; k >= 0; k--) if (_txnCleanups[k].tid === tid) {
+        const p = _txnCleanups.splice(k, 1)[0];
+        if (orig == null) orig = p.orig;
+        await restoreSentinel(p);
+      }
+    }
+    const raw = await pageTitle(ws);
+    if (orig == null) orig = (typeof raw === 'string' && /^__SHIMSEL_[a-z0-9]{8}__$/.test(raw)) ? null : raw;
+    await setPageTitle(ws, sentinel);
+    // [SHIM_TESTHOOK_V1] Barrier: force topology divergence BETWEEN correlation and selection.
+    // When armed, Attempt-1 deliberately selects a DIFFERENT tab than the candidate, so the
+    // sentinel-proof below must fail and Attempt-2 (relocate by sentinel) must recover.
+    let _forceWrong = false;
+    if (_testHooksOn() && _isTestRoom(activeRoom) && _armed.get(activeRoom + ':forceWrongCandidate')) {
+      _armed.delete(activeRoom + ':forceWrongCandidate'); _forceWrong = true;
+      log('[TESTHOOK] forcing Attempt-1 onto a WRONG tab for', activeRoom, '(must trigger Attempt-2 relocation)');
+    }
+    // Attempt 1 — cheap candidate index (hint). Proof = selected current bears our sentinel.
+    let sel;
+    if (_forceWrong) {
+      const rows0 = parseTabsFull(await tool('browser_tabs', { action: 'list' }));
+      const wrong = rows0.find(r => r.title !== sentinel) || rows0[0];
+      sel = await tool('browser_tabs', { action: 'select', index: wrong ? wrong.index : 0 });
+    } else {
+      sel = (candidateIdx != null && candidateIdx >= 0) ? await tool('browser_tabs', { action: 'select', index: candidateIdx }) : null;
+    }
+    let cur = sel ? parseTabsFull(sel).find(r => r.current) : null;
+    if (!(cur && cur.title === sentinel)) {
+      // Attempt 2 — locate the sentinel's true index and select THAT, then re-verify.
+      let rows = sel ? parseTabsFull(sel) : [];
+      let hit = rows.find(r => r.title === sentinel);
+      if (!hit) { rows = parseTabsFull(await tool('browser_tabs', { action: 'list' })); hit = rows.find(r => r.title === sentinel); }
+      if (!hit) throw new Error('sentinel not visible in MCP tab list for ' + String(tid).slice(0, 12) + ' — cannot prove identity (fail-closed)');
+      sel = await tool('browser_tabs', { action: 'select', index: hit.index });
+      cur = parseTabsFull(sel).find(r => r.current);
+      if (!cur || cur.title !== sentinel) throw new Error('select did not land on the sentinel-proven tab ' + String(tid).slice(0, 12) + ' (fail-closed)');
+    }
+    repairOrder(tid, cur.index);
+    // Hand the live sentinel to the outer txn: it stays installed THROUGH the upstream action.
+    const cleanup = { tid, ws, sentinel, orig };
+    if (_txnCleanups) { _txnCleanups.push(cleanup); } else { await restoreSentinel(cleanup); }
+    handedOff = true;
+    return sel;
+  } finally {
+    // Threw before hand-off (identity unproven): restore + close our own ws now (fail-closed).
+    if (!handedOff) await restoreSentinel({ ws, sentinel, orig });
+  }
+}
+// Select the tab owned as `tid` and PROVE (by sentinel) Playwright made it current.
+// Returns the proven select-list result. Throws (fail-closed) if unprovable.
+async function selectTargetProven(tid) {
+  if (!tid) throw new Error('selectTargetProven: no target');
   if (orderDirty) await resyncOrder();
-  const idx = pageTargets.indexOf(rt.current);
-  if (idx < 0) throw new Error('room tab vanished');
-  await tool('browser_tabs', { action: 'select', index: idx });
-  tabTouch.set(rt.current, Date.now());   // [SHIM_RECONCILE_V1] per-tab recency for lossless reap
+  let idx = pageTargets.indexOf(tid);
+  if (idx < 0) { await resyncOrder(); idx = pageTargets.indexOf(tid); }
+  const sel = await proveSelect(tid, idx);   // sentinel-proven identity, fail-closed
+  tabTouch.set(tid, Date.now());
+  return sel;
+}
+async function selectCurrent(rt) {
+  if (!rt || !rt.current) throw new Error('room has no current tab');
+  await selectTargetProven(rt.current);
 }
 
 // Intercept browser_tabs and present a room-local view (indices 0..n within the
@@ -554,8 +847,9 @@ async function handleTabs(room, rt, args) {
     const i = (args.index == null) ? rt.tabs.indexOf(rt.current) : args.index;
     const tid = rt.tabs[i];
     if (tid == null) return { content: [{ type: 'text', text: `Error: this room has no tab ${i}` }], isError: true };
-    const g = pageTargets.indexOf(tid);
-    if (g >= 0) { await tool('browser_tabs', { action: 'select', index: g }); await tool('browser_tabs', { action: 'close' }); }
+    // Close by targetId over CDP — authoritative, so a stale index can never close a
+    // FOREIGN tab (the inferred-index close was the destructive-path hole). [SHIM_SELECT_VERIFY_V2]
+    if (pageTargets.includes(tid)) { try { await cdpCloseTarget(tid); } catch {} evictedTabs.add(tid); }
     rt.tabs = rt.tabs.filter(t => t !== tid);
     if (rt.current === tid) rt.current = rt.tabs[rt.tabs.length - 1] || null;
     if (rt.tabs.length === 0) { const n = await newTab(); rt.tabs.push(n); rt.current = n; }
@@ -751,6 +1045,17 @@ const server = http.createServer((req, res) => {
     });
     res.writeHead(200); return res.end('detached');
   }
+  // [SHIM_TESTHOOK_V1] Arm/disarm a one-shot adversarial barrier for a conf-it-* test room.
+  // POST /test/arm/<room>/<phase>/<action>  (phase: forceWrongCandidate | afterProof).
+  const tst = url.match(/^\/test\/(arm|disarm)\/([^/]+)\/([^/]+)(?:\/([^/?]+))?$/);
+  if (tst) {
+    if (!_testHooksOn()) { res.writeHead(404); return res.end('test hooks disabled (set SHIM_TEST_HOOKS=1 or ~/.claude/shim-test-hooks to enable)'); }
+    const room = decodeURIComponent(tst[2]);
+    if (!_isTestRoom(room)) { res.writeHead(403); return res.end('test hooks only for conf-it-* rooms'); }
+    const key = room + ':' + decodeURIComponent(tst[3]);
+    if (tst[1] === 'arm') { _armed.set(key, { action: decodeURIComponent(tst[4] || 'noop') }); res.writeHead(200); return res.end('armed ' + key); }
+    _armed.delete(key); res.writeHead(200); return res.end('disarmed ' + key);
+  }
   // Admin room-close (bridge calls this on room teardown): POST /admin/close/<room>.
   // Frees the room mapping and closes its tab.
   const adm = url.match(/^\/admin\/close\/([^/?]+)$/);
@@ -759,9 +1064,10 @@ const server = http.createServer((req, res) => {
     lock(async () => {
       const rt = rooms.get(room); rooms.delete(room);
       { let _ac = false; for (const [a, c] of roomAlias) if (c === room || a === room) { roomAlias.delete(a); _ac = true; } if (_ac) saveAliases(); }
+      // Close each tab by targetId over CDP (authoritative — never an inferred index
+      // that could close another room's tab). [SHIM_SELECT_VERIFY_V2]
       if (rt && rt.tabs) for (const tid of rt.tabs) {
-        const g = pageTargets.indexOf(tid);
-        if (g >= 0) { try { await tool('browser_tabs', { action: 'select', index: g }); await tool('browser_tabs', { action: 'close' }); } catch {} }
+        if (pageTargets.includes(tid)) { try { await cdpCloseTarget(tid); } catch {} evictedTabs.add(tid); }
       }
       log('room', room, 'closed (admin)');
     });
@@ -806,23 +1112,45 @@ const server = http.createServer((req, res) => {
       }
       if (method === 'tools/call') {
         const nm = msg.params.name, a = msg.params.arguments || {};
+        // [CONFERENCE_V2] fail-closed browser mutation gate for conference rooms.
+        {
+          const _isMut = _CONF_MUT.has(nm) || (nm === 'browser_tabs' && a && (a.action === 'new' || a.action === 'close'));
+          if (_isMut) {
+            const _g = confGate(room);
+            if (_g.conf && !_g.allow) {
+              confRecordDenial(_g.keys, nm);
+              log('CONFERENCE_V2 blocked mutating', nm, 'room', room, 'stage', _g.stage);
+              return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: { code: -32011, message: 'CONFERENCE_POLICY_DENIED: ' + nm + ' is not permitted during the ' + (_g.stage || 'discussion') + ' stage (read-only). Blocked; the conference will pause for the user.' } });
+            }
+          }
+        }
         const out = await lock(async () => {
-          activeRoom = room;   // this room now holds the floor (for tab attribution)
-          // Recovery is REACTIVE only (no pre-emptive session probe): sessions
-          // survive idle fine, so an extra probe would just add its own 404 risk
-          // -> reinit -> tab-index drift. ensureRoomTab (idempotent) is retried;
-          // browser_tabs new/close are NOT idempotent (a retry would create/close
-          // an extra tab), so they run exactly ONCE, never wrapped in withRetry.
-          const rt = await withRetry(() => ensureRoomTab(room));
-          rt.lastUsed = Date.now();   // mark recency for LRU eviction
-          if (nm === 'browser_tabs') return handleTabs(room, rt, a);   // room-scoped, runs once
-          // Remember the room's target page so a lost tab can be restored there.
-          if (nm === 'browser_navigate' && a && a.url) rt.lastUrl = a.url;
-          // Plain forwarded calls (navigate/click/evaluate/...) are safe to re-run,
-          // so retry just the select+forward if the session dies mid-call.
-          const _res = await withRetry(async () => { await selectCurrent(rt); return tool(nm, a); });
-          await reconcileAfterCall(room, rt).catch(() => {});   // [SHIM_RECONCILE_V1] chip membership + paintable current
-          return _res;
+          // [SHIM_SELECT_VERIFY_V4] One non-reentrant boundary owns the sentinel lifecycle:
+          // proveSelect registers cleanups in _txnCleanups; the sentinel persists THROUGH the
+          // upstream action; the finally does compare-and-restore AFTER it. `return await` so
+          // the finally runs only once the action has fully completed (not at return time).
+          _txnCleanups = [];
+          try {
+            activeRoom = room;   // this room now holds the floor (for tab attribution)
+            // Recovery is REACTIVE only; ensureRoomTab (idempotent) is retried; browser_tabs
+            // new/close are NOT idempotent so run exactly ONCE (never wrapped in withRetry).
+            const rt = await withRetry(() => ensureRoomTab(room));
+            rt.lastUsed = Date.now();   // mark recency for LRU eviction
+            if (nm === 'browser_tabs') return await handleTabs(room, rt, a);   // room-scoped, runs once
+            if (nm === 'browser_navigate' && a && a.url) rt.lastUrl = a.url;   // remember target page
+            // Plain forwarded calls are safe to re-run: retry select+forward on a mid-call death.
+            const _res = await withRetry(async () => {
+              await selectCurrent(rt);
+              // [SHIM_TESTHOOK_V1] Barrier: close the PROVEN target between proof and action.
+              await _testHook('afterProof', room, { tid: rt.current });
+              return tool(nm, a);
+            });
+            await reconcileAfterCall(room, rt).catch(() => {});   // [SHIM_RECONCILE_V1] chip membership + paintable current
+            return _res;
+          } finally {
+            const _cl = _txnCleanups || []; _txnCleanups = null;
+            for (const c of _cl) await restoreSentinel(c);   // compare-and-restore AFTER the action
+          }
         });
         // Pass upstream result OR error straight through (don't swallow tool errors).
         if (out && out.error) return sse(res, `shim-${room}`, { jsonrpc: '2.0', id, error: out.error });

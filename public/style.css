@@ -738,7 +738,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #chat-input {
   flex: 1; background: var(--bg-msg); border: 1px solid var(--border);
   border-radius: 6px; color: var(--text); padding: 8px 10px;
-  font-size: 13px; resize: none; line-height: 1.4; font-family: inherit;
+  font-size: 13px; resize: vertical; line-height: 1.4; font-family: inherit;
+  min-height: 38px; max-height: 60vh; /* INPUT_RESIZE_V1 */
   transition: border-color 0.2s;
 }
 #chat-input:focus { outline: none; border-color: var(--accent); }

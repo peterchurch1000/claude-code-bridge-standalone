@@ -561,7 +561,97 @@
     try { const f = document.getElementById('vnc-frame'); f && f.contentWindow && f.contentWindow.postMessage({ type: 'ccb-room-bg', color: c || '' }, '*'); } catch {}
   }
   window.addEventListener('message', e => { if (e && e.data && e.data.type === 'ccb-room-bg-req') applyRoomBg(currentRoomId); });
-  let globalEngine = 'claude', codexEnabled = false;
+  let globalEngine = 'claude', codexEnabled = false, roomEngineSync = false;
+  // [ENGINE_AUTHORITATIVE_V1] The engine the status bar is CURRENTLY showing (server-authoritative
+  // via /usage or room_engine). This exact value is sent with every chat so the server can refuse
+  // to dispatch under an engine the user was not shown. currentTurnEngine = engine of the live turn.
+  let displayedEngine = null;
+  let currentTurnEngine = null;
+  try {
+    const _chipStyle = document.createElement('style');
+    _chipStyle.textContent = '.msg-assistant[data-engine]::before{content:"";display:block;width:max-content;font-size:10px;font-weight:600;opacity:.6;margin:0 0 4px;padding:1px 6px;border-radius:4px;letter-spacing:.02em}'
+      + '.msg-assistant[data-engine="claude"]::before{content:"🟦 Claude";background:rgba(80,120,255,.16)}'
+      + '.msg-assistant[data-engine="codex"]::before{content:"🟩 Codex";background:rgba(80,200,120,.16)}';
+    document.head.appendChild(_chipStyle);
+  } catch (e) {}
+
+  // ── [CONFERENCE_V1] client-side conference rendering + controls ──────────────
+  let confStreamEngine = null;        // engine whose turn is currently streaming
+  let confState = null;               // last known conference state for the current room
+  let activeConf = false;             // true while the conference is actively orchestrating
+  function confModeKey(rid) { return 'confmode:' + (rid || currentRoomId); }
+  function confModeOn(rid) { try { return localStorage.getItem(confModeKey(rid)) === '1'; } catch { return false; } }
+  function setConfMode(rid, on) { try { if (on) localStorage.setItem(confModeKey(rid), '1'); else localStorage.removeItem(confModeKey(rid)); } catch {} }
+  function confStripVerdict(t) { return String(t || '').replace(/<<<CONFERENCE_VERDICT[\s\S]*$/, '').replace(/\s+$/, ''); }
+  function confEngineLabel(e) { return e === 'codex' ? 'Codex' : 'Claude'; }
+  function confEngineIcon(e) { return e === 'codex' ? '\uD83D\uDFE9' : '\uD83D\uDFE6'; }  // 🟩 / 🟦
+
+  function ensureConfBanner() {
+    let b = $('conf-banner');
+    if (b) return b;
+    b = document.createElement('div');
+    b.id = 'conf-banner';
+    b.className = 'conf-banner';
+    b.style.cssText = 'display:none;position:sticky;top:0;z-index:20;padding:8px 12px;margin:0 0 6px;border-radius:8px;background:#1f2937;color:#e5e7eb;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 1px 4px rgba(0,0,0,.3)';
+    b.innerHTML = '<span id="conf-banner-text" style="flex:1 1 auto">Conference</span>' +
+      '<button id="conf-btn-pause" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Pause</button>' +
+      '<button id="conf-btn-resume" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb;display:none">Resume</button>' +
+      '<button id="conf-btn-stop" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#991b1b;color:#fee2e2">Stop</button>';
+    if (messagesEl && messagesEl.parentNode) messagesEl.parentNode.insertBefore(b, messagesEl);
+    else document.body.appendChild(b);
+    b.querySelector('#conf-btn-pause').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_pause' })); } catch {} };
+    b.querySelector('#conf-btn-resume').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_resume' })); } catch {} };
+    b.querySelector('#conf-btn-stop').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_stop' })); } catch {} };
+    return b;
+  }
+  function renderConfBanner() {
+    const b = ensureConfBanner();
+    const c = confState;
+    if (!c || c.status === 'stopped' || c.status === 'done' || c.status === 'idle') {
+      if (c && (c.status === 'done' || c.status === 'stopped')) {
+        b.style.display = '';
+        b.querySelector('#conf-banner-text').textContent = c.status === 'done' ? '\u2705 Conference complete' : '\u23F9 Conference stopped';
+        b.querySelector('#conf-btn-pause').style.display = 'none';
+        b.querySelector('#conf-btn-resume').style.display = 'none';
+        b.querySelector('#conf-btn-stop').style.display = 'none';
+      } else { b.style.display = 'none'; }
+      return;
+    }
+    b.style.display = '';
+    const lead = confEngineLabel(c.leadEngine), rev = confEngineLabel(c.reviewEngine);
+    /* [CONFERENCE_V2] */ const who = c.subphase === 'review' ? (rev + ' reviewing') : c.subphase === 'final' ? (lead + ' finalising') : (lead + ' working');
+    const stageTxt = c.stageLabel || c.stage || '';
+    let txt = '\uD83E\uDD1D Conference \u00B7 ' + stageTxt + ' \u00B7 round ' + (c.round || 1) + '/' + (c.maxRounds || 4) + ' \u00B7 ' + who + (c.restriction && c.restriction !== 'write' ? ' \u00B7 \uD83D\uDD12 read-only' : '');
+    if (c.status === 'paused') txt = '\u23F8 Paused' + (c.reason ? (' \u2014 ' + c.reason) : '') + ' \u00B7 round ' + (c.round || 1) + '/' + (c.maxRounds || 4);
+    b.querySelector('#conf-banner-text').textContent = txt;
+    b.querySelector('#conf-btn-pause').style.display = c.status === 'running' ? '' : 'none';
+    b.querySelector('#conf-btn-resume').style.display = c.status === 'paused' ? '' : 'none';
+    b.querySelector('#conf-btn-stop').style.display = '';
+  }
+  function confDivider(engine, role, round, stageLabel) {   /* [CONFERENCE_V2] */
+    const d = document.createElement('div');
+    d.className = 'conf-divider';
+    d.style.cssText = 'margin:14px 0 4px;font-size:12px;font-weight:600;letter-spacing:.02em;opacity:.85;display:flex;align-items:center;gap:6px';
+    d.textContent = confEngineIcon(engine) + ' ' + confEngineLabel(engine) + ' \u00B7 ' + (role || '') + (stageLabel ? (' \u00B7 ' + stageLabel) : '') + (round ? (' \u00B7 round ' + round) : '');
+    messagesEl.appendChild(d);
+    scrollBottom();
+  }
+  // Render the full server-authoritative conference log (reload / second device).
+  function renderConfSync(msg) {
+    if (!Array.isArray(msg.messages)) return;
+    if (busy) { return; }   // don't disturb a live streaming view; next reload will sync
+    messagesEl.innerHTML = '';
+    storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
+    for (const m of msg.messages) {
+      confDivider(m.engine, m.role, m.round, m.stageLabel);   /* [CONFERENCE_V2] */
+      const el = appendMsg('assistant', m.text || '');
+      void el;
+    }
+    confState = { status: msg.status, stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine };   /* [CONFERENCE_V2] */
+    activeConf = (msg.status === 'running');
+    renderConfBanner();
+  }
+
   function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
   function applyEngineMeta(d) { if (!d) return; globalEngine = (d.engine === 'codex') ? 'codex' : 'claude'; codexEnabled = !!d.codexEnabled; if (typeof updateTitlebar === 'function') updateTitlebar(); }
   (async () => { try { const _d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
@@ -703,6 +793,7 @@
 
     if (role === 'assistant') {
       div.style.whiteSpace = 'normal';
+      if (currentTurnEngine) div.dataset.engine = currentTurnEngine;
       renderMd(div, text || '');
     } else {
       div.textContent = text || '';
@@ -712,7 +803,9 @@
     scrollBottom();
 
     if (!_restoring) {
-      storedMsgData.push({ type: role, text: text || '' });
+      const rec = { type: role, text: text || '' };
+      if (role === 'assistant' && currentTurnEngine) rec.engine = currentTurnEngine;
+      storedMsgData.push(rec);
       if (role === 'assistant') lastAssistantDataIdx = storedMsgData.length - 1;
       saveToStorage();
     }
@@ -927,6 +1020,32 @@
 
       case 'pong': break;
 
+      // [CONFERENCE_V1] server-orchestrated collaboration events
+      case 'conf_started':
+        confState = { status: 'running', stage: msg.stage || 'diagnosis', stageLabel: msg.stageLabel, subphase: 'lead', round: 1, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine };   /* [CONFERENCE_V2] */
+        activeConf = true; renderConfBanner();
+        appendMsg('user', '\uD83E\uDD1D Conference started \u2014 lead: ' + confEngineLabel(msg.leadEngine) + ', reviewer: ' + confEngineLabel(msg.reviewEngine) + ' (up to ' + msg.maxRounds + ' rounds)');
+        break;
+      case 'conf_status':
+        confState = { status: msg.status, stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason };   /* [CONFERENCE_V2] */
+        activeConf = (msg.status === 'running'); renderConfBanner();
+        break;
+      case 'conf_turn':
+        confStreamEngine = msg.engine;
+        confDivider(msg.engine, msg.role, msg.round, msg.stageLabel);   /* [CONFERENCE_V2] */
+        break;
+      case 'conf_msg':
+        // Live view already streamed this turn; finalise the current bubble to the
+        // clean (verdict-stripped) text so no marker remnants remain.
+        if (currentAssistantEl) { renderMd(currentAssistantEl, msg.text || ''); currentAssistantEl = null; currentAssistantText = ''; }
+        break;
+      case 'conf_sync':
+        renderConfSync(msg);
+        break;
+      case 'conf_policy':   /* [CONFERENCE_V2] */
+        appendMsg('user', '\uD83D\uDEAB Policy: a disallowed action (' + (msg.detail || 'mutation') + ') was blocked during ' + (msg.stage || '') + '. The conference is paused for your review.');
+        break;
+
       case 'status':
         setStatus(msg.text || '');
         if (/auto-compacting|compacting to free space/i.test(msg.text || '')) noteCompaction();
@@ -989,6 +1108,39 @@
           updateTitlebar();
           if (typeof loadSessions === 'function') loadSessions();
         }
+        break;
+
+      case 'room_engine':
+        roomEngineSync = true;
+        if (msg.roomId !== currentRoomId) break;
+        setRoomOverride(msg.mode, msg.roomId);
+        if (msg.mode === 'global') globalEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        displayedEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        updateTitlebar();
+        pollUsage();
+        if (msg.error) {
+          appendMsg('error', '⚠ ' + msg.error);
+          setBusy(!!msg.processing);
+          if (!msg.processing) removeThinking();
+        }
+        break;
+
+      case 'turn_engine':
+        currentTurnEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        break;
+
+      case 'engine_resync':
+      case 'client_upgrade_required':
+        if (msg.roomId && msg.roomId !== currentRoomId) break;
+        if (msg.engine) {
+          displayedEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+          if (msg.mode === 'global') globalEngine = displayedEngine; else setRoomOverride(msg.mode, currentRoomId);
+        }
+        if (msg.text && !inputEl.value.trim()) { inputEl.value = msg.text; inputEl.dispatchEvent(new Event('input', { bubbles: true })); }
+        removeThinking(); setBusy(false);
+        try { updateTitlebar(); } catch (e) {}
+        pollUsage();
+        showToast(msg.reason || 'Engine changed — message not sent. Please resend.', 'warning');
         break;
 
       case 'room_status':
@@ -1203,15 +1355,49 @@
     return `${timeLeft} (${resetStr})`;
   }
 
+  let usageRequest = 0;
   async function pollUsage() {
+    const request = ++usageRequest;
+    const roomId = currentRoomId;
+    const guess = effectiveEngine(roomId);
+    const isCurrent = () => request === usageRequest && roomId === currentRoomId;
+    // Optimistic label from local state; the server response is authoritative below.
+    if (metaModel) metaModel.textContent = guess === 'codex' ? 'Codex' : 'Claude';
+    if (metaEmail) metaEmail.textContent = '';
+    if (metaSep) metaSep.style.visibility = 'hidden';
+    if (btnUsageRefresh) btnUsageRefresh.style.display = guess === 'codex' ? 'none' : '';
+    for (const [fill, label] of [[fill5h, pct5h], [fill7d, pct7d], [fillCtx, pctCtx]]) {
+      fill.style.width = '0%'; label.textContent = '–';
+    }
+    if (time5h) time5h.textContent = '';
+    if (time7d) time7d.textContent = '';
     try {
-      const engine = effectiveEngine(currentRoomId);
-      const qs = '?engine=' + encodeURIComponent(engine) + '&roomId=' + encodeURIComponent(currentRoomId || '');
+      // [ENGINE_AUTHORITATIVE_V1] Ask the server (roomId) and render the engine IT resolves, so the
+      // bar can never show usage for an engine the server will not dispatch to. Fall back to the
+      // local guess only when talking to an older server that omits data.engine.
+      const qs = '?engine=' + encodeURIComponent(guess) + '&roomId=' + encodeURIComponent(roomId || '');
       const res  = await fetch(API_BASE + '/usage' + qs, { cache: 'no-store' });
       const data = await res.json();
-      if (!data.ok) return;
+      if (!isCurrent() || !data.ok) return;
+      const engine = (data.engine === 'codex') ? 'codex' : (data.engine === 'claude' ? 'claude' : guess);
+      displayedEngine = engine;
+      if (btnUsageRefresh) btnUsageRefresh.style.display = engine === 'codex' ? 'none' : '';
+
+      let selectedEmail = '';
+      if (engine === 'codex') {
+        const accounts = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json();
+        if (!isCurrent()) return;
+        if (accounts && accounts.ok) {
+          const active = (accounts.accounts || []).find(a => a.type === 'codex' && a.active);
+          selectedEmail = active && active.email || '';
+          if (metaEmail) metaEmail.textContent = selectedEmail;
+          if (metaSep) metaSep.style.visibility = selectedEmail ? 'visible' : 'hidden';
+        }
+      }
 
       const rl = data.rateLimits || {};
+      // Reject usage cached for the account that was active before switching.
+      if (engine === 'codex' && (!selectedEmail || rl.email !== selectedEmail)) return;
       const b  = data.block      || {};
       const w  = data.week       || {};
 
@@ -1525,7 +1711,7 @@
             currentAssistantEl = appendMsg('assistant', '');
           }
           currentAssistantText += block.text;
-          renderMd(currentAssistantEl, currentAssistantText);
+          renderMd(currentAssistantEl, activeConf ? confStripVerdict(currentAssistantText) : currentAssistantText);   // [CONFERENCE_V1]
           // Persist THIS bubble's text immediately. Without this, assistant text
           // that precedes a tool_use is never written back to storedMsgData (only
           // the turn's final bubble was, via lastAssistantDataIdx at 'result'),
@@ -1593,14 +1779,15 @@
         if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
       }
     } else {
-      appendMsg(m.type, m.text || '');
+      const _el = appendMsg(m.type, m.text || '');
+      if (_el && m.type === 'assistant' && m.engine) _el.dataset.engine = m.engine;
     }
   }
 
-  function buildMsgNode(role, text) {
+  function buildMsgNode(role, text, engine) {
     const div = document.createElement('div');
     div.className = `msg msg-${role}`;
-    if (role === 'assistant') { div.style.whiteSpace = 'normal'; renderMd(div, text || ''); }
+    if (role === 'assistant') { div.style.whiteSpace = 'normal'; if (engine) div.dataset.engine = engine; renderMd(div, text || ''); }
     else div.textContent = text || '';
     return div;
   }
@@ -1644,7 +1831,7 @@
     const prevH = messagesEl.scrollHeight, prevTop = messagesEl.scrollTop;
     const frag = document.createDocumentFragment();
     for (const m of batch) {
-      const node = m.type === 'tool' ? buildToolNode(m.toolName, m.args, m.result) : buildMsgNode(m.type, m.text || '');
+      const node = m.type === 'tool' ? buildToolNode(m.toolName, m.args, m.result) : buildMsgNode(m.type, m.text || '', m.engine);
       if (node) frag.appendChild(node);
     }
     const anchor = _olderBtn ? _olderBtn.nextSibling : messagesEl.firstChild;
@@ -1876,12 +2063,38 @@
     });
   });
 
+  // ── Input history (shell-style ArrowUp/ArrowDown recall) ── INPUT_HISTORY_V1 ─
+  const inputHistory = [];   // oldest first, most-recent last
+  let historyIdx = -1;       // -1 = live (un-recalled) draft
+  let historyDraft = '';
+  function setInputValue(v) {
+    inputEl.value = v;
+    inputEl.dispatchEvent(new Event('input'));
+    inputEl.setSelectionRange(v.length, v.length);
+  }
+  function recallHistory(dir) {            // dir -1 = older, +1 = newer
+    if (!inputHistory.length) return false;
+    if (dir < 0) {
+      if (historyIdx === -1) { historyDraft = inputEl.value; historyIdx = 0; }
+      else if (historyIdx < inputHistory.length - 1) historyIdx++;
+      else { return true; }
+    } else {
+      if (historyIdx <= 0) { historyIdx = -1; setInputValue(historyDraft); return true; }
+      historyIdx--;
+    }
+    setInputValue(inputHistory[inputHistory.length - 1 - historyIdx]);
+    return true;
+  }
+
   // ── Send ──────────────────────────────────────────────────────────────────
   function sendMessage() {
     const text = inputEl.value.trim();
     if (!text && !pendingAttachments.length) return;
     if (uploadsInFlight > 0) { showToast('Wait for the upload to finish', 'warning'); return; }
     if (ws?.readyState !== WebSocket.OPEN) return;
+    // [ENGINE_AUTHORITATIVE_V1] For a global-mode room, don't send until the bar's engine is known
+    // (the server fails closed otherwise). Fetch it, then the user resends.
+    if (!confModeOn(currentRoomId) && roomOverride() === 'global' && !displayedEngine) { pollUsage(); showToast('Confirming engine… please resend in a moment', 'info'); return; }
 
     const attachments = pendingAttachments.map(a => ({ path: a.path, name: a.name }));
     const echo = text + (attachments.length
@@ -1889,11 +2102,23 @@
       : '');
     appendMsg('user', echo);
     clearLastQuestion();
-    ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: roomOverride(), roomId: currentRoomId }));
+    if (confModeOn(currentRoomId)) {   // [CONFERENCE_V1] start / interject a conference
+      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'conference', roomId: currentRoomId }));
+    } else {
+      const _mode = roomOverride();
+      if (_mode === 'claude' || _mode === 'codex') displayedEngine = _mode;   // explicit pin == what the bar shows
+      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: _mode, displayedEngine, roomId: currentRoomId }));
+    }
     setCurrentTask(text.replace(/\s+/g, ' ').trim().slice(0, 140));
+    if (text && inputHistory[inputHistory.length - 1] !== text) {
+      inputHistory.push(text);
+      if (inputHistory.length > 50) inputHistory.shift();
+    }
+    historyIdx = -1;
 
     inputEl.value = '';
-    inputEl.style.height = 'auto';
+    userResizedInput = false;
+    autoGrowInput();
     clearAttachments();
   }
 
@@ -1902,12 +2127,32 @@
   // since there's no Shift key to reach for. On desktop keep Enter-to-send.
   const enterInsertsNewline = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
   inputEl.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey && !enterInsertsNewline) { e.preventDefault(); sendMessage(); }
+    if (e.key === 'Enter' && !e.shiftKey && !enterInsertsNewline) { e.preventDefault(); sendMessage(); return; }
+    // ArrowUp recalls previous input only when the caret is at the very start,
+    // so multi-line editing (moving up between lines) still works normally.
+    if (e.key === 'ArrowUp' && inputEl.selectionStart === 0 && inputEl.selectionEnd === 0) {
+      if (recallHistory(-1)) e.preventDefault();
+    } else if (e.key === 'ArrowDown' && historyIdx !== -1) {
+      if (recallHistory(1)) e.preventDefault();
+    }
   });
-  inputEl.addEventListener('input', () => {
+  // Auto-grow up to 120px — but once the user drags the resize handle we stop
+  // overriding their chosen height. INPUT_RESIZE_V1
+  let userResizedInput = false;
+  let lastAutoHeight = null;
+  function autoGrowInput() {
+    if (userResizedInput) return;
     inputEl.style.height = 'auto';
     inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
-  });
+    lastAutoHeight = inputEl.offsetHeight;
+  }
+  inputEl.addEventListener('input', autoGrowInput);
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => {
+      if (userResizedInput || lastAutoHeight == null) return;
+      if (Math.abs(inputEl.offsetHeight - lastAutoHeight) > 1) userResizedInput = true;
+    }).observe(inputEl);
+  }
 
   // ── Session management ────────────────────────────────────────────────────
   function fmtSessionDate(ts) {
@@ -1950,7 +2195,8 @@
     const engSel = $('st-engine');
     if (engSel) {
       engSel.style.display = codexEnabled ? '' : 'none';
-      engSel.value = roomOverride(currentRoomId);
+      if (!engSel.querySelector('option[value="conference"]')) { const o = document.createElement('option'); o.value = 'conference'; o.textContent = '\uD83E\uDD1D Conference'; engSel.appendChild(o); }   // [CONFERENCE_V1]
+      engSel.value = confModeOn(currentRoomId) ? 'conference' : roomOverride(currentRoomId);
       const gopt = engSel.querySelector('option[value="global"]');
       if (gopt) gopt.textContent = 'Global (' + (globalEngine === 'codex' ? 'Codex' : 'Claude') + ')';
       const eff = effectiveEngine(currentRoomId);
@@ -1959,10 +2205,26 @@
       if (!engSel._wired) {
         engSel._wired = true;
         engSel.addEventListener('change', () => {
-          setRoomOverride(engSel.value, currentRoomId);
-          updateTitlebar();
-          pollUsage();
-          if (typeof showToast === 'function') showToast('This room \u2192 ' + (engSel.value === 'global' ? 'Global engine' : engSel.value === 'codex' ? 'Codex' : 'Claude'), 'info');
+          if (engSel.value === 'conference') {   // [CONFERENCE_V1]
+            setConfMode(currentRoomId, true);
+            if (typeof showToast === 'function') showToast('Conference mode \u2014 your next message starts a Claude+Codex collaboration', 'info');
+            updateTitlebar();
+            return;
+          }
+          const mode = engSel.value;
+          if (!roomEngineSync) {
+            setConfMode(currentRoomId, false);
+            setRoomOverride(mode, currentRoomId);
+            updateTitlebar(); pollUsage();
+            return;
+          }
+          updateTitlebar(); // Keep the acknowledged value until the server accepts.
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            showToast('Not connected. Reconnect before changing the room engine.', 'error');
+            return;
+          }
+          setConfMode(currentRoomId, false);
+          ws.send(JSON.stringify({ type: 'set_engine', roomId: currentRoomId, mode }));
         });
       }
     }
@@ -2948,8 +3210,11 @@
 
   // ── Codex (ChatGPT) re-authentication via device code [CODEX_DEVICE_AUTH_V1]
   function openCodexAuth(name, isNew) {
-    /* CODEX_BROWSER_AUTH_V2: full browser-OAuth flow (grants api.connectors.* scopes);
-       user pastes back the localhost:1455 redirect URL, backend relays it to codex.
+    /* [CODEX_DEVICE_OPT_V1] Two sign-in modes:
+         browser (default) — full codex login, grants api.connectors.* scopes; user
+           pastes back the localhost:1455 redirect (relayed via /codex/auth/complete).
+         device — codex login --device-auth; shows a URL + one-time code, codex polls
+           OpenAI itself (no paste-back). Reduced scope (no api.connectors.*).
        isNew=true → prompt for a name tag and save the result as a NEW Codex account. */
     document.querySelectorAll('.cauth-overlay').forEach(n => n.remove());
     const ov = document.createElement('div');
@@ -2958,11 +3223,15 @@
       <div class="cauth-modal">
         <div class="cauth-head"><span>${isNew ? '➕ Add Codex account' : '↻ Re-authenticate Codex — ' + name}</span><button class="cauth-x" title="Close">✕</button></div>
         <div class="cauth-body">
-          <p class="cauth-intro">${isNew ? 'Sign a <b>new</b> ChatGPT (Codex) account in with full scopes.' : 'Refresh this Codex (ChatGPT) login with full scopes.'} Click start, open the link, sign in &amp; approve. Your browser will then try to open a <code>localhost:1455</code> page that won’t load — copy that whole address and paste it below.</p>
+          <p class="cauth-intro">${isNew ? 'Sign a <b>new</b> ChatGPT (Codex) account in.' : 'Refresh this Codex (ChatGPT) login.'} Choose how to sign in, then click start.</p>
+          <div class="cxauth-mode" style="display:flex;gap:14px;margin:0 0 10px;font-size:13px;flex-wrap:wrap">
+            <label style="display:flex;gap:5px;align-items:center;cursor:pointer"><input type="radio" name="cxauthmode" value="browser" checked> Browser sign-in <span style="opacity:.6">(full scopes)</span></label>
+            <label style="display:flex;gap:5px;align-items:center;cursor:pointer"><input type="radio" name="cxauthmode" value="device"> Device code <span style="opacity:.6">(simpler, no paste-back)</span></label>
+          </div>
           ${isNew ? `<p style="margin:0 0 4px"><b>Name this login</b> (a short tag to identify it):</p>
           <input id="cxauth-name" type="text" placeholder="e.g. tamara" maxlength="24" autocomplete="off" spellcheck="false" style="width:100%;box-sizing:border-box;margin-bottom:8px" value="${name || ''}" />` : ''}
           <button class="cauth-btn" id="cxauth-start">Start sign-in</button>
-          <div id="cxauth-step2" class="cauth-hidden">
+          <div id="cxauth-step2b" class="cauth-hidden">
             <p><b>1.</b> Open this link and sign in with ChatGPT:</p>
             <div class="cauth-linkrow">
               <a id="cxauth-link" target="_blank" rel="noopener">Open ChatGPT sign-in ↗</a>
@@ -2973,6 +3242,19 @@
               <input id="cxauth-url" type="text" placeholder="http://localhost:1455/auth/callback?code=…" autocomplete="off" spellcheck="false" style="flex:1;min-width:0" />
               <button class="cauth-btn cauth-sm" id="cxauth-submit">Finish</button>
             </div>
+          </div>
+          <div id="cxauth-step2d" class="cauth-hidden">
+            <p><b>1.</b> Open this page on any device:</p>
+            <div class="cauth-linkrow">
+              <a id="cxauth-dlink" target="_blank" rel="noopener">Open device sign-in ↗</a>
+              <button class="cauth-btn cauth-sm" id="cxauth-dcopy">Copy link</button>
+            </div>
+            <p><b>2.</b> Enter this one-time code (expires in 15 min):</p>
+            <div class="cauth-linkrow">
+              <code id="cxauth-code" style="font-size:20px;letter-spacing:2px;font-weight:700;user-select:all">————</code>
+              <button class="cauth-btn cauth-sm" id="cxauth-codecopy">Copy code</button>
+            </div>
+            <p style="opacity:.7;margin-top:6px">Waiting for you to approve — this finishes automatically, no paste-back needed.</p>
           </div>
           <div id="cxauth-msg" class="cauth-msg"></div>
         </div>
@@ -2985,6 +3267,7 @@
     ov.querySelector('.cauth-x').addEventListener('click', close);
     ov.addEventListener('click', e => { if (e.target === ov) close(); });
     const startBtn = ov.querySelector('#cxauth-start');
+    const selectedMode = () => (ov.querySelector('input[name=cxauthmode]:checked') || {}).value || 'browser';
     const startPoll = () => {
       if (pollTimer) return;
       pollTimer = setInterval(async () => {
@@ -3006,14 +3289,26 @@
         useName = ((ni && ni.value) || '').trim().replace(/[^a-zA-Z0-9_-]/g, '');
         if (!useName) { setMsg('Enter a name tag first.', 'err'); if (ni) ni.focus(); return; }
       }
+      const mode = selectedMode();
       startBtn.disabled = true; setMsg('Starting sign-in…', 'info');
       try {
-        const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: useName }) });
+        const r = await fetch(`${API_BASE}/codex/auth/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: useName, mode }) });
         const d = await r.json();
         if (!r.ok || !d.url) throw new Error(d.error || 'Could not start sign-in.');
-        ov.querySelector('#cxauth-link').href = d.url;
-        ov.querySelector('#cxauth-step2').classList.remove('cauth-hidden');
         startBtn.classList.add('cauth-hidden');
+        ov.querySelectorAll('.cxauth-mode input').forEach(i => { i.disabled = true; });
+        if (mode === 'device') {
+          ov.querySelector('#cxauth-dlink').href = d.url;
+          ov.querySelector('#cxauth-code').textContent = d.code || '————';
+          ov.querySelector('#cxauth-step2d').classList.remove('cauth-hidden');
+          ov.querySelector('#cxauth-dcopy').addEventListener('click', () => navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => {}));
+          ov.querySelector('#cxauth-codecopy').addEventListener('click', () => navigator.clipboard.writeText(d.code || '').then(() => setMsg('Code copied.', 'info'), () => {}));
+          setMsg('Open the link, enter the code, and approve — this window finishes on its own.', 'info');
+          startPoll();
+          return;
+        }
+        ov.querySelector('#cxauth-link').href = d.url;
+        ov.querySelector('#cxauth-step2b').classList.remove('cauth-hidden');
         setMsg('Sign in, approve, then paste the localhost address below.', 'info');
         ov.querySelector('#cxauth-copy').addEventListener('click', () => navigator.clipboard.writeText(d.url).then(() => setMsg('Link copied.', 'info'), () => {}));
         const submit = ov.querySelector('#cxauth-submit');
@@ -3031,7 +3326,7 @@
         };
         submit.addEventListener('click', doSubmit);
         urlInp.addEventListener('keydown', e => { if (e.key === 'Enter') doSubmit(); });
-      } catch (e) { startBtn.disabled = false; setMsg(e.message, 'err'); }
+      } catch (e) { startBtn.disabled = false; ov.querySelectorAll('.cxauth-mode input').forEach(i => { i.disabled = false; }); setMsg(e.message, 'err'); }
     });
   }
 
@@ -3222,6 +3517,7 @@
       await render();
     }
     async function doSwitch(name, type) {
+      ++usageRequest;
       setMsg('Switching…', 'info');
       listEl.querySelectorAll('button').forEach(b => b.disabled = true);
       try {

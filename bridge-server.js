@@ -636,6 +636,7 @@ function transplantPreamble(body) {
 }
 function maybeSeed(S, engine, text) {
   if (!XENGINE_TRANSPLANT) return { text, crossed: false };
+  if (S && S.conf && S.conf.status === 'running') return { text, crossed: false };   // [CONFERENCE_V1] keep native threads; deltas carry the partner's turns
   if (!S.lastEngine || S.lastEngine === engine) return { text, crossed: false };
   const msgs = roomHistoryMessages(S.key, S.sessionId);
   if (!msgs.length) return { text, crossed: false };
@@ -790,6 +791,7 @@ app.post('/history/:sessionId', (req, res) => {
 app.delete('/history/:sessionId', (req, res) => {
   try {
     delete chatData[req.params.sessionId];
+    clearRoom(req.params.sessionId);   // [CODEX_DURABLE_V2]
     saveChatData();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -953,7 +955,7 @@ app.delete('/sessions/:id', (req, res) => {
     if (room && room.processing) {
       return res.status(409).json({ error: 'Session is running — stop it before deleting.' });
     }
-    if (room) { try { room.killCurrentProc('session deleted'); } catch {} clientSessions.delete(id); }
+    if (room) { try { room.killCurrentProc('session deleted'); } catch {} clientSessions.delete(id); clearRoom(id); }   // [CODEX_DURABLE_V2]
     try {
       const f = path.join(transcriptsDir(), `${id}.jsonl`);
       if (fs.existsSync(f)) fs.unlinkSync(f);
@@ -1177,6 +1179,46 @@ function currentEngine() {
   if (!e) { try { e = fs.readFileSync(ENGINE_FILE, 'utf8').trim().toLowerCase(); } catch {} }
   return e === 'codex' ? 'codex' : 'claude';
 }
+// [ENGINE_AUTHORITATIVE_V1] Monotonic revision of the shared global-engine marker. It bumps
+// whenever the marker VALUE changes, so connected clients can be told to resync. Value-equality
+// (never the rev) is the dispatch refusal criterion.
+let _globalEngineSeen = null, _globalEngineRev = 0;
+function globalEngineNow() {
+  const v = currentEngine();
+  if (_globalEngineSeen !== v) { _globalEngineSeen = v; _globalEngineRev++; }
+  return { engine: v, rev: _globalEngineRev };
+}
+// The ONE place a room's engine is decided (used by /usage, engineState and the dispatch
+// guard so no divergent fallback logic can creep in): a per-room pin wins, else the live
+// global marker. NEVER lastEngine (that is display history, not a predictor of dispatch).
+function resolveRoomEngine(S) {
+  const override = (S && (S.engineOverride === 'claude' || S.engineOverride === 'codex')) ? S.engineOverride : null;
+  const g = globalEngineNow();
+  return { engine: override || g.engine, mode: override ? override : 'global', rev: g.rev };
+}
+// Durable-map variant for a room with no live session (offline /usage lookups).
+function resolveRoomEngineByKey(key) {
+  const S = clientSessions.get(key);
+  if (S) return resolveRoomEngine(S);
+  let override = null;
+  try { const rec = _loadRoomMap()[key]; if (rec && (rec.engineOverride === 'claude' || rec.engineOverride === 'codex')) override = rec.engineOverride; } catch {}
+  const g = globalEngineNow();
+  return { engine: override || g.engine, mode: override ? override : 'global', rev: g.rev };
+}
+// Push a fresh room_engine to every room that FOLLOWS the global marker, so an out-of-band
+// change (another tab/account switch, a cron) updates their bars without a reload.
+function broadcastGlobalEngineChange() {
+  for (const S of clientSessions.values()) {
+    if (!S || S.engineOverride) continue;
+    try { S.send(S.engineState()); } catch {}
+  }
+}
+// Convergence poll (NOT the correctness guarantee): detect a marker value change and broadcast.
+function pollEngineMarker() {
+  const before = _globalEngineSeen;
+  const g = globalEngineNow();
+  if (before !== null && g.engine !== before) broadcastGlobalEngineChange();
+}
 function codexEmail(o) {
   try {
     const t = ((o.tokens || {}).id_token) || '';
@@ -1268,6 +1310,7 @@ app.post('/accounts/switch', (req, res) => {
       const out = ((stdout || '') + (stderr || '')).trim();
       if (err) return res.status(500).json({ ok: false, error: out || err.message });
       try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+      try { broadcastGlobalEngineChange(); } catch {}
       const codex = listCodexAccounts();
       res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'codex', ...listAccounts(), codexAccounts: codex.accounts });
     });
@@ -1277,6 +1320,7 @@ app.post('/accounts/switch', (req, res) => {
     const out = ((stdout || '') + (stderr || '')).trim();
     if (err) return res.status(500).json({ ok: false, error: out || err.message });
     try { fs.writeFileSync(ENGINE_FILE, 'claude'); } catch {}
+    try { broadcastGlobalEngineChange(); } catch {}
     res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'claude', ...listAccounts() });
   });
 });
@@ -1362,8 +1406,11 @@ app.post('/accounts/delete', (req, res) => {
 // they land on; we relay it to codex's local callback server to finish the exchange
 // (full scopes). Same paste-back shape as the Claude flow; state kept separate.
 let cxProc = null, cxBuf = '', cxUrl = '', cxDone = false, cxResult = null, cxName = 'peter';
+// [CODEX_DEVICE_OPT_V1] device-code flow state (mode 'device' vs default 'browser')
+let cxCode = '', cxMode = 'browser', cxWatch = null;
 let cxStartAuthMtime = 0, cxFinalized = false;
 function killCodexAuth() {
+  if (cxWatch) { try { clearInterval(cxWatch); } catch {} cxWatch = null; }
   if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
   cxProc = null;
 }
@@ -1385,6 +1432,14 @@ function finalizeCodexAuth() {
     cxResult = { ok: false, message: 'Sign-in did not complete' + (fail ? ' — ' + fail : '.') };
   }
 }
+// [CODEX_DEVICE_OPT_V1] parse `codex login --device-auth` output: a fixed
+// https://auth.openai.com/codex/device link + a one-time XXXX-XXXXX code.
+function parseCodexDevice(buf) {
+  const t = stripAnsiSeq(buf).replace(/\r/g, '\n');
+  const url = (t.match(/https:\/\/auth\.openai\.com\/codex\/device\S*/) || [])[0] || 'https://auth.openai.com/codex/device';
+  const code = (t.match(/\b[A-Z0-9]{4}-[A-Z0-9]{5}\b/) || [])[0] || '';
+  return code ? { url: url.replace(/["'\)\]\s]+$/, ''), code } : null;
+}
 function parseCodexAuthUrl(buf) {
   const s = stripAnsiSeq(buf).replace(/\r/g, '\n');
   const m = s.match(/https:\/\/auth\.openai\.com\/oauth\/authorize\?\S+/);
@@ -1393,23 +1448,49 @@ function parseCodexAuthUrl(buf) {
 app.post('/codex/auth/start', (req, res) => {
   try {
     killCodexAuth();
-    cxBuf = ''; cxUrl = ''; cxDone = false; cxResult = null; cxFinalized = false;
+    cxBuf = ''; cxUrl = ''; cxCode = ''; cxDone = false; cxResult = null; cxFinalized = false;
     try { cxStartAuthMtime = fs.statSync(CODEX_AUTH).mtimeMs; } catch { cxStartAuthMtime = 0; }
     cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
-    // Full browser flow (NOT --device-auth): grants api.connectors.* scopes. Starts a
-    // local callback server on 127.0.0.1:1455 and prints the auth URL. BROWSER=/bin/true
-    // + no DISPLAY stop codex trying to spawn a local GUI browser.
+    // [CODEX_DEVICE_OPT_V1] mode selects the flow:
+    //  'browser' (default) — full `codex login`: grants api.connectors.* scopes, starts a
+    //     local callback server on 127.0.0.1:1455 + prints the auth URL; user pastes back
+    //     the localhost redirect (relayed via /codex/auth/complete).
+    //  'device' — `codex login --device-auth`: prints a fixed device URL + a one-time code;
+    //     codex polls OpenAI itself and writes auth.json, so there is NO paste-back and no
+    //     1455 callback (more robust). Token is reduced-scope (no api.connectors.*).
+    cxMode = (req.body && req.body.mode === 'device') ? 'device' : 'browser';
+    // BROWSER=/bin/true + no DISPLAY stop codex trying to spawn a local GUI browser.
     const env = { ...process.env, BROWSER: '/bin/true' }; delete env.DISPLAY;
-    cxProc = spawn('codex', ['login'], { env, cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-    const onData = d => { cxBuf += d.toString('utf8'); if (!cxUrl) { const u = parseCodexAuthUrl(cxBuf); if (u) cxUrl = u; } };
+    const args = cxMode === 'device' ? ['login', '--device-auth'] : ['login'];
+    cxProc = spawn('codex', args, { env, cwd: os.homedir(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const onData = d => {
+      cxBuf += d.toString('utf8');
+      if (cxMode === 'device') { if (!cxCode) { const dv = parseCodexDevice(cxBuf); if (dv) { cxUrl = dv.url; cxCode = dv.code; } } }
+      else { if (!cxUrl) { const u = parseCodexAuthUrl(cxBuf); if (u) cxUrl = u; } }
+    };
     cxProc.stdout.on('data', onData);
     cxProc.stderr.on('data', onData);
     cxProc.on('exit', () => { finalizeCodexAuth(); cxProc = null; });
+    // Device flow finishes with no /complete call, and codex 0.144.x may write auth.json
+    // without exiting — so watch auth.json here and finalize deterministically when a fresh
+    // token appears. Give up after ~15min (the code's expiry); user can also cancel.
+    if (cxMode === 'device') {
+      let tries = 0;
+      cxWatch = setInterval(() => {
+        if (cxFinalized) { clearInterval(cxWatch); cxWatch = null; return; }
+        let mt = 0, ok = false;
+        try { mt = fs.statSync(CODEX_AUTH).mtimeMs; } catch {}
+        try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); } catch {}
+        if (ok && mt > cxStartAuthMtime) { clearInterval(cxWatch); cxWatch = null; finalizeCodexAuth(); killCodexAuth(); }
+        else if (++tries > 900) { clearInterval(cxWatch); cxWatch = null; }
+      }, 1000);
+    }
     let settled = false; const t0 = Date.now();
     const iv = setInterval(() => {
       if (settled) return;
-      if (cxUrl) { settled = true; clearInterval(iv); res.json({ ok: true, url: cxUrl }); }
-      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in URL.' }); }
+      const haveDetails = cxMode === 'device' ? (cxUrl && cxCode) : cxUrl;
+      if (haveDetails) { settled = true; clearInterval(iv); res.json({ ok: true, mode: cxMode, url: cxUrl, code: cxCode || undefined }); }
+      else if (cxDone || Date.now() - t0 > 20000) { settled = true; clearInterval(iv); killCodexAuth(); res.status(504).json({ ok: false, error: 'Timed out waiting for the sign-in details.' }); }
     }, 300);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1765,10 +1846,15 @@ function codexUsageResponse(raw, roomId) {
 
 // Claude token/cost usage — 5-hour block + weekly, parallel fetch
 app.get('/usage', (req, res) => {
-  if (String(req.query.engine || '').toLowerCase() === 'codex') {
+  // [ENGINE_AUTHORITATIVE_V1] With a roomId, the SERVER decides the engine (single source of
+  // truth) and the client renders whatever we return; the client's ?engine= is a fallback only.
+  const _rid = String(req.query.roomId || '');
+  let _engine = String(req.query.engine || '').toLowerCase() === 'codex' ? 'codex' : 'claude';
+  if (_rid) _engine = resolveRoomEngineByKey(_rid).engine;
+  if (_engine === 'codex') {
     return readCodexMetrics((err, raw) => err
       ? res.status(502).json({ ok: false, engine: 'codex', error: err.message })
-      : res.json(codexUsageResponse(raw, String(req.query.roomId || ''))));
+      : res.json(codexUsageResponse(raw, _rid)));
   }
   let blockResult = null, weekResult = null, done = 0;
   const rateLimits = readRateLimits() || {};
@@ -1807,7 +1893,7 @@ app.get('/usage', (req, res) => {
 
   function finish() {
     if (++done < 2) return;
-    res.json({ ok: true, block: blockResult, week: weekResult, rateLimits });
+    res.json({ ok: true, engine: 'claude', block: blockResult, week: weekResult, rateLimits });
   }
 
   // 5-hour block data
@@ -2120,7 +2206,7 @@ const WARM_ROOM_TTL_MS = parseInt(process.env.WARM_ROOM_TTL_MS, 10) || 15 * 60 *
 const MAX_WARM_ROOMS   = parseInt(process.env.MAX_WARM_ROOMS,   10) || 2;
 function enforceWarmCap(justArmed) {
   const warm = [...clientSessions.values()]
-    .filter(s => s.sockets.size === 0 && s.currentProc && (s.sessionId || s.threadId));
+    .filter(s => s.sockets.size === 0 && s.currentProc && (s.sessionId || s.threadId) && !(s.conf && s.conf.status === 'running'));   // [CONFERENCE_V1]
   if (warm.length <= MAX_WARM_ROOMS) return;
   warm.sort((a, b) => (a.lastActiveAt || 0) - (b.lastActiveAt || 0));   // oldest first
   for (const s of warm.slice(0, warm.length - MAX_WARM_ROOMS)) {
@@ -2189,6 +2275,26 @@ function userMsgJSON(text) {
 // Translate one Codex `exec --json` event into the bridge's normalised UI messages
 // (the SAME shapes the Claude stream parser emits), so everything downstream — UI,
 // mirroring, history — is unchanged. Returns [] for events with no UI signal.
+function codexAuthFailure(text) {
+  return /refresh_token_(?:invalidated|revoked|expired)|refresh token was revoked|invalidated oauth token|Your session has ended/i.test(text)
+    || /codex_(?:login|api|models_manager)[^\n]*(?:401|Unauthorized)/i.test(text);
+}
+function createCodexErrorReporter(send, email) {
+  let reported = false, stderr = '';
+  const report = (text, terminal = false) => {
+    const auth = codexAuthFailure(text);
+    if (reported || (!auth && !terminal)) return;
+    reported = true;
+    send({ type: 'error', text: auth
+      ? 'Codex sign-in failed' + (email ? ' for ' + email : '') + ' (401 Unauthorized). Your saved login is no longer valid. Open Accounts, click ↻ beside this Codex account, sign in again, then resend your message.'
+      : 'Codex could not complete this message. Please try again. If it keeps failing, check the account sign-in or contact the administrator.' });
+  };
+  return {
+    stderr(chunk) { stderr = (stderr + chunk).slice(-8192); report(stderr); },
+    failed(message) { report(message || '', true); },
+  };
+}
+
 function parseCodexEvent(ev) {
   const out = [];
   switch (ev.type) {
@@ -2234,6 +2340,479 @@ function sessionFileExists(id) {
   try { return fs.existsSync(f); } catch { return false; }
 }
 
+// [CODEX_DURABLE_V2] Codex rollout existence (mirror of sessionFileExists). Codex writes
+// ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-...-<thread_id>.jsonl; the trailing UUID is
+// the resume handle for `codex exec resume <id>`.
+const CODEX_SESSIONS_DIR = path.join(process.env.HOME || os.homedir(), '.codex', 'sessions');
+function codexRolloutExists(threadId) {
+  if (!threadId) return false;
+  const suffix = '-' + threadId + '.jsonl';
+  const walk = (dir, depth) => {
+    let ents;
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    for (const e of ents) {
+      if (e.isDirectory()) { if (depth < 3 && walk(path.join(dir, e.name), depth + 1)) return true; }
+      else if (depth === 3 && e.name.endsWith(suffix)) return true;
+    }
+    return false;
+  };
+  return walk(CODEX_SESSIONS_DIR, 0);
+}
+// Durable, engine-neutral room map: roomKey -> {sessionId, threadId, lastEngine, engineOverride, updatedAt}.
+// Claude survived restarts because its resume handle == the on-disk transcript; Codex's threadId lived
+// only in memory. This map gives BOTH engines disk-anchored recovery across eviction/reconnect/restart.
+const ROOM_MAP_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-rooms.json');
+function _loadRoomMap() { try { return JSON.parse(fs.readFileSync(ROOM_MAP_FILE, 'utf8')) || {}; } catch { return {}; } }
+function _writeRoomMap(m) {
+  try { const tmp = ROOM_MAP_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(m)); fs.renameSync(tmp, ROOM_MAP_FILE); }
+  catch (e) { console.log('[Bridge] roomMap write failed:', e.message); }
+}
+function persistRoom(S) {
+  if (!S || !S.key) return;
+  if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride) return;   // nothing durable yet
+  try {
+    const m = _loadRoomMap();
+    m[S.key] = { sessionId: S.sessionId || null, threadId: S.threadId || null, lastEngine: S.lastEngine || null, engineOverride: S.engineOverride || null, updatedAt: Date.now() };
+    _writeRoomMap(m);
+  } catch (e) { console.log('[Bridge] persistRoom failed:', e.message); }
+}
+function clearRoom(key) {
+  try {
+    const m = _loadRoomMap(); let changed = false;
+    if (m[key]) { delete m[key]; changed = true; }
+    for (const k of Object.keys(m)) { if (m[k] && (m[k].sessionId === key || m[k].threadId === key)) { delete m[k]; changed = true; } }   // [CODEX_DURABLE_V3] named-room records keyed by room id, deleted by session id
+    if (changed) _writeRoomMap(m);
+  } catch {}
+}
+const _ROOM_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function restoreRoom(S) {
+  if (!S || !S.key) return;
+  const rec = _loadRoomMap()[S.key];
+  if (rec) {
+    if (!S.sessionId && rec.sessionId && sessionFileExists(rec.sessionId)) S.sessionId = rec.sessionId;
+    if (!S.threadId && rec.threadId && codexRolloutExists(rec.threadId)) S.threadId = rec.threadId;
+    if (rec.lastEngine) S.lastEngine = rec.lastEngine;
+    if (rec.engineOverride) S.engineOverride = rec.engineOverride;
+  }
+  // [CODEX_DURABLE_V3] If a stored handle no longer validates, rewrite (or clear) the
+  // record so we don't keep resurrecting a dead session/thread id.
+  if (rec && (rec.sessionId !== (S.sessionId || null) || rec.threadId !== (S.threadId || null))) {
+    if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride) clearRoom(S.key);
+    else persistRoom(S);
+  }
+  // Legacy fallback ONLY: some older rooms are keyed by the Codex thread id itself.
+  if (!S.sessionId && !S.threadId && _ROOM_UUID_RE.test(S.key) && codexRolloutExists(S.key)) S.threadId = S.key;
+  if (S.threadId) console.log('[Bridge] [CODEX_DURABLE_V2] restored room', S.key, 'threadId=' + S.threadId, 'lastEngine=' + (S.lastEngine || '-'), 'override=' + (S.engineOverride || '-'));
+}
+
+
+// ── [CONFERENCE_V1] Collaborative Claude + Codex "Conference Room" ─────────────
+// One room, server-orchestrated lead/reviewer turns between the two engines. The
+// server owns the canonical, engine-attributed transcript and the durable
+// orchestration state; the browser only renders events. Consensus design agreed
+// jointly by Claude and Codex (see design discussion 2026-09-05).
+const CONF_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-conference');
+const CONF_MAX_ROUNDS_DEFAULT = 4;
+const CONF_HARD_ROUND_CAP = 8;
+function confFile(key) { return path.join(CONF_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
+function confLoad(key) { try { return JSON.parse(fs.readFileSync(confFile(key), 'utf8')); } catch { return null; } }
+function confSave(S) { if (!S || !S.conf) return; try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.writeFileSync(confFile(S.key), JSON.stringify(S.conf)); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confSave failed:', e.message); } }
+function confClearFile(key) { try { fs.unlinkSync(confFile(key)); } catch {} }
+function confExistsRunning(key) { const c = confLoad(key); return !!(c && c.status === 'running'); }
+function confActive(S) { return !!(S && S.conf && S.conf.status === 'running'); }
+
+function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7); }
+
+function confSendStatus(S) {
+  if (!S || !S.conf) return;
+  const c = S.conf;
+  S.send({ type: 'conf_status', status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
+           round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
+           leadEngine: c.leadEngine, reviewEngine: c.reviewEngine, nextEngine: c.nextEngine, reason: c.pausedReason || null });
+}
+
+// ── [CONFERENCE_V2] Staged, consensus-first orchestration ─────────────────────
+// Stages run in a fixed order; discussion stages (diagnosis, solution_design)
+// require BOTH engines to approve before advancing, and are hard read-only.
+const CONF_STAGES = ['diagnosis', 'solution_design', 'implementation', 'verification', 'final'];
+function confStageLabel(st) {
+  return ({ diagnosis: 'Diagnosis', solution_design: 'Solution design', implementation: 'Implementation',
+            verification: 'Verification', final: 'Final synthesis' })[st] || String(st || '');
+}
+// [CONFERENCE_V2 FSMFIX] An engine turn that is actually a usage/rate-limit or transient
+// error banner (not real work). Used to stop an errored/limited implementation turn from
+// being handed to the reviewer as if the lead had produced something to verify.
+const _CONF_JUNK_RE = /(hit your (session|usage) limit|session limit|usage limit|rate limit|resets?\s*\d|try again (later|in)|temporarily unavailable|overloaded|service unavailable|api error|context.{0,20}exceeded)/i;
+// Restriction mode per stage. Only 'write' (implementation) permits mutations
+// (edits, deploys, browser navigation/clicks/etc). Everything else is read-only.
+// Consumed by spawnProc (Claude flags), _runCodexTurn (Codex sandbox) and the shim.
+function confRestrictionMode(c) {
+  if (!c || (c.status !== 'running' && c.status !== 'paused')) return null;
+  if (c.stage === 'implementation') return 'write';
+  if (c.stage === 'verification') return 'verify';   // read-only fallback (+ report proof gap)
+  return 'readonly';                                  // diagnosis, solution_design, final
+}
+
+// Per-turn denial ledger written by the shim when it blocks a disallowed mutation.
+function confDenyFile(key) { return path.join(CONF_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.deny.jsonl'); }
+function confClearDenials(key) { try { fs.unlinkSync(confDenyFile(key)); } catch {} }
+function confReadDenials(key) {
+  try { return fs.readFileSync(confDenyFile(key), 'utf8').trim().split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
+  catch { return []; }
+}
+
+function confVerdictSpec(stage) {
+  return '\n\n---\nWhen you finish, append a machine-readable verdict as the LAST thing in your reply, ' +
+    'on its own lines, EXACTLY in this form (nothing after it):\n' +
+    '<<<CONFERENCE_VERDICT\n{"stage":"' + stage + '","verdict":"approve","remainingIssues":[]}\nCONFERENCE_VERDICT>>>\n' +
+    'The "stage" value MUST be exactly "' + stage + '". ' +
+    'Set "verdict" to "approve" ONLY when THIS stage\'s goal is fully met and you have no substantive ' +
+    'remaining concerns; "revise" if more work is needed; "blocked" only if you genuinely cannot proceed ' +
+    'without the user. List concrete open items in "remainingIssues".';
+}
+
+function confRolePreamble(S, engine) {
+  const c = S.conf;
+  const isLead = (engine === c.leadEngine);
+  const partner = (engine === 'claude') ? 'Codex' : 'Claude';
+  const stage = c.stage;
+  let s = 'You are collaborating with ' + partner + ' in a shared, STAGED "conference" to solve ONE objective. ' +
+    'You share the same workspace and browser and take strict turns (never simultaneously). ' +
+    'The conference proceeds through fixed stages: diagnosis -> solution_design -> implementation -> verification -> final. ' +
+    'You are in the "' + stage + '" stage (' + confStageLabel(stage) + '), round ' + c.round + ' of up to ' + c.maxRounds + '. ' +
+    'Continue directly; do not re-introduce yourself or restate the whole objective.\n\n';
+
+  const readOnly = 'HARD RULE for this stage: you are in READ-ONLY mode. Do NOT edit files, run mutating shell commands, ' +
+    'deploy, restart services, or mutate the browser (navigate/click/type/press/upload/eval/close). The bridge ENFORCES ' +
+    'this: those tools are disabled and any attempt is blocked and PAUSES the conference for the user. Investigate only by ' +
+    'read-only means (read files, search, read logs, read-only browser snapshots/screenshots) and reason carefully. ';
+
+  if (stage === 'diagnosis') {
+    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the ROOT CAUSE only — propose no fixes yet. ';
+    s += isLead ? 'As LEAD, present an evidence-based root-cause analysis for the reviewer to check.'
+                : 'As REVIEWER, independently verify the LEAD\'s root-cause analysis and challenge anything weak or unproven.';
+  } else if (stage === 'solution_design') {
+    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the SOLUTION DESIGN/plan only — do NOT implement anything yet. ';
+    s += isLead ? 'As LEAD, propose a concrete plan (steps, files, tests) to fix the agreed root cause.'
+                : 'As REVIEWER, scrutinise the plan for gaps, risks and bypasses; approve only if it is sound and complete.';
+  } else if (stage === 'implementation') {
+    s += 'You now have CONSENSUS on the root cause AND the plan. This stage is WRITE-ENABLED. ' +
+      'As LEAD, implement the agreed plan concretely (make the changes, run what you need). Stay within the agreed plan; ' +
+      'if you find the plan is wrong, set verdict "blocked" and explain rather than improvising a different design.';
+  } else if (stage === 'verification') {
+    s += 'This stage is INDEPENDENT VERIFICATION by the reviewer, in READ-ONLY mode (no edits/deploys/browser mutation). ' +
+      'A disposable write-sandbox is NOT available here, so run only static and read-only checks; wherever a check would ' +
+      'REQUIRE execution or mutation you cannot perform, explicitly REPORT THE PROOF GAP rather than assuming success. ' +
+      'As REVIEWER, verify the LEAD\'s implementation against the agreed plan and root cause. Approve only if genuinely ' +
+      'satisfied; otherwise set "revise" with concrete findings for the LEAD to fix.';
+  } else if (stage === 'final') {
+    s += 'Consensus was reached and the implementation verified. Produce the polished, user-facing synthesis that resolves ' +
+      'the objective, incorporating the collaboration. You are in READ-ONLY mode. Do NOT append a verdict block.';
+  }
+  return s;
+}
+
+// Parse + strip the hidden verdict block. Missing/malformed OR wrong-stage => 'revise'
+// (never crash, never terminate). 'blocked' always halts regardless of stage tag.
+function confExtractVerdict(text, expectedStage) {
+  const re = /<<<CONFERENCE_VERDICT\s*([\s\S]*?)\s*CONFERENCE_VERDICT>>>/;
+  const m = String(text || '').match(re);
+  let verdict = { verdict: 'revise', stage: null, remainingIssues: [] };
+  if (m) {
+    try {
+      const j = JSON.parse(m[1].trim());
+      let v = (j && (j.verdict === 'approve' || j.verdict === 'blocked' || j.verdict === 'revise')) ? j.verdict : 'revise';
+      const stg = (j && typeof j.stage === 'string') ? j.stage : null;
+      if (expectedStage && stg !== expectedStage && v !== 'blocked') v = 'revise';   // stale/wrong-stage => revise
+      verdict = { verdict: v, stage: stg, remainingIssues: (j && Array.isArray(j.remainingIssues)) ? j.remainingIssues.slice(0, 20) : [] };
+    } catch { verdict = { verdict: 'revise', stage: null, remainingIssues: [] }; }
+  }
+  const visible = String(text || '').replace(re, '').trim();
+  return { verdict, visible };
+}
+
+function confBuildPrompt(S, engine) {
+  const c = S.conf;
+  const parts = [];
+  parts.push(confRolePreamble(S, engine));
+  parts.push('\n\nSHARED OBJECTIVE:\n' + c.brief);
+  const partnerEngine = (engine === 'claude') ? 'codex' : 'claude';
+  const lastPartner = c.lastByEngine && c.lastByEngine[partnerEngine];
+  if (lastPartner) {
+    parts.push('\n\nYour collaborator (' + (partnerEngine === 'codex' ? 'Codex' : 'Claude') +
+      ') just said:\n"""\n' + lastPartner + '\n"""');
+  }
+  if (Array.isArray(c.pendingInterject) && c.pendingInterject.length) {
+    const live = c.pendingInterject.filter(x => x && x.ttl > 0);
+    if (live.length) parts.push('\n\nThe user interjected (address this):\n"""\n' +
+      live.map(x => x.text).join('\n---\n') + '\n"""');
+  }
+  if (c.stage === 'final') {
+    parts.push('\n\nThis is the FINAL turn. Produce the polished, user-facing result. Do NOT append a verdict block.');
+  } else {
+    parts.push(confVerdictSpec(c.stage));
+  }
+  return parts.join('');
+}
+
+function _confConsumeInterjections(S) {
+  const c = S.conf;
+  if (!Array.isArray(c.pendingInterject) || !c.pendingInterject.length) return;
+  c.pendingInterject = c.pendingInterject.map(x => ({ text: x.text, ttl: (x.ttl || 0) - 1 })).filter(x => x.ttl > 0);
+}
+
+// Dispatch the next (or, on recovery, the same) conference turn.
+function confDispatch(S, reuseTurnId) {
+  const c = S.conf;
+  if (!c || c.status !== 'running') return;
+  const engine = c.nextEngine;
+  // [CONFERENCE_V2] Ensure the engine process carries THIS stage's restriction mode.
+  // Claude is a persistent proc whose flags are fixed at spawn, so drop an idle proc
+  // spawned under a different mode; spawnProc re-reads the stage and applies flags.
+  if (engine === 'claude') {
+    const need = confRestrictionMode(c);
+    if (S.currentProc && S.procEngine === 'claude' && !S.processing && S._spawnedConfMode !== need) {
+      try { S.currentProc.kill('SIGKILL'); } catch {}
+      S.currentProc = null; S.procEngine = null;
+    }
+  }
+  const turnId = reuseTurnId || _confNewTurnId();
+  c.activeTurnId = turnId;
+  S._confTurnId = turnId;
+  c._acc = ''; c._accParts = '';
+  const prompt = confBuildPrompt(S, engine);
+  _confConsumeInterjections(S);
+  confClearDenials(S.key);   // fresh denial window for this turn
+  confSave(S);
+  S.send({ type: 'conf_turn', engine, role: (engine === c.leadEngine ? 'lead' : 'reviewer'),
+           stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase, round: c.round,
+           turnId, restriction: confRestrictionMode(c) });
+  confSendStatus(S);
+  try { S.sendToEngine(engine, prompt); }
+  catch (e) { console.log('[Bridge] [CONFERENCE_V2] dispatch failed:', e.message); c.status = 'paused'; c.pausedReason = 'dispatch-error'; confSave(S); confSendStatus(S); }
+}
+
+function confStart(S, brief, opts) {
+  opts = opts || {};
+  const lead = (opts.leadEngine === 'codex') ? 'codex'
+             : (opts.leadEngine === 'claude') ? 'claude'
+             : ((S.engineOverride === 'codex' || S.engineOverride === 'claude') ? S.engineOverride : currentEngine());
+  const review = lead === 'claude' ? 'codex' : 'claude';
+  let maxRounds = parseInt(opts.maxRounds, 10);
+  if (!(maxRounds >= 1 && maxRounds <= CONF_HARD_ROUND_CAP)) maxRounds = CONF_MAX_ROUNDS_DEFAULT;
+  S.conf = {
+    version: 2, status: 'running',
+    stage: 'diagnosis', subphase: 'lead', round: 1, maxRounds,
+    leadEngine: lead, reviewEngine: review, nextEngine: lead,
+    brief: String(brief || '').slice(0, 20000),
+    activeTurnId: null, log: [], stageVerdicts: {}, lastByEngine: {}, pendingInterject: [],
+    createdAt: Date.now(),
+  };
+  S._confRecovered = true;
+  confClearDenials(S.key);
+  confSave(S);
+  console.log('[Bridge] [CONFERENCE_V2] start room', S.key, 'lead=' + lead, 'rounds=' + maxRounds);
+  S.send({ type: 'conf_started', leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief,
+           stage: 'diagnosis', stageLabel: confStageLabel('diagnosis') });
+  confDispatch(S);
+}
+
+function confInterject(S, text) {
+  const c = S.conf; if (!c) return;
+  c.pendingInterject = c.pendingInterject || [];
+  c.pendingInterject.push({ text: String(text || '').slice(0, 8000), ttl: 2 });
+  confSave(S);
+  if (c.status === 'paused') { S.send({ type: 'status', text: 'Interjection saved — resume the conference to deliver it.' }); }
+  else S.send({ type: 'status', text: 'Interjection queued — it will reach both engines on the next turn.' });
+}
+
+function confPause(S) {
+  const c = S.conf; if (!c || (c.status !== 'running')) return;
+  if (c.activeTurnId) { c._afterTurn = 'pause'; confSave(S); S.send({ type: 'status', text: 'Pausing after the current turn finishes…' }); }
+  else { c.status = 'paused'; confSave(S); confSendStatus(S); }
+}
+function confResume(S) {
+  const c = S.conf; if (!c || c.status !== 'paused') return;
+  c.status = 'running'; c.pausedReason = null; c._afterTurn = null; confSave(S);
+  confSendStatus(S);
+  confDispatch(S);
+}
+function confStop(S) {
+  const c = S.conf; if (!c) return;
+  if (c.status === 'running' && c.activeTurnId) { c._afterTurn = 'stop'; confSave(S); S.send({ type: 'status', text: 'Stopping after the current turn finishes…' }); return; }
+  c.status = 'stopped'; c.activeTurnId = null; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 });
+}
+
+// A disallowed mutation was blocked by the shim during a discussion turn: pause the
+// whole conference with a visible policy event instead of silently continuing.
+function confPolicyPause(S, detail) {
+  const c = S.conf; if (!c) return;
+  c.status = 'paused';
+  c.pausedReason = 'Policy: a disallowed action was blocked during ' + confStageLabel(c.stage) +
+    (detail ? ' (' + detail + ')' : '') + '. The conference was paused for your review.';
+  c.activeTurnId = null; S._confTurnId = null;
+  confSave(S); confSendStatus(S);
+  S.send({ type: 'conf_policy', stage: c.stage, detail: detail || null, reason: c.pausedReason });
+  S.send({ type: 'done', code: 0 });
+}
+
+function confComplete(S, finalStatus) {
+  const c = S.conf;
+  c.status = finalStatus || 'done'; c.finishedAt = Date.now(); c.activeTurnId = null;
+  confClearDenials(S.key);
+  confSave(S);
+  confSendStatus(S);
+  S.send({ type: 'done', code: 0 });
+  console.log('[Bridge] [CONFERENCE_V2] conference', c.status, 'room', S.key, 'stage', c.stage);
+  return true;
+}
+
+// Staged state machine, called after a turn's response is durably recorded.
+function confAdvance(S, engine, verdict, meta) {
+  const c = S.conf;
+  meta = meta || {};
+  if (verdict === 'blocked') {
+    c.status = 'paused'; c.activeTurnId = null;
+    c.pausedReason = 'An engine reported it is blocked during ' + confStageLabel(c.stage) + ' and needs your input.';
+    confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 });
+    return true;
+  }
+  const enterStage = (next) => { c.stage = next; c.round = 1; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; };
+  const pauseNoConsensus = (why) => { c.status = 'paused'; c.pausedReason = why; c.activeTurnId = null; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 }); };
+  // [CONFERENCE_V2 FSMFIX] Absolute safety valve: past the hard round cap the conference
+  // STOPS (terminal) rather than pausing — a paused/resumed loop must never be unbounded.
+  const hardCapStop = () => { c.stage = 'implementation'; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; return confComplete(S, 'stopped'); };
+
+  if (c.stage === 'diagnosis' || c.stage === 'solution_design') {
+    if (c.subphase === 'lead') {
+      c.subphase = 'review'; c.nextEngine = c.reviewEngine;
+    } else {
+      const both = c.stageVerdicts[c.leadEngine] === 'approve' && c.stageVerdicts[c.reviewEngine] === 'approve';
+      if (both) {
+        enterStage(c.stage === 'diagnosis' ? 'solution_design' : 'implementation');
+      } else {
+        c.round++;
+        if (c.round > CONF_HARD_ROUND_CAP) { c.pausedReason = 'Hard round cap reached in ' + confStageLabel(c.stage) + '.'; return hardCapStop(); }
+        // Return to the LEAD so a resume makes forward progress (not re-run the reviewer).
+        c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {};
+        if (c.round > c.maxRounds) {
+          pauseNoConsensus('No consensus reached in ' + confStageLabel(c.stage) + ' within ' + c.maxRounds +
+            ' rounds. Resume to let the lead try again, adjust the brief, or stop.');
+          return true;
+        }
+      }
+    }
+  } else if (c.stage === 'implementation') {
+    // [CONFERENCE_V2 FSMFIX] Only hand to the reviewer when the LEAD actually produced a
+    // complete, well-formed implementation turn. Incomplete / malformed / errored /
+    // usage-limited / self-declared-not-done turns must NOT advance to verification —
+    // otherwise the reviewer keeps rejecting "no new evidence" and rounds burn out.
+    const junk = _CONF_JUNK_RE.test(String(meta.visible || ''));
+    const okImpl = (engine === c.leadEngine) && verdict === 'approve' && meta.verdictStage === 'implementation' && !junk;
+    if (okImpl) {
+      c.stage = 'verification'; c.subphase = 'review'; c.nextEngine = c.reviewEngine; c.stageVerdicts = {};
+    } else {
+      // Stay on implementation/lead so a resume retries the lead (e.g. after usage resets).
+      c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {};
+      const why = junk
+        ? 'The lead could not complete implementation (engine usage/rate limit or a transient error). Resume once ' + (c.leadEngine === 'claude' ? 'Claude' : 'Codex') + ' is available again.'
+        : ((verdict === 'revise' && meta.verdictStage === 'implementation')
+            ? 'The lead reports implementation is not yet complete. Resume to let the lead continue the work.'
+            : 'The implementation turn was incomplete or malformed (no valid implementation-stage verdict). Resume to let the lead complete it.');
+      pauseNoConsensus(why);
+      return true;
+    }
+  } else if (c.stage === 'verification') {
+    if (c.stageVerdicts[c.reviewEngine] === 'approve') {
+      c.stage = 'final'; c.subphase = 'final'; c.nextEngine = c.leadEngine; c.stageVerdicts = {};
+    } else {
+      c.round++;
+      if (c.round > CONF_HARD_ROUND_CAP) { c.pausedReason = 'Hard round cap reached in Verification.'; return hardCapStop(); }
+      // [CONFERENCE_V2 FSMFIX] Always return to the implementation LEAD for forward progress
+      // (never leave the paused state pointed at the reviewer, which can only re-reject).
+      c.stage = 'implementation'; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {};
+      if (c.round > c.maxRounds) {
+        pauseNoConsensus('Verification did not pass within ' + c.maxRounds + ' rounds. Resume to let ' +
+          (c.leadEngine === 'claude' ? 'Claude' : 'Codex') + ' (lead) continue implementation, adjust, or stop.');
+        return true;
+      }
+    }
+  } else if (c.stage === 'final') {
+    return confComplete(S, 'done');
+  }
+
+  if (c._afterTurn === 'stop') { c._afterTurn = null; return confComplete(S, 'stopped'); }
+  if (c._afterTurn === 'pause') { c._afterTurn = null; c.status = 'paused'; c.activeTurnId = null; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 }); return true; }
+  confSave(S);
+  setTimeout(() => { try { if (confActive(S)) confDispatch(S); } catch (e) { console.log('[Bridge] [CONFERENCE_V2] advance-dispatch failed:', e.message); } }, 400);
+  return true;
+}
+
+// A conference turn completed on 'engine'. Record it (server-authoritative) BEFORE
+// advancing. Idempotent: a completion that doesn't match the active turn is ignored.
+function confFinishTurn(S, engine) {
+  const c = S.conf;
+  if (!c || (c.status !== 'running' && c.status !== 'stopping')) return false;
+  if (!S._confTurnId || S._confTurnId !== c.activeTurnId) { console.log('[Bridge] [CONFERENCE_V2] stale/duplicate finish ignored', S.key); return false; }
+  const raw = String(c._acc || c._accParts || '').trim();
+  const isFinal = (c.stage === 'final');
+  const parsed = isFinal ? { verdict: { verdict: 'approve', stage: 'final', remainingIssues: [] }, visible: raw }
+                         : confExtractVerdict(raw, c.stage);
+  const turnId = c.activeTurnId;
+  const role = (engine === c.leadEngine) ? 'lead' : 'reviewer';
+  c.log = c.log || [];
+  c.log.push({ turnId, engine, role, stage: c.stage, subphase: c.subphase, round: c.round,
+               text: parsed.visible, verdict: parsed.verdict.verdict, verdictStage: parsed.verdict.stage || null, ts: Date.now() });
+  c.lastByEngine = c.lastByEngine || {}; c.lastByEngine[engine] = parsed.visible;
+  c.stageVerdicts = c.stageVerdicts || {}; c.stageVerdicts[engine] = parsed.verdict.verdict;
+  c.activeTurnId = null; S._confTurnId = null; c._acc = ''; c._accParts = '';
+  confSave(S);   // persist response + cleared active turn BEFORE advancing
+  S.send({ type: 'conf_msg', turnId, engine, role, stage: c.stage, stageLabel: confStageLabel(c.stage),
+           subphase: c.subphase, round: c.round, text: parsed.visible, verdict: parsed.verdict.verdict, remainingIssues: parsed.verdict.remainingIssues });
+  // [CONFERENCE_V2] If the shim blocked a disallowed mutation during this turn, pause (fail-closed, visible).
+  const denials = confReadDenials(S.key);
+  if (denials.length) { const d = denials[denials.length - 1]; confPolicyPause(S, (d && d.tool) ? d.tool : null); return true; }
+  return confAdvance(S, engine, parsed.verdict.verdict, { verdictStage: parsed.verdict.stage, visible: parsed.visible });
+}
+
+// Re-derive server state on attach / after a restart. Single-owner recovery:
+// coordinates with the pending-turn journal so only one mechanism resumes a turn.
+// A fresh spawn re-reads the persisted stage, so Claude/Codex come back with the
+// correct restriction flags before any turn replays.
+function confRecover(S) {
+  const disk = confLoad(S.key);
+  if (!disk) return;
+  if (disk.status === 'superseded') return;   // inert tombstone from an atomic rekey
+  if (!S.conf) S.conf = disk;
+  const c = S.conf;
+  confSendStatus(S);
+  if (Array.isArray(c.log) && c.log.length) {
+    S.send({ type: 'conf_sync', messages: c.log, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
+             subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
+             leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
+  }
+  if (S._confRecovered) return;
+  S._confRecovered = true;
+  if (c.status !== 'running') return;
+  if (S.processing) return;   // a live turn is already running in this process
+  let journaled = false;
+  try { const j = JSON.parse(fs.readFileSync(pendingFile(S.key), 'utf8')); journaled = !!(j && Array.isArray(j.turns) && j.turns.length); } catch {}
+  if (c.activeTurnId) {
+    if (RESUME_TURNS && !journaled) {
+      console.log('[Bridge] [CONFERENCE_V2] state/journal disagreement — pausing for recovery', S.key);
+      c.status = 'paused'; c.pausedReason = 'Recovery: turn state was uncertain after a restart. Resume to continue.';
+      confSave(S); confSendStatus(S);
+      return;
+    }
+    console.log('[Bridge] [CONFERENCE_V2] recovering interrupted turn', c.activeTurnId, 'room', S.key);
+    clearPending(S.key);
+    confDispatch(S, c.activeTurnId);
+  } else {
+    console.log('[Bridge] [CONFERENCE_V2] resuming between-turns', S.key);
+    confDispatch(S);
+  }
+}
 const clientSessions = new Map();   // clientId -> session state (survives reconnects)
 
 // --- Blip recovery journal (gated on RESUME_TURNS) ----------------------------
@@ -2249,7 +2828,9 @@ function journalPending(S) {
   try {
     if (S.inFlight && S.inFlight.length) {
       fs.mkdirSync(PENDING_DIR, { recursive: true });
-      fs.writeFileSync(pendingFile(S.key), JSON.stringify({ key: S.key, sessionId: S.sessionId || null, turns: S.inFlight.slice(), ts: Date.now() }));
+      let _attempts = 0;   // [CODEX_DURABLE_V5] carry the replay-attempt count forward so rewrites don't reset the ceiling
+      try { const _p = JSON.parse(fs.readFileSync(pendingFile(S.key), 'utf8')); if (_p && _p.attempts) _attempts = _p.attempts; } catch {}
+      fs.writeFileSync(pendingFile(S.key), JSON.stringify({ key: S.key, sessionId: S.sessionId || null, threadId: S.threadId || null, engine: S.pendingEngine || S.procEngine || S.engineOverride || null, attempts: _attempts, turns: S.inFlight.slice(), ts: Date.now() }));
     } else {
       try { fs.unlinkSync(pendingFile(S.key)); } catch {}
     }
@@ -2270,13 +2851,14 @@ function replayPending() {
     j.attempts = (j.attempts || 0) + 1;
     if (j.attempts > 2) { try { fs.unlinkSync(fp); } catch {} console.log('[Bridge] blip-replay: giving up on', j.key); continue; }
     try { fs.writeFileSync(fp, JSON.stringify(j)); } catch {}
-    const key = (j.sessionId && sessionFileExists(j.sessionId)) ? j.sessionId : j.key;
+    const key = j.key;   // [CODEX_DURABLE_V3] stable room key; never split a named room onto its session id
+    if (confExistsRunning(key)) { console.log('[Bridge] [CONFERENCE_V1] blip-replay skipping conference room', key); continue; }
     let S = clientSessions.get(key);
-    if (!S) { S = makeSession(key); if (j.sessionId && sessionFileExists(j.sessionId)) S.sessionId = j.sessionId; clientSessions.set(key, S); }
+    if (!S) { S = makeSession(key); if (j.sessionId && sessionFileExists(j.sessionId)) S.sessionId = j.sessionId; restoreRoom(S); if (!S.threadId && j.threadId && codexRolloutExists(j.threadId)) S.threadId = j.threadId; clientSessions.set(key, S); }   // [CODEX_DURABLE_V3] do NOT clobber the room's saved engineOverride
     if (S.processing) continue;   // already live (a reconnecting client beat us to it)
     const turns = j.turns.slice();
     console.log(`[Bridge] blip-replay: re-injecting ${turns.length} dropped turn(s) into ${key} (attempt ${j.attempts})`);
-    setTimeout(() => { try { turns.forEach(t => S.sendToClaude(t)); } catch (e) { console.log('[Bridge] blip-replay failed:', e.message); } }, 800);
+    setTimeout(() => { try { turns.forEach(t => S.sendToEngine(j.engine === 'codex' ? 'codex' : 'claude', t)); } catch (e) { console.log('[Bridge] blip-replay failed:', e.message); } }, 800);   // [CODEX_DURABLE_V4] explicit engine routing, no override change
   }
 }
 
@@ -2288,7 +2870,13 @@ function makeSession(key) {
     ctxPct: null, ctxTokens: null, compacting: false, lastCompactAt: 0,
     engineOverride: null,   // per-room engine override: null=follow global (~/.claude/engine), else 'claude'|'codex'
     lastEngine: null,       // [XENGINE_TRANSPLANT_V1] engine that last actually ran a turn in this room
+    threadId: null,         // [CODEX_DURABLE_V2] Codex resume handle (persisted in bridge-rooms.json)
+    conf: null,             // [CONFERENCE_V1] live conference orchestration state (mirrored to disk)
   };
+
+  S.engineState = (error = '') => { const _r = resolveRoomEngine(S); return { type: 'room_engine', roomId: S.key,
+    mode: _r.mode, engine: _r.engine, rev: _r.rev,
+    processing: !!S.processing, error }; };
 
   // Broadcast to all connected sockets. Buffer when nobody is connected so a
   // reconnecting client still receives in-flight output.
@@ -2315,8 +2903,9 @@ function makeSession(key) {
     S.clearWatch();
     if (S.currentProc) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; }
     const wasProcessing = S.processing;
-    S.processing = false; S.pendingTurns = 0; S.inFlight = [];
+    S.processing = false; S.pendingTurns = 0; S.inFlight = []; S.codexQueue = [];   // [CODEX_DURABLE_V4] also clear the Codex queue on kill/cancel/watchdog
     clearPending(S.key);   // in-process end — UI is unblocked, so no blip-replay
+    if (S.conf && S.conf.status === 'running') { S.conf.status = 'paused'; S.conf.pausedReason = 'The active turn was interrupted (' + (reason || 'stopped') + '). Resume to continue.'; S.conf.activeTurnId = S.conf.activeTurnId || null; confSave(S); confSendStatus(S); }   // [CONFERENCE_V1] never silently advance on error
     if (wasProcessing) S.send({ type: 'done', code: -1 });
     if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   };
@@ -2326,6 +2915,7 @@ function makeSession(key) {
   // called at every point the session returns to idle.
   S.evictIfReady = () => {
     if (!S.evictWhenIdle) return;
+    if (S.conf && S.conf.status === 'running') return;   // [CONFERENCE_V1] keep orchestrating even with no devices attached
     if (S.sockets.size > 0) { S.evictWhenIdle = false; return; }  // a device rejoined
     if (S.processing || S.pendingTurns > 0) return;               // still working — wait
     S.evictWhenIdle = false;
@@ -2349,6 +2939,16 @@ function makeSession(key) {
 
     const args = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--model', CLAUDE_MODEL, '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
+    // [CONFERENCE_V2] Discussion/verification/final stages run Claude READ-ONLY:
+    // plan mode + deny mutation-capable built-ins. Browser mutation is blocked centrally
+    // at the shim. Implementation stage keeps full tools. Recorded so confDispatch can
+    // respawn the persistent proc when the stage (mode) changes.
+    let _confMode = null;
+    try { if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) _confMode = confRestrictionMode(S.conf); } catch (e) {}
+    if (_confMode && _confMode !== 'write') {
+      args.push('--permission-mode', 'plan', '--disallowedTools', 'Bash,Edit,Write,NotebookEdit,Task');
+    }
+    S._spawnedConfMode = _confMode;
     // Point Claude at this room's browser MCP. Preferred: the room's OWN isolated
     // Playwright MCP (per-room browsers). It must already be listening — sendToClaude
     // awaits roomStack.ensureRoom(S.key) before the fresh spawn, so portsFor() is set.
@@ -2442,6 +3042,28 @@ function makeSession(key) {
             clientSessions.delete(S.key);
             S.key = ev.session_id;
             clientSessions.set(S.key, S);
+            // [CONFERENCE_V2] Atomic conference state migration: persist under the
+            // canonical (session) key FIRST, then leave an inert tombstone at the draft
+            // key so a stale alias/gate can never enforce the wrong phase. Fail-closed:
+            // on any state conflict, pause rather than guess.
+            if (S.conf) {
+              try {
+                const _canonFile = confFile(ev.session_id);
+                let _conflict = false;
+                try { const _ex = JSON.parse(fs.readFileSync(_canonFile, 'utf8'));
+                  if (_ex && (_ex.status === 'running' || _ex.status === 'paused') &&
+                      (Array.isArray(_ex.log) ? _ex.log.length : 0) !== (Array.isArray(S.conf.log) ? S.conf.log.length : 0)) _conflict = true; } catch (e) {}
+                if (_conflict) {
+                  console.log('[Bridge] [CONFERENCE_V2] rekey conflict — pausing', _oldKey, '->', ev.session_id);
+                  S.conf.status = 'paused'; S.conf.activeTurnId = null;
+                  S.conf.pausedReason = 'Recovery: conflicting conference state during room promotion. Resume to continue.';
+                }
+                fs.mkdirSync(CONF_DIR, { recursive: true });
+                fs.writeFileSync(_canonFile, JSON.stringify(S.conf));   // canonical first
+                fs.writeFileSync(confFile(_oldKey), JSON.stringify({ status: 'superseded', supersededBy: ev.session_id, ts: Date.now() }));   // inert tombstone
+                confClearDenials(_oldKey);
+              } catch (e) { console.log('[Bridge] [CONFERENCE_V2] conf migrate failed:', e.message); }
+            }
             // Move this room's browser stack onto the real key too, so later MCP/noVNC
             // lookups by S.key (and by the client's promoted room id) find the SAME
             // running stack instead of spawning a second one under the new key.
@@ -2455,8 +3077,14 @@ function makeSession(key) {
           }
           S.send({ type: 'session_id', id: S.sessionId });
           journalPending(S);   // upgrade the journal now that we have the real session id
+          persistRoom(S);   // [CODEX_DURABLE_V2]
         }
 
+        if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) {   // [CONFERENCE_V1] capture this turn's text server-side
+          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+            for (const b of ev.message.content) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; }
+          } else if (ev.type === 'result' && typeof ev.result === 'string' && ev.result) { S.conf._acc = ev.result; }
+        }
         S.send({ type: 'stream', data: ev });
 
         if (ev.type === 'result') {
@@ -2473,6 +3101,7 @@ function makeSession(key) {
             S.processing = false;
             S.clearWatch();
             S.send({ type: 'done', code: 0 });
+            if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { try { confFinishTurn(S, 'claude'); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] finish(claude) failed:', e.message); } }
             try { autoNameRoom(S); } catch (e) {}
             S.maybeAutoCompact();
             S.evictIfReady();
@@ -2501,6 +3130,7 @@ function makeSession(key) {
       if (resumeMissing && triedResume && !S.retried) {
         S.retried = true;
         S.sessionId = null;
+        persistRoom(S);   // [CODEX_DURABLE_V3] drop the stale session id from the durable record
         const resend = S.inFlight.slice();
         S.inFlight = []; S.pendingTurns = 0;
         S.send({ type: 'status', text: 'Previous session expired — starting a fresh conversation.' });
@@ -2528,6 +3158,7 @@ function makeSession(key) {
   // written straight into its stdin — queuing/steering the running session.
   // Otherwise a fresh process is spawned (resuming the session id when we have one).
   S._sendNow = (text) => {
+    S.pendingEngine = 'claude';   // [CODEX_DURABLE_V4] journal tag
     const _seed = maybeSeed(S, 'claude', text);
     // [XENGINE_RESUME_V1] Cross INTO Claude: if this room already has a resumable
     // Claude session, RESUME it (append this seeded turn) rather than nulling the id
@@ -2583,10 +3214,19 @@ function makeSession(key) {
     S.send({ type: 'thinking' });
     const _seed = maybeSeed(S, 'codex', text);
     if (_seed.crossed) { text = _seed.text; S.threadId = null; }   // [XENGINE_TRANSPLANT_V1] fresh seeded rollout
+    // [CONFERENCE_V2 ARGORDER] codex sandbox: discussion/verification/final => read-only.
+    // ALL exec-level options (sandbox, approval config, --json, --skip-git-repo-check,
+    // --dangerously-bypass-hook-trust) MUST precede the `resume` subcommand + thread id;
+    // codex accepts -s/--sandbox ONLY at the exec level, never after `resume <id>`.
+    let _cxConfMode = null;
+    try { if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) _cxConfMode = confRestrictionMode(S.conf); } catch (e) {}
+    const _cxReadOnly = _cxConfMode && _cxConfMode !== 'write';
+    const _mcpUrl = _cxReadOnly ? null : S._codexMcpUrl();
     const args = ['exec'];
-    if (S.threadId) args.push('resume', S.threadId);
-    const _mcpUrl = S._codexMcpUrl();
-    args.push('--json', '--skip-git-repo-check', '--dangerously-bypass-hook-trust', text);
+    if (_cxReadOnly) args.push('--sandbox', 'read-only', '-c', 'approval_policy="never"');
+    args.push('--json', '--skip-git-repo-check', '--dangerously-bypass-hook-trust');
+    if (S.threadId) args.push('resume', S.threadId, text);
+    else args.push(text);
     const env = { ...process.env };
     if (!env.HOME) env.HOME = os.homedir();
     // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
@@ -2595,11 +3235,14 @@ function makeSession(key) {
     let proc;
     touchBrowserWanted();
     try { proc = spawn('codex', args, { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch (e) { S.processing = false; S.send({ type: 'error', text: 'Codex spawn failed: ' + e.message }); S.send({ type: 'done', code: -1 }); return; }
+    catch (e) { S.processing = false; S.inFlight = []; S.codexQueue = []; clearPending(S.key); S.send({ type: 'error', text: 'Codex spawn failed: ' + e.message }); S.send({ type: 'done', code: -1 }); return; }   // [CODEX_DURABLE_V4]
     S.currentProc = proc;
     S.procEngine = 'codex';
     S.lastEngine = 'codex';
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '\u23F1 Codex failed to start \u2014 session reset.');
+    let accountEmail = '';
+    try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+    const errors = createCodexErrorReporter(data => S.send(data), accountEmail);
     let buf = '';
     proc.stdout.on('data', chunk => {
       buf += chunk.toString();
@@ -2608,9 +3251,12 @@ function makeSession(key) {
         if (!line.trim()) continue;
         let ev; try { ev = JSON.parse(line); } catch { continue; }
         if (!ev || !ev.type) continue;
+        if (ev.type === 'turn.failed' || ev.type === 'error') {
+          errors.failed((ev.error && ev.error.message) || ev.message || '');
+        }
         for (const m of parseCodexEvent(ev)) {
-          if (m.kind === 'session') { S.threadId = m.id; S.send({ type: 'session_id', id: m.id }); }
-          else if (m.kind === 'stream') S.send({ type: 'stream', data: m.data });
+          if (m.kind === 'session') { S.threadId = m.id; persistRoom(S); S.send({ type: 'session_id', id: m.id }); }  // [CODEX_DURABLE_V2]
+          else if (m.kind === 'stream') { if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data }); }
           else if (m.kind === 'result' && m.usage) {
             // cached_input_tokens is a subset of input_tokens in Codex usage.
             S.codexCtxTokens = Number(m.usage.input_tokens || 0);
@@ -2620,20 +3266,34 @@ function makeSession(key) {
         S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
       }
     });
-    proc.stderr.on('data', d => console.log('[codex stderr]', d.toString().slice(0, 300)));
+    proc.stderr.on('data', d => {
+      console.log('[codex stderr]', d.toString().slice(0, 300));
+      errors.stderr(d.toString());
+    });
     proc.on('error', e => console.log('[Bridge] codex proc error:', e.message));
     proc.on('close', code => {
       if (S.currentProc !== proc) return;
       S.clearWatch(); S.currentProc = null; S.processing = false;
       S.send({ type: 'done', code: code || 0 });
+      if (S.inFlight.length) S.inFlight.shift();   // [CODEX_DURABLE_V4] drop the completed prompt only
       const q = S.codexQueue || [];
-      if (q.length) { const next = q.shift(); setTimeout(() => S._runCodexTurn(next), 50); }
-      else { try { autoNameRoom(S); } catch (e) {}   /* AUTONAME_CODEX_V1 */
-             if (S.evictIfReady) S.evictIfReady(); }
+      if (q.length) {
+        journalPending(S);                          // [CODEX_DURABLE_V4] rewrite journal before the next queued turn
+        const next = q.shift();
+        setTimeout(() => S._runCodexTurn(next), 50);
+      } else {
+        clearPending(S.key);                        // [CODEX_DURABLE_V4] queue drained — clear recovery state
+        try { autoNameRoom(S); } catch (e) {}       /* AUTONAME_CODEX_V1 */
+        if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { try { confFinishTurn(S, 'codex'); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] finish(codex) failed:', e.message); } }
+        if (S.evictIfReady) S.evictIfReady();
+      }
     });
   };
   S._sendCodex = (text) => {
     S.codexQueue = S.codexQueue || [];
+    S.pendingEngine = 'codex';        // [CODEX_DURABLE_V4] journal tag
+    S.inFlight.push(text);            // [CODEX_DURABLE_V4] enter the durable queue exactly once (active or queued)
+    journalPending(S);                // persist so a bridge blip can re-inject this Codex turn
     // An idle *Claude* persistent proc occupies the slot but isn't a Codex turn
     // in flight. Tear it down so Codex can run; Claude losslessly resumes from
     // its transcript (--resume <sessionId>) on its next turn.
@@ -2654,8 +3314,11 @@ function makeSession(key) {
     S._runCodexTurn(text);
   };
 
-  S.sendToClaude = (text) => {
-    if ((S.engineOverride || currentEngine()) === 'codex') return S._sendCodex(text);
+  // [CODEX_DURABLE_V4] Dispatch to a SPECIFIC engine without touching the room's saved
+  // engineOverride, preserving each engine's browser-warming. Used by normal dispatch
+  // (via sendToClaude) and by blip-replay recovery.
+  S.sendToEngine = (engine, text) => {
+    if (engine === 'codex') return S._sendCodex(text);
     if (roomStack && !S.currentProc) {
       if (!S.processing) S.send({ type: 'thinking' });
       roomStack.ensureRoom(S.key)
@@ -2665,8 +3328,10 @@ function makeSession(key) {
     }
     S._sendNow(text);
   };
+  S.sendToClaude = (text) => S.sendToEngine((S.engineOverride || currentEngine()), text);
 
   S.maybeAutoCompact = () => {
+    if (S.conf && S.conf.status === 'running') return;   // [CONFERENCE_V1] never inject /compact during a conference
     const tokenBudget = AUTO_COMPACT_TOKENS > 0;
     if (!tokenBudget && AUTO_COMPACT_PCT <= 0) return;
     if (S.compacting) { S.compacting = false; return; }
@@ -2708,6 +3373,7 @@ wss.on('connection', (ws) => {
       S = makeSession(key);
       // If the room key is an existing Claude transcript, resume it on next turn.
       if (sessionFileExists(key)) S.sessionId = key;
+      restoreRoom(S);   // [CODEX_DURABLE_V2] re-derive threadId/lastEngine/engineOverride from disk
       clientSessions.set(key, S);
     }
     if (S.graceTimer) { clearTimeout(S.graceTimer); S.graceTimer = null; }
@@ -2726,7 +3392,9 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'history_sync', messages: hist.messages }));
       }
     }
+    ws.send(JSON.stringify(S.engineState()));
     if (S.processing) ws.send(JSON.stringify({ type: 'thinking' }));
+    try { if (S.conf || confLoad(S.key)) confRecover(S); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confRecover failed:', e.message); }
   }
 
   // Remove a socket from its room; when the room empties, start the grace timer
@@ -2742,11 +3410,12 @@ wss.on('connection', (ws) => {
     // Session-backed rooms stay warm far longer so switching away from an idle
     // room doesn't tear it down; anon/draft rooms keep the short reconnect grace.
     // The warm-room cap bounds how many live idle procs we keep on the container.
-    const graceMs = sess.sessionId ? WARM_ROOM_TTL_MS : RECONNECT_GRACE_MS;
+    const graceMs = (sess.sessionId || sess.threadId) ? WARM_ROOM_TTL_MS : RECONNECT_GRACE_MS;   // [CODEX_DURABLE_V2]
     console.log('[Bridge] Room', sess.key, `empty — grace ${Math.round(graceMs / 1000)}s`);
-    if (sess.sessionId) enforceWarmCap(sess);
+    if (sess.sessionId || sess.threadId) enforceWarmCap(sess);   // [CODEX_DURABLE_V2]
     clearTimeout(sess.graceTimer);
     sess.graceTimer = setTimeout(() => {
+      if (sess.conf && sess.conf.status === 'running') { sess.evictWhenIdle = true; console.log('[Bridge] [CONFERENCE_V1] grace expired but conference running — keeping room alive:', sess.key); return; }
       if (sess.processing || sess.pendingTurns > 0) {
         // A turn is still running with no devices attached. Don't kill it —
         // let it finish in the background; evict once it goes idle (evictIfReady).
@@ -2781,6 +3450,15 @@ wss.on('connection', (ws) => {
       // Client stall-watchdog liveness probe: report this room's real turn
       // state so the UI can self-recover a missed 'done' (permanent spinner).
       ws.send(JSON.stringify({ type: 'room_status', processing: !!S.processing, pendingTurns: S.pendingTurns || 0 }));
+    } else if (msg.type === 'set_engine') {
+      if (msg.roomId !== S.key || !['claude', 'codex', 'global'].includes(msg.mode)) return;
+      if (S.processing || S.pendingTurns > 0 || confActive(S)) {
+        ws.send(JSON.stringify(S.engineState('Engine unchanged: a turn or conference is still active. Wait for it to finish, or press Stop, then select the engine again.')));
+        return;
+      }
+      S.engineOverride = msg.mode === 'global' ? null : msg.mode;
+      persistRoom(S);
+      S.send(S.engineState());
     } else if (msg.type === 'chat') {
       // Guard against socket drift: reconnect races can leave this socket bound to
       // a different room than the UI shows. Re-bind to the room the client says it
@@ -2812,11 +3490,51 @@ wss.on('connection', (ws) => {
           sock.send(JSON.stringify({ type: 'user_msg', text: displayText }));
         }
       }
+      // [CONFERENCE_V1] Conference is its own orchestration flow — handle first, before the guard.
+      if (msg.engineMode === 'conference' || confActive(S)) {
+        if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) { confInterject(S, prompt); if (S.conf.status === 'paused') confResume(S); }
+        else confStart(S, prompt, { leadEngine: msg.leadEngine, maxRounds: msg.maxRounds });
+        return;
+      }
+      // [CODEX_DURABLE_V6] Never switch engines mid-turn — it would interleave the two
+      // engines' queue/journal state. Hold the room's current engine, notify, and require
+      // the user to resend once the active turn drains. Does NOT mutate engineOverride.
+      {
+        const _req = (msg.engineMode === 'claude' || msg.engineMode === 'codex') ? msg.engineMode
+                   : (msg.engineMode === 'global' ? currentEngine() : null);
+        if (S.processing && _req && _req !== (S.procEngine || S.engineOverride || currentEngine())) {
+          S.send(S.engineState('Message not sent: a turn is still running on the previous engine. Wait or press Stop, then select the engine and resend your message.'));
+          return;
+        }
+      }
       // Per-room override rides on the chat msg: 'claude'/'codex' pins THIS room;
       // 'global' (or absent) clears the pin so the room follows the pane engine.
       if (msg.engineMode === 'claude' || msg.engineMode === 'codex') S.engineOverride = msg.engineMode;
       else if (msg.engineMode === 'global') S.engineOverride = null;
-      S.sendToClaude(prompt);
+      persistRoom(S);   // [CODEX_DURABLE_V2]
+      // [ENGINE_AUTHORITATIVE_V1] Capture-once dispatch guard. Resolve the engine ONCE,
+      // synchronously (before any await/callback), and never run under an engine the user
+      // was not shown. The captured value is then passed explicitly to sendToEngine, which
+      // does NOT re-resolve, so a marker flip after this point cannot change the turn.
+      {
+        const _captured = resolveRoomEngine(S);
+        const _shown = (msg.displayedEngine === 'claude' || msg.displayedEngine === 'codex') ? msg.displayedEngine : null;
+        if (!_shown) {
+          S.send({ type: 'client_upgrade_required', roomId: S.key, engine: _captured.engine, mode: _captured.mode, rev: _captured.rev,
+                   text: prompt, reason: 'This tab is out of date and could not confirm which engine it is showing. Please reload the page, then resend your message.' });
+          return;
+        }
+        if (_shown !== _captured.engine) {
+          const _lbl = _captured.engine === 'codex' ? 'Codex' : 'Claude';
+          S.send({ type: 'engine_resync', roomId: S.key, engine: _captured.engine, mode: _captured.mode, rev: _captured.rev,
+                   text: prompt, reason: 'The engine changed to ' + _lbl + ' since this view loaded — your message was not sent. It now shows ' + _lbl + '; resend to run on it.' });
+          S.send(S.engineState());
+          return;
+        }
+        S.turnEngine = _captured.engine;
+        S.send({ type: 'turn_engine', engine: _captured.engine });
+        S.sendToEngine(_captured.engine, prompt);
+      }
     } else if (msg.type === 'resume_session') {
       // Join the room for this conversation (idempotent if already there).
       const target = (typeof msg.id === 'string' && msg.id.slice(0, 80)) || null;
@@ -2827,10 +3545,19 @@ wss.on('connection', (ws) => {
       // a reconnect/restart while keeping its stable room key. Gentle: never
       // clobbers a live turn or an already-set session.
       const id = (typeof msg.id === 'string' && msg.id.slice(0, 80)) || null;
-      if (id && S && !S.processing && !S.sessionId) {
+      if (id && S && !S.processing && !S.sessionId && sessionFileExists(id)) {   // [CODEX_DURABLE_V5] adopt a REAL Claude transcript only — never a Codex thread id
         S.sessionId = id;
+        persistRoom(S);   // [CODEX_DURABLE_V3] persist adopted Claude session
         S.send({ type: 'session_id', id });
       }
+    } else if (msg.type === 'conf_start') {   // [CONFERENCE_V1]
+      const brief = (msg.brief || '').toString().trim();
+      if (!brief) return;
+      if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) { confInterject(S, brief); if (S.conf.status === 'paused') confResume(S); }
+      else confStart(S, brief, { leadEngine: msg.leadEngine, maxRounds: msg.maxRounds });
+    } else if (msg.type === 'conf_pause') { confPause(S);
+    } else if (msg.type === 'conf_resume') { confResume(S);
+    } else if (msg.type === 'conf_stop') { confStop(S);
     } else if (msg.type === 'compact') {
       console.log('[Bridge] Compacting session:', S.sessionId);
       S.sendToClaude('/compact');
@@ -2840,6 +3567,8 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'reset') {
       S.killCurrentProc('user reset');
       S.sessionId = null;
+      S.threadId = null; S.lastEngine = null; clearRoom(S.key);   // [CODEX_DURABLE_V3] drop both handles + durable record
+      if (S.conf) { S.conf = null; S._confRecovered = false; confClearFile(S.key); }   // [CONFERENCE_V1]
       S.send({ type: 'status', text: 'Session reset — next message starts a fresh Claude session.' });
     } else if (msg.type === 'switch_session') {
       // Move this socket to another room. The old room keeps running for any other
@@ -2884,5 +3613,6 @@ server.listen(BRIDGE_PORT, '0.0.0.0', () => {
   console.log(`   Claude CWD: ${CLAUDE_CWD}\n`);
   // Re-inject any turns that were in flight when a previous instance was killed
   // (a blip). No-op unless RESUME_TURNS is enabled.
+  try { setInterval(pollEngineMarker, 3000); } catch (e) {}
   try { replayPending(); } catch (e) { console.log('[Bridge] replayPending failed:', e.message); }
 });
