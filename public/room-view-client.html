@@ -97,6 +97,10 @@
   }
 
   let ws = null;
+  // Keep the outer app informed that an empty room is healthy. The relay may
+  // close a viewer while no tab is assigned; reporting that as "disconnected"
+  // makes app.js reload this iframe every few seconds, causing a visible flap.
+  let waitingForTab = false;
   let reconnectTimer = null;
   let reconnectDelay = 1000;
   function setStatus(s, cls) { statusEl.textContent = s; if (cls) stateEl.className = cls; }
@@ -124,15 +128,15 @@
   }
   function connect() {
     ws = new WebSocket(buildWsUrl());
-    ws.onopen = () => { reconnectDelay = 1000; unansweredProbes = 0; setStatus('connected · ' + roomId, 'connecting'); startLiveness(); };
-    ws.onclose = () => { live = false; setStatus('disconnected', 'disconnected'); scheduleReconnect(); };
+    ws.onopen = () => { reconnectDelay = 1000; unansweredProbes = 0; setStatus('connected · ' + roomId, waitingForTab ? 'waiting' : 'connecting'); startLiveness(); };
+    ws.onclose = () => { live = false; if (waitingForTab) showWaiting(); else setStatus('disconnected', 'disconnected'); scheduleReconnect(); };
     ws.onerror = () => { setStatus('error', 'error'); };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.t === 'frame') { gotFrame = true; unansweredProbes = 0; hideWaiting(); drawFrame(m); }
       else if (m.t === 'meta') renderMeta(m);
-      else if (m.t === 'hello') { live = true; unansweredProbes = 0; hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); requestKeyframes(); }
-      else if (m.t === 'waiting') { live = false; showWaiting(); }
+      else if (m.t === 'hello') { waitingForTab = false; live = true; unansweredProbes = 0; hideWaiting(); setStatus('live · ' + roomId + ' · ' + (m.targetId || '').slice(0, 8), 'connected'); requestKeyframes(); }
+      else if (m.t === 'waiting') { waitingForTab = true; live = false; showWaiting(); }
       else if (m.t === 'error') setStatus('err: ' + m.msg, 'error');
     };
   }
