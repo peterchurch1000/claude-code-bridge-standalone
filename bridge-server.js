@@ -878,7 +878,17 @@ function autoNameRoom(S) {
     if ((S._nameTurns || 0) >= 2) return;               // only the 1st or 2nd instruction
     try { if (readAutonomyRooms().get(id)) return; } catch {}   // leave task rooms alone
     const file = path.join(transcriptsDir(), id + '.jsonl');
-    const first = firstUserInstruction(file);
+    // [AUTONAME_CONF_BRIEF_V1] A conference's transcript begins with generic
+    // role/stage scaffolding (confBuildPrompt), so first-user-message naming
+    // yields boilerplate titles ("Diagnosis Conference Round One"). The brief is
+    // the real problem statement — name a conference room from it directly.
+    let first;
+    if (S.conf && S.conf.brief && String(S.conf.brief).trim().length >= 4) {
+      first = String(S.conf.brief).replace(/\s+/g, ' ').trim();
+      if (first.length > 400) { const cut = first.slice(0, 400); first = cut.slice(0, cut.lastIndexOf(' ') + 1).trim() || cut; }
+    } else {
+      first = firstUserInstruction(file);
+    }
     if (!first || first.length < 4) { console.log('[autoname] skip', id.slice(0, 8), 'no first message yet'); return; }
     S._nameTurns = (S._nameTurns || 0) + 1;
     S._naming = true;
@@ -3368,6 +3378,15 @@ wss.on('connection', (ws) => {
     // mirror; a different roomId gets its own room + Claude process. Default
     // 'shared' preserves single-room behaviour for clients that send no roomId.
     const key = (typeof roomId === 'string' && roomId.slice(0, 80)) || 'shared';
+    // [ROOMLINK_V1] Resolvability BEFORE makeSession (which would create an empty entry
+    // that must NOT count). A room is resolvable only with meaningful durable state; a
+    // draft-* id is never resolvable. Used to warn a device that opened an unresolvable
+    // shared link instead of silently showing an empty/wrong room.
+    const _rlRec = _loadRoomMap()[key];
+    const _rlLive = clientSessions.get(key);
+    const _rlResolvable = key !== 'shared'
+      && !String(key).startsWith('draft-')
+      && (sessionFileExists(key) || !!(_rlRec && (_rlRec.sessionId || _rlRec.threadId)) || !!chatData[key] || !!(_rlLive && (_rlLive.sessionId || _rlLive.threadId)));
     S = clientSessions.get(key);
     if (!S) {
       S = makeSession(key);
@@ -3392,9 +3411,19 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ type: 'history_sync', messages: hist.messages }));
       }
     }
+    // [ROOMLINK_V1] The link named a room we cannot resolve to any real conversation: tell
+    // the client so it can show an honest "not found" notice instead of silently sitting in
+    // an empty/different room. Harmless for older clients (unknown message type is ignored).
+    if (!_rlResolvable && key !== 'shared') {
+      ws.send(JSON.stringify({ type: 'room_unresolved', roomId: key, kind: String(key).startsWith('draft-') ? 'draft' : 'unknown' }));
+    }
     ws.send(JSON.stringify(S.engineState()));
     if (S.processing) ws.send(JSON.stringify({ type: 'thinking' }));
-    try { if (S.conf || confLoad(S.key)) confRecover(S); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confRecover failed:', e.message); }
+    try {
+      const _cdisk = confLoad(S.key);   // [CONFERENCE_ROOMSWITCH_V1] load inside try so a read failure follows the intended error handling
+      if (S.conf || (_cdisk && _cdisk.status !== 'superseded')) confRecover(S);
+      else ws.send(JSON.stringify({ type: 'conf_status', status: 'idle' }));   // authoritative "no conference here"; FIFO-ordered after any stale old-room frames
+    } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confRecover failed:', e.message); }
   }
 
   // Remove a socket from its room; when the room empties, start the grace timer
