@@ -520,8 +520,31 @@
   // is independent of the Claude session: resets don't unhook it, and different
   // tabs (even in the same profile) never cross over. Two tabs sharing ?room=
   // mirror each other.
-  const _rawRoom = new URLSearchParams(location.search).get('room');
-  let PINNED_ROOM = (_rawRoom && _rawRoom.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60)) || null;
+  const _sanitizeRoom = (v) => (v && v.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60)) || null;
+  // [ROOMLINK_V1] Accept the room id from the query OR the fragment. The fragment is a
+  // redundant copy written by setRoomUrl(): it survives a query-stripping redirect
+  // because it never leaves the browser.
+  const _rawRoomQuery = new URLSearchParams(location.search).get('room');
+  let _rawRoomHash = null;
+  try { _rawRoomHash = new URLSearchParams((location.hash || '').replace(/^#/, '')).get('room'); } catch (e) {}
+  const _rawRoom = _rawRoomQuery || _rawRoomHash;
+  let PINNED_ROOM = _sanitizeRoom(_rawRoom);
+  // [ROOMLINK_V1] Per-room inbound-link intent: the sanitized room id THIS page load was
+  // asked to open. Scopes the "room not found" banner to exactly that id; cleared once it
+  // resolves or on any user-driven room switch. roomServerConfirmed gates Copy-link and is
+  // reset on every room transition, set true only when the server confirms THIS room.
+  // [ROOMLINK_SELFDRAFT_V1] A draft-<clientId>-… id embedding THIS browser's own clientId is a
+  // blank room this profile opened for itself (e.g. the "New room in a new tab" pop-out), NOT a
+  // shared inbound link, so it must not raise the "never started" banner. A draft id only ever
+  // appears in the URL while unstarted (the first reply promotes the room to a real session id),
+  // so a self-owned draft is always legitimately blank; foreign drafts (a different embedded
+  // clientId) keep the honest warning.
+  const _selfDraftClientId = (() => { try { return localStorage.getItem('bridge_client_id') || ''; } catch (e) { return ''; } })();
+  const _isSelfDraft = (id) => !!id && !!_selfDraftClientId && String(id).startsWith('draft-' + _selfDraftClientId + '-');
+  let pendingLinkRoomId = _isSelfDraft(PINNED_ROOM) ? null : PINNED_ROOM;
+  let roomServerConfirmed = false;
+  let _copyLinkBtn = null;
+  let _roomUnresolvedBanner = null;
   // Session id namespaced per pinned room so rooms in one profile stay independent.
   let SESSION_KEY  = 'bridge_session_id' + (PINNED_ROOM ? '::' + PINNED_ROOM : '');
   // Stable per-browser id so the bridge can reattach a live Claude turn after a
@@ -542,6 +565,10 @@
   let currentRoomId = PINNED_ROOM || currentSessionId || localStorage.getItem(ROOM_KEY) || newDraftRoomId();
   let roomEpoch = 0;   // bumps on every room change; guards async history repaints
   if (!PINNED_ROOM) localStorage.setItem(ROOM_KEY, currentRoomId);
+  // [ROOMLINK_V1] Eager URL reflection (display-only; PINNED_ROOM unchanged): make the
+  // address bar always name the current room — including a fresh draft — so copying it
+  // can never yield a BARE url that silently opens a different room on another device.
+  try { setRoomUrl(currentRoomId); } catch (e) {}
   try { setTimeout(() => applyRoomBg(currentRoomId), 0); } catch {}
   // Engine model: a pane-wide GLOBAL engine (set by account switching; read from the
   // server's /accounts `engine`) is the default every room follows. A room may be
@@ -652,6 +679,18 @@
     renderConfBanner();
   }
 
+  // [CONFERENCE_ROOMSWITCH_V1] Clear transient conference UI when leaving a room. The banner is a
+  // singleton sibling of messagesEl (so messagesEl.innerHTML='' cannot remove it) and
+  // confState is a module global that would otherwise carry the prior room's status into
+  // the next room. The destination room's own conf_status/conf_sync (pushed by the
+  // server's attach -> confRecover, or an explicit idle) repaints authoritatively. Does
+  // NOT touch confmode:<rid> (the per-room engine-selector choice).
+  function resetConfUI() {
+    confState = null; activeConf = false; confStreamEngine = null;
+    const b = document.getElementById('conf-banner');
+    if (b) { b.style.display = 'none'; const t = b.querySelector('#conf-banner-text'); if (t) t.textContent = ''; }
+  }
+
   function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
   function applyEngineMeta(d) { if (!d) return; globalEngine = (d.engine === 'codex') ? 'codex' : 'claude'; codexEnabled = !!d.codexEnabled; if (typeof updateTitlebar === 'function') updateTitlebar(); }
   (async () => { try { const _d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
@@ -690,7 +729,13 @@
       const res = await fetch(`${API_BASE}/history/${sessionId}`, { cache: 'no-store' });
       const data = await res.json();
       if (roomEpoch !== epoch) return;   // user opened/switched another room mid-fetch — do not repaint stale history
-      if (data.messages && data.messages.length > 0) renderStoredDisplay(data.messages);
+      if (data.messages && data.messages.length > 0) {
+        renderStoredDisplay(data.messages);
+        roomServerConfirmed = true;   // [ROOMLINK_V1] server has real history for this room
+        if (pendingLinkRoomId && (sessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
+        hideRoomUnresolved();
+        if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
+      }
     } catch {}
   }
 
@@ -1027,6 +1072,7 @@
         appendMsg('user', '\uD83E\uDD1D Conference started \u2014 lead: ' + confEngineLabel(msg.leadEngine) + ', reviewer: ' + confEngineLabel(msg.reviewEngine) + ' (up to ' + msg.maxRounds + ' rounds)');
         break;
       case 'conf_status':
+        if (msg.status === 'idle') { resetConfUI(); break; }   // [CONFERENCE_ROOMSWITCH_V1] authoritative: no conference in this room
         confState = { status: msg.status, stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason };   /* [CONFERENCE_V2] */
         activeConf = (msg.status === 'running'); renderConfBanner();
         break;
@@ -1063,6 +1109,10 @@
         // for the room we just left cannot repaint the empty new room.
         if (currentSessionId && Array.isArray(msg.messages) && msg.messages.length && !storedMsgData.length) {
           renderStoredDisplay(msg.messages);
+          roomServerConfirmed = true;   // [ROOMLINK_V1]
+          if (pendingLinkRoomId && (currentSessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
+          hideRoomUnresolved();
+          if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
         }
         break;
 
@@ -1177,6 +1227,7 @@
         // real session id (the server re-keys the room to it too), promote the room
         // to that durable id so a reload rejoins THIS exact room/conversation.
         if (PINNED_ROOM && PINNED_ROOM.startsWith('draft-')) {
+          roomServerConfirmed = false;   // [ROOMLINK_V1] id is changing; re-confirm after currentRoomId is final
           try { setRoomOverride(roomOverride(currentRoomId), msg.id); localStorage.removeItem(OVR_KEY(currentRoomId)); } catch {}
           try { const _bg = getRoomBg(currentRoomId); if (_bg) { setRoomBg(_bg, msg.id); setRoomBg('', currentRoomId); } applyRoomBg(msg.id); } catch {}
           if (pendingRoomName) {
@@ -1193,7 +1244,7 @@
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
           localStorage.setItem(ROOM_KEY, msg.id);   // [ROOMKEY_PERSIST_V1] so a bare-URL/cold open resumes THIS room, not a fresh draft
-          try { const u = new URL(location.href); u.searchParams.set('room', msg.id); history.replaceState(null, '', u); } catch {}
+          setRoomUrl(msg.id);   // [ROOMLINK_V1] reflect into ?room= AND #room=
           if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
           if (_PRB || _RV) setVncRoom(msg.id);   // panel follows the promoted room id
         } else if (!PINNED_ROOM) {
@@ -1205,11 +1256,21 @@
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
           localStorage.setItem(ROOM_KEY, msg.id);
-          try { const u = new URL(location.href); u.searchParams.set('room', msg.id); history.replaceState(null, '', u); } catch {}
+          setRoomUrl(msg.id);   // [ROOMLINK_V1] reflect into ?room= AND #room=
           if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
           if (_PRB || _RV) setVncRoom(msg.id);
         }
         localStorage.setItem(SESSION_KEY, currentSessionId || msg.id);
+        // [ROOMLINK_V1b] Confirm ONLY when the server's session_id names the CURRENT room.
+        // session_id is delivered for the socket's currently-bound room; requiring
+        // msg.id === currentRoomId binds confirmation to this room+id and rejects a
+        // delayed/stale session_id from a room we've since left. Promotion sets
+        // currentRoomId = msg.id just above, so promoted/UUID/cold-open rooms confirm here;
+        // named rooms (key !== session id) confirm via history restore instead
+        // (fetchAndRestoreHistory / history_sync).
+        if (msg.id === currentRoomId) roomServerConfirmed = true;
+        if (pendingLinkRoomId && (msg.id === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) { pendingLinkRoomId = null; hideRoomUnresolved(); }
+        if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
         if (window._pendingTask) { localStorage.setItem(taskKey(msg.id), window._pendingTask); window._pendingTask = null; }
         updateTitlebar();
         if (pendingTaskLink) {
@@ -1218,6 +1279,16 @@
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session: msg.id }),
           }).then(() => loadTasks()).catch(() => {});
+        }
+        break;
+
+      case 'room_unresolved':
+        // [ROOMLINK_V1] The server could not resolve the room this LINK asked to open.
+        // Show the honest banner ONLY when it matches the id THIS page load was asked for
+        // (per-room intent, so a later local draft can't trip a stale warning) and nothing
+        // was restored into the view.
+        if (pendingLinkRoomId && msg.roomId === pendingLinkRoomId && !storedMsgData.length && !_isSelfDraft(msg.roomId)) {
+          showRoomUnresolved(msg.roomId, msg.kind);
         }
         break;
 
@@ -1481,7 +1552,7 @@
     try {
       const r = await fetch(API_BASE + '/accounts/switch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type })
+        body: JSON.stringify({ name, type: 'code' })
       });
       const d = await r.json();
       if (r.ok && d.ok) {
@@ -2184,7 +2255,22 @@
       nameEl.style.minWidth = Math.min(20, (nm||'').length) + 'ch';
       try { document.title = (nm && nm !== 'New room') ? (nm + ' \u2014 Claude Code Bridge') : 'Claude Code Bridge'; } catch (e) {} /* TASK335_TAB_TITLE */
     }
-    if (idEl) { idEl.textContent = id ? id.slice(0, 8) : '\u2014'; idEl.title = id || ''; }
+    if (idEl) {
+      idEl.textContent = id ? id.slice(0, 8) : '\u2014';
+      idEl.title = id ? ('Claude session: ' + id + '\nRoom: ' + currentRoomId + '\n(click to copy session ID)') : 'No Claude session yet';
+      idEl.style.cursor = id ? 'pointer' : '';
+      if (!idEl._wired) {   /* SESSIDBTN_V1: click #st-id to copy the Claude Code session id */
+        idEl._wired = true;
+        idEl.addEventListener('click', () => {
+          const sid = currentSessionId;
+          if (!sid) { if (typeof showToast === 'function') showToast('No Claude session yet \u2014 send a message first', 'info'); return; }
+          navigator.clipboard.writeText(sid).then(
+            () => { if (typeof showToast === 'function') showToast('Session ID copied: ' + sid, 'success'); },
+            () => { if (typeof showToast === 'function') showToast('Copy failed \u2014 full ID is in the tooltip', 'error'); }
+          );
+        });
+      }
+    }
     if (taskEl) {
       const t = id ? (localStorage.getItem(taskKey(id)) || '') : '';
       taskEl.textContent = t ? ('\u2316 ' + t) : '';
@@ -2289,11 +2375,14 @@
   async function enterRoom(roomKey, sessionId) {
     sessionDropdown.classList.add('hidden');
     roomEpoch++;
+    roomServerConfirmed = false;   // [ROOMLINK_V1] new room until the server confirms a session
+    pendingLinkRoomId = null;      // [ROOMLINK_V1] user-driven switch clears inbound-link intent
+    hideRoomUnresolved();
     PINNED_ROOM   = roomKey;
     currentRoomId = roomKey;
     applyRoomBg(roomKey);
     SESSION_KEY   = 'bridge_session_id::' + roomKey;
-    try { const u = new URL(location.href); u.searchParams.set('room', roomKey); history.replaceState(null, '', u); } catch {}
+    setRoomUrl(roomKey);   // [ROOMLINK_V1] reflect into ?room= AND #room=
     if (_PRB || _RV) setVncRoom(roomKey);   // switch the live panel to this room's browser
     messagesEl.innerHTML = '';
     _pendingOlder = []; _olderBtn = null; _restoring = false;   // drop prior room's load-older backlog so it can't refill the new room
@@ -2301,6 +2390,7 @@
     currentAssistantText = '';
     lastToolEl = null;
     setBusy(false);
+    resetConfUI();   // [CONFERENCE_ROOMSWITCH_V1] clear any prior room's conference banner
     hideContextWarning();
     refreshCompactNudge(roomKey);
     storedMsgData        = [];
@@ -2316,6 +2406,7 @@
     if (sessionId) await fetchAndRestoreHistory(sessionId);
     updateTitlebar();
     if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
+    if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
   }
 
   // Start a brand-new room from zero and enter it. It rides a temporary draft key
@@ -2345,13 +2436,16 @@
     currentRoomId = name;
     applyRoomBg(name);
     roomEpoch++;
+    roomServerConfirmed = false;   // [ROOMLINK_V1]
+    pendingLinkRoomId = null;      // [ROOMLINK_V1]
+    hideRoomUnresolved();
     SESSION_KEY = 'bridge_session_id::' + name;            // re-point session namespace
-    const u = new URL(location.href); u.searchParams.set('room', name);
-    history.replaceState(null, '', u);                     // a later reload stays on this room
+    setRoomUrl(name);                                      // [ROOMLINK_V1] ?room= AND #room=; a later reload/copy stays on this room
     if (_PRB || _RV) setVncRoom(name);   // switch the live panel to this room's browser
     const prev = localStorage.getItem(SESSION_KEY) || null;
     messagesEl.innerHTML = ''; _pendingOlder = []; _olderBtn = null; _restoring = false; currentAssistantEl = null; currentAssistantText = '';
     lastToolEl = null; setBusy(false); storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
+    resetConfUI();   // [CONFERENCE_ROOMSWITCH_V1] clear any prior room's conference banner
     currentSessionId = prev;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'switch_session', id: name }));   // re-room this socket live
@@ -2360,6 +2454,7 @@
     if (prev) fetchAndRestoreHistory(prev);
     if (typeof updateTitlebar === 'function') updateTitlebar();
     refreshRoomBtn();
+    if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
     showToast('Room: ' + name + (prev ? '' : ' (new)'), 'success');
   }
   (function wireRoomBtn() {
@@ -2372,6 +2467,83 @@
       if (name != null && name.trim()) switchRoom(name.trim());
     };
   })();
+
+  // ── Shareable room link + inbound-link resolution (ROOMLINK_V1) ─────────────
+  // Room identity used to live only in an OPTIONAL ?room= param written lazily (after the
+  // first reply). A URL copied before that — or one whose param was dropped in transit —
+  // arrived bare, so another device silently opened ITS OWN last room. We now (1) reflect
+  // the current room into BOTH ?room= and #room= on every load/switch so the address bar is
+  // never bare, (2) offer a Copy-link button that only enables once the server has confirmed
+  // a session for THIS room, and (3) show an honest banner when a link points at a room the
+  // server cannot resolve — instead of a silent wrong room.
+  function setRoomUrl(id) {
+    if (!id) return;
+    try {
+      const u = new URL(location.href);
+      u.searchParams.set('room', id);
+      u.hash = 'room=' + encodeURIComponent(id);
+      history.replaceState(null, '', u);
+    } catch (e) {}
+  }
+  function buildShareUrl(id) {
+    const u = new URL(location.href);
+    u.searchParams.set('room', id);
+    u.hash = 'room=' + encodeURIComponent(id);
+    return u.href;
+  }
+  function refreshCopyLinkBtn() {
+    if (!_copyLinkBtn) return;
+    const on = !!(roomServerConfirmed && currentRoomId && !String(currentRoomId).startsWith('draft-'));
+    _copyLinkBtn.disabled = !on;
+    _copyLinkBtn.title = on ? 'Copy a shareable link to this room'
+                            : 'Send a message first to get a shareable link for this room';
+  }
+  (function wireCopyLinkBtn() {   // [ROOMLINK_V1c] robust anchor: btn-room is absent in index.html
+    _copyLinkBtn = document.createElement('button');
+    _copyLinkBtn.id = 'btn-copy-room-link';
+    _copyLinkBtn.type = 'button';
+    _copyLinkBtn.className = 'st-copy-link';
+    _copyLinkBtn.textContent = '🔗';
+    _copyLinkBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;font-size:13px;padding:0 4px;opacity:.85';
+    _copyLinkBtn.addEventListener('click', async () => {
+      if (_copyLinkBtn.disabled || !currentRoomId) return;
+      const url = buildShareUrl(currentRoomId);
+      try { await navigator.clipboard.writeText(url); showToast('Room link copied — anyone you send it to opens THIS room', 'success'); }
+      catch (e) { showToast(url, 'info'); }
+    });
+    const roomBtn = document.getElementById('btn-room');
+    const bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
+    if (roomBtn && roomBtn.parentNode) roomBtn.parentNode.insertBefore(_copyLinkBtn, roomBtn.nextSibling);
+    else if (bar) bar.appendChild(_copyLinkBtn);
+    else { _copyLinkBtn = null; return; }
+    refreshCopyLinkBtn();
+  })();
+  function hideRoomUnresolved() { if (_roomUnresolvedBanner) { _roomUnresolvedBanner.remove(); _roomUnresolvedBanner = null; } }
+  function showRoomUnresolved(roomId, kind) {
+    hideRoomUnresolved();
+    const b = document.createElement('div');
+    b.className = 'ctx-warning';
+    const span = document.createElement('span');
+    const code = document.createElement('code');
+    code.textContent = roomId || '';   // id rendered as TEXT, never HTML
+    if (kind === 'draft') {
+      span.appendChild(document.createTextNode('🔗 This link points to a room that was never started ('));
+      span.appendChild(code);
+      span.appendChild(document.createTextNode('). Showing an empty room.'));
+    } else {
+      span.appendChild(document.createTextNode('🔗 This link’s room ('));
+      span.appendChild(code);
+      span.appendChild(document.createTextNode(') isn’t available here — it may have expired or been created on another account. Showing an empty room.'));
+    }
+    const x = document.createElement('button');
+    x.className = 'ctx-btn-dismiss';
+    x.textContent = '✕';
+    x.onclick = hideRoomUnresolved;
+    b.appendChild(span);
+    b.appendChild(x);
+    if (messagesEl && messagesEl.parentNode) messagesEl.parentNode.insertBefore(b, messagesEl);
+    _roomUnresolvedBanner = b;
+  }
 
   let _sessRows = [];
   let _taskRoomsData = [];
