@@ -351,6 +351,33 @@
     panBtn.style.display = 'none';        // desktop uses a real mouse
   }
 
+  // ── Live-browser pane toggle (BROWSER_TOGGLE_V1) ────────────────────────────
+  // Collapse the live-browser pane off/on in both layouts; chat fills the space.
+  // State lives on <html data-browser-hidden> (seeded pre-paint by the head script)
+  // + localStorage 'ccb-browser-hidden'. The iframe stays connected (CSS display:none),
+  // so toggling is instant and lossless.
+  const btnBrowserToggle = $('btn-browser-toggle');
+  function setBrowserHidden(hidden) {
+    document.documentElement.setAttribute('data-browser-hidden', hidden ? '1' : '0');
+    try { localStorage.setItem('ccb-browser-hidden', hidden ? '1' : '0'); } catch (_) {}
+    if (btnBrowserToggle) {
+      btnBrowserToggle.setAttribute('aria-expanded', hidden ? 'false' : 'true');   // false = pane hidden
+      btnBrowserToggle.title = hidden ? 'Show live browser' : 'Hide live browser';
+    }
+    if (!hidden) {
+      // Re-shown: the iframe relayouts from display:none and noVNC re-fits on its own
+      // resize; nudge the same-origin frame's own window defensively (guarded).
+      try { vncFrame.contentWindow.dispatchEvent(new Event('resize')); } catch (_) {}
+    }
+  }
+  if (btnBrowserToggle) {
+    setBrowserHidden(document.documentElement.getAttribute('data-browser-hidden') === '1');
+    btnBrowserToggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      setBrowserHidden(document.documentElement.getAttribute('data-browser-hidden') !== '1');
+    });
+  }
+
   // Centroid in stable top-window coords (the iframe's own clientX is relative
   // to a viewport that moves as we pan, so add the iframe's rect to cancel it).
   // Handles one OR two fingers so the same pan math serves both gestures.
@@ -579,8 +606,47 @@
 
   // ── Per-room background colour ─────────────────────────────────────────────
   const ROOMBG_KEY = rid => 'ccb-roombg::' + (rid || currentRoomId);
-  function getRoomBg(rid) { try { return localStorage.getItem(ROOMBG_KEY(rid)) || ''; } catch { return ''; } }
-  function setRoomBg(color, rid) { try { const k = ROOMBG_KEY(rid); if (color) localStorage.setItem(k, color); else localStorage.removeItem(k); } catch {} }
+  // [ROOMBG_SYNC_V1] Server (/roombg/rooms) is the source of truth so a room's colour follows the
+  // user across browser profiles/devices. localStorage is only a fast first-paint cache used UNTIL
+  // hydration completes; once roomBgCache is an object it is authoritative and a missing key means
+  // "no colour" even if a stale local key survives. Outgoing writes are serialized per-browser via
+  // _roombgWriteChain so this browser's own selections reach the server in click order; each op
+  // catches so one failure can't wedge the chain. _roombgPending gates hydration so an in-flight
+  // GET can't overwrite optimistic local state.
+  let roomBgCache = null;
+  let _roombgPending = 0;
+  let _roombgWriteChain = Promise.resolve();
+  function getRoomBg(rid) {
+    const id = rid || currentRoomId;
+    if (roomBgCache) return roomBgCache[id] || '';
+    try { return localStorage.getItem(ROOMBG_KEY(id)) || ''; } catch { return ''; }
+  }
+  function setRoomBg(color, rid) {
+    const id = rid || currentRoomId;
+    try { const k = ROOMBG_KEY(id); if (color) localStorage.setItem(k, color); else localStorage.removeItem(k); } catch {}
+    if (roomBgCache) { if (color) roomBgCache[id] = color; else delete roomBgCache[id]; }
+    _roombgPending++;
+    _roombgWriteChain = _roombgWriteChain
+      .then(() => fetch(`${API_BASE}/roombg/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roomId: id, color: color || '' }) }).catch(() => {}))
+      .then(() => { _roombgPending = Math.max(0, _roombgPending - 1); }, () => { _roombgPending = Math.max(0, _roombgPending - 1); });
+  }
+  function loadRoomBgs() {
+    if (_roombgPending > 0) return Promise.resolve();
+    return fetch(`${API_BASE}/roombg/rooms`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null)
+      .then(map => {
+        if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+        if (_roombgPending > 0) return;
+        roomBgCache = map;
+        try {
+          for (let i = localStorage.length - 1; i >= 0; i--) { const k = localStorage.key(i); if (k && k.indexOf('ccb-roombg::') === 0) localStorage.removeItem(k); }
+          Object.keys(map).forEach(id => { try { if (map[id]) localStorage.setItem(ROOMBG_KEY(id), map[id]); } catch {} });
+        } catch {}
+        try { applyRoomBg(currentRoomId); } catch {}
+        try { if (typeof loadSessions === 'function') loadSessions(); } catch {}
+      })
+      .catch(() => {});
+  }
   function applyRoomBg(rid) {
     const c = getRoomBg(rid || currentRoomId);
     if (c) document.documentElement.style.setProperty('--room-bg', c);
@@ -606,6 +672,20 @@
   let confStreamEngine = null;        // engine whose turn is currently streaming
   let confState = null;               // last known conference state for the current room
   let activeConf = false;             // true while the conference is actively orchestrating
+  let pendingConfStart = null;        // [CONF_TASK_ASSOC_V1] held first-message payload during task-association
+  let confStartGuard = false;         // armed from send until accept/cancel; blocks a competing fresh start
+  let confAwaitingAck = false;        // sent; waiting for conf_started / conf_need_task
+  function confUuid() { try { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12)); } catch { return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12); } }
+  // [CONFERENCE_HISTORY_V1] Reconcile the live preview bubble with the authoritative
+  // conf_msg by STABLE turn identity (turnId from the server's confTurnId tag), not a
+  // mutable global. _suppressSave stops replay/stream output being POSTed back into
+  // /history; _pendingConfSync defers a sync that arrived mid-stream so it is applied
+  // (never dropped) on the next 'done'.
+  let confBubbleByTurn = {};
+  let confDividerByTurn = {};   // turnId -> divider already drawn (survives conf_turn; reset by a renderConfSync wipe, mirroring the DOM)
+  let confStreamTurnId = null;
+  let _suppressSave = false;
+  let _pendingConfSync = null;
   function confModeKey(rid) { return 'confmode:' + (rid || currentRoomId); }
   function confModeOn(rid) { try { return localStorage.getItem(confModeKey(rid)) === '1'; } catch { return false; } }
   function setConfMode(rid, on) { try { if (on) localStorage.setItem(confModeKey(rid), '1'); else localStorage.removeItem(confModeKey(rid)); } catch {} }
@@ -621,6 +701,7 @@
     b.className = 'conf-banner';
     b.style.cssText = 'display:none;position:sticky;top:0;z-index:20;padding:8px 12px;margin:0 0 6px;border-radius:8px;background:#1f2937;color:#e5e7eb;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 1px 4px rgba(0,0,0,.3)';
     b.innerHTML = '<span id="conf-banner-text" style="flex:1 1 auto">Conference</span>' +
+      '<span id="conf-banner-task" style="display:none;padding:2px 8px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px" title="Tarea asociada"></span>' +
       '<button id="conf-btn-pause" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Pause</button>' +
       '<button id="conf-btn-resume" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb;display:none">Resume</button>' +
       '<button id="conf-btn-stop" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#991b1b;color:#fee2e2">Stop</button>';
@@ -651,6 +732,8 @@
     let txt = '\uD83E\uDD1D Conference \u00B7 ' + stageTxt + ' \u00B7 round ' + (c.round || 1) + '/' + (c.maxRounds || 4) + ' \u00B7 ' + who + (c.restriction && c.restriction !== 'write' ? ' \u00B7 \uD83D\uDD12 read-only' : '');
     if (c.status === 'paused') txt = '\u23F8 Paused' + (c.reason ? (' \u2014 ' + c.reason) : '') + ' \u00B7 round ' + (c.round || 1) + '/' + (c.maxRounds || 4);
     b.querySelector('#conf-banner-text').textContent = txt;
+    const _tc = b.querySelector('#conf-banner-task');
+    if (_tc) { if (c.task && (c.task.id || c.task.file)) { _tc.textContent = '\uD83D\uDDC2 task-' + (c.task.id || ''); _tc.title = c.task.title || ('Tarea ' + (c.task.file || '')); _tc.style.display = ''; } else { _tc.style.display = 'none'; } }
     b.querySelector('#conf-btn-pause').style.display = c.status === 'running' ? '' : 'none';
     b.querySelector('#conf-btn-resume').style.display = c.status === 'paused' ? '' : 'none';
     b.querySelector('#conf-btn-stop').style.display = '';
@@ -666,15 +749,27 @@
   // Render the full server-authoritative conference log (reload / second device).
   function renderConfSync(msg) {
     if (!Array.isArray(msg.messages)) return;
-    if (busy) { return; }   // don't disturb a live streaming view; next reload will sync
-    messagesEl.innerHTML = '';
-    storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
-    for (const m of msg.messages) {
-      confDivider(m.engine, m.role, m.round, m.stageLabel);   /* [CONFERENCE_V2] */
-      const el = appendMsg('assistant', m.text || '');
-      void el;
-    }
-    confState = { status: msg.status, stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine };   /* [CONFERENCE_V2] */
+    // [CONFERENCE_HISTORY_V1] Never DROP a sync that lands mid-stream — defer it and
+    // apply on the next 'done' so the authoritative log always wins eventually.
+    if (busy) { _pendingConfSync = msg; return; }
+    _pendingConfSync = null;
+    // [CONFERENCE_HISTORY_V1] Suppress history POSTs while replaying (this is render
+    // output, not a new turn) but STILL populate storedMsgData so search/load-older
+    // have the full in-memory model.
+    _suppressSave = true;
+    try {
+      messagesEl.innerHTML = '';
+      confBubbleByTurn = {};
+      confDividerByTurn = {};   // the wipe removed every divider; rebuild the ledger as we redraw
+      storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
+      for (const m of msg.messages) {
+        if (m.type === 'user') { appendMsg('user', m.text || ''); continue; }   // [CONF_BRIEF_V1] original brief / user turns
+        if (m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel); if (m.turnId) confDividerByTurn[m.turnId] = true; }   /* [CONFERENCE_V2] */
+        const el = appendMsg('assistant', m.text || '');
+        if (el) { if (m.engine) el.dataset.engine = m.engine; if (m.turnId) { el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = el; } }
+      }
+    } finally { _suppressSave = false; }
+    confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
     activeConf = (msg.status === 'running');
     renderConfBanner();
   }
@@ -687,8 +782,144 @@
   // NOT touch confmode:<rid> (the per-room engine-selector choice).
   function resetConfUI() {
     confState = null; activeConf = false; confStreamEngine = null;
+    confBubbleByTurn = {}; confDividerByTurn = {}; confStreamTurnId = null; _pendingConfSync = null;   // [CONFERENCE_HISTORY_V1]
     const b = document.getElementById('conf-banner');
     if (b) { b.style.display = 'none'; const t = b.querySelector('#conf-banner-text'); if (t) t.textContent = ''; }
+  }
+
+  // ── [CONF_TASK_ASSOC_V1] Task-association step at conference start ───────────
+  function confCommitPending(reqId) {
+    if (!pendingConfStart || pendingConfStart.committed) return;
+    if (reqId && pendingConfStart.reqId && reqId !== pendingConfStart.reqId) return;
+    const p = pendingConfStart; p.committed = true;
+    appendMsg('user', p.echo);
+    if (inputEl.value === (p.snapText || '') && pendingAttachments.map(a => a.path).join('|') === (p.snapAtt || '')) {
+      inputEl.value = ''; userResizedInput = false; autoGrowInput(); clearAttachments();
+    }
+    if (p.text && inputHistory[inputHistory.length - 1] !== p.text) { inputHistory.push(p.text); if (inputHistory.length > 50) inputHistory.shift(); }
+    historyIdx = -1;
+    confStartGuard = false; confAwaitingAck = false; pendingConfStart = null;
+    closeConfTaskModalUI();
+  }
+  // Reconnect path: conf_status/conf_sync already rendered the brief authoritatively, so
+  // resolve the pending start WITHOUT re-appending; just release guard + clear if unchanged.
+  function confReconcilePending(startReqId) {
+    if (!pendingConfStart || pendingConfStart.committed) return;
+    if (!startReqId || pendingConfStart.reqId !== startReqId) return;
+    const p = pendingConfStart; p.committed = true;
+    if (inputEl.value === (p.snapText || '') && pendingAttachments.map(a => a.path).join('|') === (p.snapAtt || '')) {
+      inputEl.value = ''; userResizedInput = false; autoGrowInput(); clearAttachments();
+    }
+    confStartGuard = false; confAwaitingAck = false; pendingConfStart = null;
+    closeConfTaskModalUI();
+  }
+  function _confPanel() { return document.getElementById('conf-task-panel'); }
+  function closeConfTaskModalUI() {
+    const m = document.getElementById('conf-task-modal'); if (m) m.remove();
+    document.removeEventListener('keydown', _confModalEsc, true);
+  }
+  function closeConfTaskModal(cancel) {
+    closeConfTaskModalUI();
+    if (cancel) { confStartGuard = false; confAwaitingAck = false; pendingConfStart = null; }
+  }
+  function _confModalEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeConfTaskModal(true); } }
+  function submitConfStart(taskDecision, task) {
+    if (!pendingConfStart) return;
+    if (ws && ws.readyState !== WebSocket.OPEN) { showToast('Sin conexi\u00f3n \u2014 reintenta', 'warning'); return; }
+    const p = pendingConfStart;
+    p.reqId = confUuid(); p.taskDecision = taskDecision; p.task = task || null;
+    p.snapText = inputEl.value; p.snapAtt = pendingAttachments.map(a => a.path).join('|');
+    confAwaitingAck = true;
+    closeConfTaskModalUI();   // hide UI but KEEP guard + pending until accept / need_task / cancel
+    try {
+      ws.send(JSON.stringify({ type: 'chat', text: p.text, attachments: p.attachments, engineMode: 'conference', roomId: currentRoomId, reqId: p.reqId, taskDecision: taskDecision, task: p.task }));
+    } catch (e) { confAwaitingAck = false; showToast('No se pudo iniciar \u2014 reintenta', 'warning'); openConfTaskModal(null, true); }
+  }
+  function openConfTaskModal(payload, reuse) {
+    closeConfTaskModalUI();
+    if (!reuse) { pendingConfStart = { text: payload.text, echo: payload.echo, attachments: (payload.attachments || []), reqId: null, committed: false }; }
+    confStartGuard = true;
+    const wrap = document.createElement('div');
+    wrap.id = 'conf-task-modal';
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    wrap.innerHTML = '<div id="conf-task-panel" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:18px"></div>';
+    wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) closeConfTaskModal(true); });
+    document.body.appendChild(wrap);
+    document.addEventListener('keydown', _confModalEsc, true);
+    _confModalRootView();
+  }
+  function _confModalRootView() {
+    const p = _confPanel(); if (!p) return;
+    p.innerHTML =
+      '<div style="font-size:15px;font-weight:600;margin-bottom:4px">\uD83E\uDD1D \u00bfAsociar esta conferencia con una tarea?</div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:14px">Elige una opci\u00f3n para continuar. La conferencia empezar\u00e1 despu\u00e9s de tu elecci\u00f3n.</div>' +
+      '<div style="display:flex;flex-direction:column;gap:8px">' +
+      '<button id="conf-t-find" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\uD83D\uDD0D Buscar una tarea existente</button>' +
+      '<button id="conf-t-new" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2795 Crear una tarea nueva</button>' +
+      '<button id="conf-t-none" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2014 Continuar sin tarea</button>' +
+      '</div>' +
+      '<div style="margin-top:14px;text-align:right"><button id="conf-t-cancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancelar</button></div>';
+    p.querySelector('#conf-t-find').onclick = _confModalFindView;
+    p.querySelector('#conf-t-new').onclick = _confModalCreateView;
+    p.querySelector('#conf-t-none').onclick = function () { submitConfStart('none', null); };
+    p.querySelector('#conf-t-cancel').onclick = function () { closeConfTaskModal(true); };
+  }
+  function _confModalFindView() {
+    const p = _confPanel(); if (!p) return;
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Buscar una tarea</div></div>' +
+      '<input id="conf-t-search" placeholder="Filtrar por t\u00edtulo o n\u00famero\u2026" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin-bottom:10px">' +
+      '<div id="conf-t-list" style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:4px">Cargando\u2026</div>';
+    p.querySelector('#conf-t-back').onclick = _confModalRootView;
+    const searchEl = p.querySelector('#conf-t-search');
+    let all = [];
+    const draw = function () {
+      const listEl = p.querySelector('#conf-t-list'); if (!listEl) return;
+      const q = (searchEl.value || '').toLowerCase().trim();
+      const rows = all.filter(function (t) { return !q || (String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0); });
+      if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">Sin coincidencias.</div>'; return; }
+      listEl.innerHTML = '';
+      rows.slice(0, 200).forEach(function (t) {
+        const row = document.createElement('button');
+        row.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
+        row.textContent = 'task-' + (t.id || '?') + ' \u00b7 ' + (t.title || '(sin t\u00edtulo)');
+        row.onclick = function () { submitConfStart('linked', { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') }); };
+        listEl.appendChild(row);
+      });
+    };
+    searchEl.oninput = draw;
+    fetch(API_BASE + '/tasks', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) { all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : []; draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0); })
+      .catch(function () { const listEl = p.querySelector('#conf-t-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">No se pudo cargar la lista. <button id="conf-t-retry" style="cursor:pointer;margin-left:6px;padding:2px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Reintentar</button></div>'; const rb = listEl.querySelector('#conf-t-retry'); if (rb) rb.onclick = _confModalFindView; } });
+  }
+  function _confModalCreateView() {
+    const p = _confPanel(); if (!p) return;
+    const prefill = (pendingConfStart && pendingConfStart.text ? pendingConfStart.text : '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Crear una tarea nueva</div></div>' +
+      '<label style="font-size:12px;opacity:.7">T\u00edtulo</label>' +
+      '<input id="conf-t-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
+      '<label style="font-size:12px;opacity:.7">Descripci\u00f3n (opcional)</label>' +
+      '<textarea id="conf-t-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="conf-t-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancelar</button><button id="conf-t-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Crear y empezar</button></div>' +
+      '<div id="conf-t-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
+    const titleEl = p.querySelector('#conf-t-title'); titleEl.value = prefill;
+    const descEl = p.querySelector('#conf-t-desc');
+    p.querySelector('#conf-t-back').onclick = _confModalRootView;
+    p.querySelector('#conf-t-cancel2').onclick = function () { closeConfTaskModal(true); };
+    const createBtn = p.querySelector('#conf-t-create');
+    createBtn.onclick = function () {
+      const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
+      const errEl = p.querySelector('#conf-t-err');
+      if (title.length < 3) { if (errEl) errEl.textContent = 'El t\u00edtulo debe tener al menos 3 caracteres.'; return; }
+      createBtn.disabled = true; createBtn.textContent = 'Creando\u2026';
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim() }) })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (res) { if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error'); submitConfStart('linked', { id: String(res.j.id || ''), file: String(res.j.file || ''), title: String(res.j.title || title) }); })
+        .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Crear y empezar'; if (errEl) errEl.textContent = 'No se pudo crear la tarea. Reintenta.'; });
+    };
+    setTimeout(function () { try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch (e) {} }, 0);
   }
 
   function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
@@ -705,6 +936,11 @@
   let _saveTimer = null;
   function saveToStorage() {
     if (_restoring || !currentSessionId) return;
+    // [CONFERENCE_HISTORY_V1] During a conf replay (_suppressSave) or a running
+    // conference (activeConf), the server owns /history (served from the authoritative
+    // conference log), so never POST render/stream output back — it would recreate the
+    // divergent record that caused the jumbling.
+    if (_suppressSave || activeConf) return;
     // [XENGINE_STALESAVE_V1] On a bare (unpinned) load, currentSessionId is seeded
     // from the global localStorage key and can be a STALE id (e.g. a Codex thread
     // id). Persisting the first reply-less turn under it materialises an orphan
@@ -1067,23 +1303,62 @@
 
       // [CONFERENCE_V1] server-orchestrated collaboration events
       case 'conf_started':
-        confState = { status: 'running', stage: msg.stage || 'diagnosis', stageLabel: msg.stageLabel, subphase: 'lead', round: 1, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine };   /* [CONFERENCE_V2] */
+        confCommitPending(msg.reqId);   // [CONF_TASK_ASSOC_V1] deferred commit-once (append + clear)
+        confState = { status: 'running', task: (msg.task || null), startReqId: (msg.reqId || null), stage: msg.stage || 'diagnosis', stageLabel: msg.stageLabel, subphase: 'lead', round: 1, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine };   /* [CONFERENCE_V2] */
         activeConf = true; renderConfBanner();
         appendMsg('user', '\uD83E\uDD1D Conference started \u2014 lead: ' + confEngineLabel(msg.leadEngine) + ', reviewer: ' + confEngineLabel(msg.reviewEngine) + ' (up to ' + msg.maxRounds + ' rounds)');
         break;
       case 'conf_status':
         if (msg.status === 'idle') { resetConfUI(); break; }   // [CONFERENCE_ROOMSWITCH_V1] authoritative: no conference in this room
-        confState = { status: msg.status, stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason };   /* [CONFERENCE_V2] */
+        confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
         activeConf = (msg.status === 'running'); renderConfBanner();
         break;
       case 'conf_turn':
         confStreamEngine = msg.engine;
+        confStreamTurnId = msg.turnId || null;   // [CONFERENCE_HISTORY_V1] identity for this turn's stream + bubble
+        currentTurnEngine = msg.engine === 'codex' ? 'codex' : 'claude';   // colour the streamed bubble for the right engine
         confDivider(msg.engine, msg.role, msg.round, msg.stageLabel);   /* [CONFERENCE_V2] */
+        if (msg.turnId) confDividerByTurn[msg.turnId] = true;   // [CONFERENCE_HISTORY_V1] this turn's divider is now on screen
         break;
-      case 'conf_msg':
-        // Live view already streamed this turn; finalise the current bubble to the
-        // clean (verdict-stripped) text so no marker remnants remain.
-        if (currentAssistantEl) { renderMd(currentAssistantEl, msg.text || ''); currentAssistantEl = null; currentAssistantText = ''; }
+      case 'conf_msg': {
+        // [CONFERENCE_HISTORY_V1] Reconcile by STABLE turn id. If this turn streamed a
+        // live preview bubble, REPLACE its content with the clean (verdict-stripped)
+        // authoritative text. If it produced no streamed bubble (e.g. a reviewer turn
+        // whose engine didn't stream, or 'done' already cleared the global), APPEND a
+        // body under the divider that conf_turn already placed — so reviewer turns are
+        // never body-less and Claude turns are never duplicated.
+        const _tid = msg.turnId || null;
+        const _clean = confStripVerdict(msg.text || '');
+        // Reconcile ONLY by stable turn id. The currentAssistantEl fallback is TURN-SAFE:
+        // adopt it only when it is unkeyed (an untagged live preview always belongs to the
+        // current turn) or its turnId matches THIS message. This guarantees that a stale
+        // deferred-sync repaint — which wipes the in-flight turn's divider + preview and
+        // can leave currentAssistantEl referencing a DIFFERENT (older) synced bubble —
+        // can never overwrite that other turn's content.
+        let _el = (_tid && confBubbleByTurn[_tid]) || null;
+        if (!_el && currentAssistantEl) {
+          const _cur = currentAssistantEl.dataset ? currentAssistantEl.dataset.turnId : null;
+          if (!_cur || _cur === _tid) _el = currentAssistantEl;
+        }
+        if (_el) { renderMd(_el, _clean); }
+        else {
+          // No bubble for this turn (never streamed, OR a deferred-sync repaint erased its
+          // preview + divider). Redraw the divider from the message's own identity fields
+          // (conclusions have none) so the divider/body pairing is always preserved, then
+          // append the body.
+          if (_tid && msg.role && msg.role !== 'conclusion' && !confDividerByTurn[_tid]) { confDivider(msg.engine, msg.role, msg.round, msg.stageLabel); confDividerByTurn[_tid] = true; }
+          _el = appendMsg('assistant', _clean);
+        }
+        if (_el) { if (msg.engine) _el.dataset.engine = msg.engine; if (_tid) { _el.dataset.turnId = _tid; confBubbleByTurn[_tid] = _el; } }
+        currentAssistantEl = null; currentAssistantText = '';
+        break;
+      }
+      case 'conf_need_task':   // [CONF_TASK_ASSOC_V1] server requires an explicit, valid task decision
+        if (pendingConfStart && (!msg.reqId || pendingConfStart.reqId === msg.reqId)) {
+          confAwaitingAck = false;
+          openConfTaskModal(null, true);
+          showToast(msg.reason === 'task' ? 'Esa tarea ya no existe \u2014 elige otra opci\u00f3n' : 'Elige una opci\u00f3n de tarea para continuar', 'warning');
+        }
         break;
       case 'conf_sync':
         renderConfSync(msg);
@@ -1127,6 +1402,7 @@
 
       case 'stream':
         lastStreamAt = Date.now();
+        confStreamTurnId = ('confTurnId' in msg) ? (msg.confTurnId || null) : confStreamTurnId;   // [CONFERENCE_HISTORY_V1]
         handleStreamEvent(msg.data);
         break;
 
@@ -1147,7 +1423,11 @@
         currentAssistantEl   = null;
         currentAssistantText = '';
         lastToolEl = null;
+        confStreamTurnId = null;   // [CONFERENCE_HISTORY_V1] turn finished; next stream re-tags
         updateLastQuestion();
+        // [CONFERENCE_HISTORY_V1] Apply a conf_sync that arrived mid-stream (deferred,
+        // not dropped) now that the view is idle.
+        if (_pendingConfSync) { const _m = _pendingConfSync; _pendingConfSync = null; renderConfSync(_m); }
         break;
 
       case 'session_named':
@@ -1780,6 +2060,9 @@
         if (block.type === 'text') {
           if (!currentAssistantEl) {
             currentAssistantEl = appendMsg('assistant', '');
+            // [CONFERENCE_HISTORY_V1] Key this live preview bubble to its turn so the
+            // authoritative conf_msg can reconcile (replace) it by identity.
+            if (activeConf && confStreamTurnId && currentAssistantEl) { currentAssistantEl.dataset.turnId = confStreamTurnId; confBubbleByTurn[confStreamTurnId] = currentAssistantEl; }
           }
           currentAssistantText += block.text;
           renderMd(currentAssistantEl, activeConf ? confStripVerdict(currentAssistantText) : currentAssistantText);   // [CONFERENCE_V1]
@@ -1850,8 +2133,12 @@
         if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
       }
     } else {
+      // [CONFERENCE_HISTORY_V1] A conference log message carries role/stage; render its
+      // divider so the /history-restore path matches renderConfSync exactly (identical
+      // ordered DOM). Non-conference messages have no role, so this is a no-op for them.
+      if (m.type === 'assistant' && m.role && m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel); if (m.turnId) confDividerByTurn[m.turnId] = true; }
       const _el = appendMsg(m.type, m.text || '');
-      if (_el && m.type === 'assistant' && m.engine) _el.dataset.engine = m.engine;
+      if (_el && m.type === 'assistant') { if (m.engine) _el.dataset.engine = m.engine; if (m.turnId) { _el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = _el; } }
     }
   }
 
@@ -2171,6 +2458,12 @@
     const echo = text + (attachments.length
       ? (text ? '\n' : '') + attachments.map(a => `📎 ${a.name}`).join('\n')
       : '');
+    // [CONF_TASK_ASSOC_V1] Fresh conference: ask about task association BEFORE any optimistic render/send.
+    if (confModeOn(currentRoomId) && !activeConf && !(confState && (confState.status === 'running' || confState.status === 'paused'))) {
+      if (confStartGuard) { showToast('Termina el paso de asociaci\u00f3n de tarea primero', 'info'); return; }
+      openConfTaskModal({ text: text, echo: echo, attachments: attachments });
+      return;
+    }
     appendMsg('user', echo);
     clearLastQuestion();
     if (confModeOn(currentRoomId)) {   // [CONFERENCE_V1] start / interject a conference
@@ -2257,17 +2550,59 @@
     }
     if (idEl) {
       idEl.textContent = id ? id.slice(0, 8) : '\u2014';
-      idEl.title = id ? ('Claude session: ' + id + '\nRoom: ' + currentRoomId + '\n(click to copy session ID)') : 'No Claude session yet';
+      idEl.title = id ? ('Claude session: ' + id + '\nRoom: ' + currentRoomId + '\n(click or press & hold to copy the full ID)') : 'No Claude session yet';
       idEl.style.cursor = id ? 'pointer' : '';
-      if (!idEl._wired) {   /* SESSIDBTN_V1: click #st-id to copy the Claude Code session id */
+      if (!idEl._wired) {   /* SESSIDBTN_V2: click or press-and-hold #st-id to copy the full Claude session id */
         idEl._wired = true;
-        idEl.addEventListener('click', () => {
+        // Copy the FULL session id (the complete form of the shortened code shown).
+        // For a started room the room is re-keyed to its session id, so this doubles
+        // as the room id; the toast also names the room. Draft/unstarted rooms have no
+        // id yet -> guarded empty state.
+        const copyRoomId = () => {
           const sid = currentSessionId;
           if (!sid) { if (typeof showToast === 'function') showToast('No Claude session yet \u2014 send a message first', 'info'); return; }
+          const nm = (sessionNameById[sid] || pendingRoomName || 'New room');
           navigator.clipboard.writeText(sid).then(
-            () => { if (typeof showToast === 'function') showToast('Session ID copied: ' + sid, 'success'); },
+            () => { if (typeof showToast === 'function') showToast('Room \u201C' + nm + '\u201D \u2014 ID copied: ' + sid, 'success'); },
             () => { if (typeof showToast === 'function') showToast('Copy failed \u2014 full ID is in the tooltip', 'error'); }
           );
+        };
+        // Press-and-hold (long-press) recognizer. Native selection / context-menu are
+        // suppressed (CSS + contextmenu) so the hold wins consistently. A completed hold
+        // fires copyRoomId and suppresses ONLY the trailing synthetic pointer-click
+        // (detail>=1); a keyboard-activated click (detail===0) is never swallowed.
+        const HOLD_MS = 500, MOVE_SLOP = 10;
+        let holdTimer = null, holdPointerId = null, holdConsumed = false, holdResetTimer = null, downX = 0, downY = 0;
+        const clearHoldTimer = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
+        const scheduleHoldReset = () => { if (holdResetTimer) clearTimeout(holdResetTimer); holdResetTimer = setTimeout(() => { holdConsumed = false; holdResetTimer = null; }, 400); };
+        const endTracking = () => { clearHoldTimer(); holdPointerId = null; };
+        idEl.addEventListener('pointerdown', (e) => {
+          if (e.button != null && e.button !== 0) return;   // primary button only
+          if (e.isPrimary === false) return;                // ignore secondary touch pointers
+          if (holdPointerId !== null) return;               // a pointer is already tracked -> a 2nd must not overwrite it
+          holdPointerId = e.pointerId; holdConsumed = false; downX = e.clientX; downY = e.clientY;
+          if (holdResetTimer) { clearTimeout(holdResetTimer); holdResetTimer = null; }
+          try { idEl.setPointerCapture(e.pointerId); } catch (_) {}
+          clearHoldTimer();
+          holdTimer = setTimeout(() => {
+            holdTimer = null;
+            if (holdPointerId == null) return;
+            holdConsumed = true;   // a real hold fired -> eat the synthetic click that follows
+            copyRoomId();
+          }, HOLD_MS);
+        });
+        idEl.addEventListener('pointermove', (e) => {
+          if (e.pointerId !== holdPointerId) return;
+          if (Math.abs(e.clientX - downX) > MOVE_SLOP || Math.abs(e.clientY - downY) > MOVE_SLOP) { endTracking(); scheduleHoldReset(); }
+        });
+        const onPointerEnd = (e) => { if (e.pointerId !== holdPointerId) return; endTracking(); scheduleHoldReset(); };
+        idEl.addEventListener('pointerup', onPointerEnd);
+        idEl.addEventListener('pointercancel', onPointerEnd);
+        idEl.addEventListener('pointerleave', onPointerEnd);
+        idEl.addEventListener('contextmenu', (e) => e.preventDefault());
+        idEl.addEventListener('click', (e) => {
+          if (e.detail !== 0 && holdConsumed) { holdConsumed = false; return; }   // swallow post-hold synthetic click only
+          copyRoomId();
         });
       }
     }
@@ -2552,6 +2887,7 @@
   // Filter both the rooms list and the task-rooms list by their title text.
   function applySessionFilter(q) {
     q = (q || '').trim().toLowerCase();
+    const terms = q ? q.split(/\s+/).filter(Boolean) : [];   // [ROOMSEARCH_CONTENT_V1] tokenised AND
     const box = document.getElementById('task-rooms-box');
     if (q && box && !box.childElementCount && _makeRow) {
       for (const s of _taskRoomsData) box.appendChild(_makeRow(s));   // render collapsed task rooms so they're searchable
@@ -2563,7 +2899,10 @@
     let taskHits = 0, archHits = 0;
     for (const r of _sessRows) {
       if (!r || !r.dataset) continue;
-      const hit = !q || (r.dataset.label || '').includes(q);
+      const label = r.dataset.label || '';
+      const localHit  = !q || terms.every(t => label.includes(t));       // partial/reordered recall
+      const remoteHit = !!q && _remoteHitIds.has(r.dataset.id);          // /search body/brief match reveals this listed row
+      const hit = localHit || remoteHit;
       r.style.display = hit ? '' : 'none';
       if (hit && r.dataset.task === '1') taskHits++;
       if (hit && r.dataset.archived === '1') archHits++;
@@ -2571,11 +2910,112 @@
     if (box) box.style.display = q ? (taskHits ? 'block' : 'none') : (taskRoomsExpanded ? 'block' : 'none');
     if (abox) abox.style.display = q ? (archHits ? 'block' : 'none') : (archivedRoomsExpanded ? 'block' : 'none');
   }
+  // [ROOMSEARCH_CONTENT_V1] The filter above only sees sparse row metadata for the
+  // recency-capped rooms in the /sessions payload. To make a room findable by anything
+  // in its conversation (incl. a conference brief embedded in the transcript) and
+  // beyond the 150-room cap, run the existing server full-text /search for every settled
+  // query: reveal already-listed rows via _remoteHitIds (the loop above) and synthesize
+  // rows for matches NOT in the payload under a "Found in conversations" group.
+  // Correctness never depends on local hit count; performance = debounce + abort.
+  let _remoteHitIds = new Set();
+  let _remoteGen = 0;
+  let _remoteAbort = null;
+  let _remoteTimer = null;
+  function _clearRemoteSearch() {
+    _remoteHitIds = new Set();
+    const head = document.getElementById('found-convos-head');
+    const fbox = document.getElementById('found-convos-box');
+    if (head) head.style.display = 'none';
+    if (fbox) { fbox.innerHTML = ''; fbox.style.display = 'none'; }
+  }
+  function _teardownRemoteSearch() {   // [ROOMSEARCH_CONTENT_V1] selector close: abort in-flight + clear
+    if (_remoteTimer) { clearTimeout(_remoteTimer); _remoteTimer = null; }
+    if (_remoteAbort) { try { _remoteAbort.abort(); } catch (_) {} _remoteAbort = null; }
+    _remoteGen++;   // invalidate any in-flight response so a late resolve is dropped
+    _clearRemoteSearch();
+  }
+  function _ensureFoundEls() {
+    const foot = document.getElementById('session-footer');
+    if (!foot) return null;
+    let head = document.getElementById('found-convos-head');
+    if (!head) {
+      head = document.createElement('div');
+      head.id = 'found-convos-head';
+      head.className = 'sess-new';
+      head.style.opacity = '0.85';
+      head.style.pointerEvents = 'none';
+      foot.appendChild(head);
+    }
+    let fbox = document.getElementById('found-convos-box');
+    if (!fbox) { fbox = document.createElement('div'); fbox.id = 'found-convos-box'; foot.appendChild(fbox); }
+    return { head, fbox };
+  }
+  function renderFoundConvos(results, gen) {
+    if (gen !== _remoteGen) return;   // stale
+    const els = _ensureFoundEls();
+    if (!els) return;
+    const { head, fbox } = els;
+    fbox.innerHTML = '';
+    const present = new Set(_sessRows.map(r => (r.dataset && r.dataset.id) || '').filter(Boolean));
+    const extra = (results || []).filter(s => s && s.id && !present.has(s.id) && s.id !== currentSessionId);
+    if (!extra.length) { head.style.display = 'none'; fbox.style.display = 'none'; return; }
+    head.textContent = 'Found in conversations (' + extra.length + ')';
+    head.style.display = '';
+    fbox.style.display = 'block';
+    for (const s of extra) {
+      const row = document.createElement('div');
+      row.className = 'sess-row';
+      const btn = document.createElement('button');
+      btn.className = 'sess-item';
+      const title = document.createElement('span');
+      title.className = 'sess-preview';
+      title.textContent = s.name || s.preview || '(conversation)';   // text-only, never HTML
+      btn.appendChild(title);
+      if (s.snippet) {
+        const sub = document.createElement('span');
+        sub.className = 'sess-sub';
+        sub.textContent = s.snippet;
+        btn.appendChild(sub);
+      }
+      btn.onclick = () => { sessionDropdown.classList.add('hidden'); enterRoom(s.id, s.id); };
+      row.appendChild(btn);
+      fbox.appendChild(row);
+    }
+  }
+  function scheduleRemoteSearch(rawQ) {
+    const q = (rawQ || '').trim();
+    if (_remoteTimer) { clearTimeout(_remoteTimer); _remoteTimer = null; }
+    if (_remoteAbort) { try { _remoteAbort.abort(); } catch (_) {} _remoteAbort = null; }
+    const gen = ++_remoteGen;
+    if (q.length < 2) { _clearRemoteSearch(); applySessionFilter(rawQ); return; }   // too short: local only
+    _remoteTimer = setTimeout(async () => {
+      _remoteAbort = new AbortController();
+      const _sig = _remoteAbort.signal;
+      let data;
+      try {
+        const r = await fetch(API_BASE + '/search?q=' + encodeURIComponent(q), { cache: 'no-store', signal: _sig });
+        data = await r.json();
+      } catch (e) {
+        if (e && e.name === 'AbortError') return;   // superseded query; local results intact
+        if (gen === _remoteGen) { const els = _ensureFoundEls(); if (els) { els.head.textContent = 'Conversation search unavailable'; els.head.style.display = ''; els.fbox.innerHTML = ''; els.fbox.style.display = 'none'; } }
+        return;
+      }
+      if (_sig.aborted || gen !== _remoteGen) return;   // stale response — ignore
+      const results = data && Array.isArray(data.results) ? data.results : [];
+      _remoteHitIds = new Set(results.map(s => s && s.id).filter(Boolean));
+      renderFoundConvos(results, gen);
+      const cur = document.getElementById('session-search');
+      applySessionFilter(cur ? cur.value : q);   // re-run so listed rows matched only remotely are revealed
+    }, 300);
+  }
   let taskRoomsExpanded = false;
   let archivedRoomsExpanded = false;
   async function loadSessions() {
     sessionList.innerHTML = '';
     _sessRows = [];
+    if (_remoteTimer) { clearTimeout(_remoteTimer); _remoteTimer = null; }   // [ROOMSEARCH_CONTENT_V1]
+    if (_remoteAbort) { try { _remoteAbort.abort(); } catch (_) {} _remoteAbort = null; }
+    _remoteHitIds = new Set();
     let _search = document.getElementById('session-search');
     if (!_search) {
       _search = document.createElement('input');
@@ -2584,7 +3024,7 @@
       _search.placeholder = 'Search rooms\u2026';
       _search.autocomplete = 'off';
       _search.addEventListener('click', e => e.stopPropagation());
-      _search.addEventListener('input', () => applySessionFilter(_search.value));
+      _search.addEventListener('input', () => { applySessionFilter(_search.value); scheduleRemoteSearch(_search.value); });
       sessionDropdown.insertBefore(_search, sessionList);
     }
     const sessionFooter = document.getElementById('session-footer');
@@ -2684,6 +3124,7 @@
         }
         btn.onclick = () => enterRoom(s.id, s.id);
         row.dataset.label = ((s.name || '') + ' ' + _taskLabel + ' ' + (s.preview || '') + ' ' + (s.lastMessage || '')).toLowerCase();
+        row.dataset.id = s.id || '';   // [ROOMSEARCH_CONTENT_V1] identity for remote-hit reveal
         row.dataset.task = s.taskRoom ? '1' : '';
         row.dataset.archived = s.archived ? '1' : '';
         _sessRows.push(row);
@@ -2866,6 +3307,7 @@
     } else {
       sessionDropdown.classList.add('hidden');
       stopSessionPoll();
+      _teardownRemoteSearch();   // [ROOMSEARCH_CONTENT_V1]
     }
   });
 
@@ -2876,6 +3318,7 @@
 
   document.addEventListener('click', () => {
     sessionDropdown.classList.add('hidden');
+    _teardownRemoteSearch();   // [ROOMSEARCH_CONTENT_V1]
   });
 
   // ── Resizable divider ─────────────────────────────────────────────────────
@@ -2904,17 +3347,71 @@
   });
 
   // ── Tasks panel toggle ────────────────────────────────────────────────────
-  const btnTasks  = $('btn-tasks');
-  const tasksPanel = $('tasks-panel');
+  const btnTasks     = $('btn-tasks');
+  const tasksPanel   = $('tasks-panel');
+  const tasksDivider = $('tasks-divider');
+
+  // Drag-to-resize the Tasks panel (mirrors #divider, but sizes #tasks-panel on
+  // its chat-facing edge). The unclamped preference persists in localStorage; the
+  // rendered width is always re-clamped to the current viewport, and inline sizing
+  // is dropped below the mobile breakpoint so the stacked full-width layout wins.
+  // TASKS_CLAMP_V1
+  const TASKS_MOBILE_BP = 820;
+  const clampTasksW = px => Math.max(300, Math.min(px, Math.round(window.innerWidth * 0.7)));
+  function readSavedTasksW() {
+    try { const n = parseInt(localStorage.getItem('ccb-tasks-w'), 10);
+          return (Number.isFinite(n) && n > 0) ? n : null; } catch { return null; }
+  }
+  function applyTasksWidthForViewport() {
+    if (!tasksPanel) return;
+    if (window.innerWidth <= TASKS_MOBILE_BP) {   // mobile: let CSS own full-width/stacked
+      tasksPanel.style.width = '';
+      tasksPanel.style.maxWidth = '';
+      return;
+    }
+    const n = readSavedTasksW();                  // desktop: reapply validated + re-clamped
+    if (n == null) return;
+    tasksPanel.style.maxWidth = 'none';
+    tasksPanel.style.width = clampTasksW(n) + 'px';
+  }
+  window.addEventListener('resize', applyTasksWidthForViewport);
+
+  if (tasksDivider && tasksPanel) {
+    let tDragging = false, tPrevPE = '';
+    tasksDivider.addEventListener('mousedown', e => {
+      tDragging = true;
+      tasksDivider.classList.add('dragging');
+      tPrevPE = vncFrame.style.pointerEvents;
+      vncFrame.style.pointerEvents = 'none';   // stop iframe swallowing mouse events
+      tasksPanel.style.maxWidth = 'none';       // lift CSS max-width cap
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', e => {
+      if (!tDragging) return;
+      const w = clampTasksW(e.clientX - tasksPanel.getBoundingClientRect().left);
+      tasksPanel.style.width = w + 'px';
+    });
+    window.addEventListener('mouseup', () => {
+      if (!tDragging) return;
+      tDragging = false;
+      tasksDivider.classList.remove('dragging');
+      vncFrame.style.pointerEvents = tPrevPE;   // restore prior value (not assumed empty)
+      const n = parseInt(tasksPanel.style.width, 10);
+      if (Number.isFinite(n)) { try { localStorage.setItem('ccb-tasks-w', String(n)); } catch {} }
+    });
+  }
+
   if (btnTasks && tasksPanel) {
     btnTasks.addEventListener('click', () => {
       const isHidden = tasksPanel.classList.contains('tasks-panel-hidden');
       tasksPanel.classList.toggle('tasks-panel-hidden', !isHidden);
       tasksPanel.classList.toggle('tasks-panel-visible', isHidden);
       btnTasks.classList.toggle('active', isHidden);
-      if (isHidden) loadTasks();
+      if (isHidden) { applyTasksWidthForViewport(); loadTasks(); }
     });
   }
+  // Apply a saved width if the panel is already visible at load. TASKS_CLAMP_V1
+  if (tasksPanel && tasksPanel.classList.contains('tasks-panel-visible')) applyTasksWidthForViewport();
 
   // ── Settings dropdown (Connectors / Settings) ─────────────────────────────
   const btnSettings      = $('btn-settings');
@@ -3760,6 +4257,108 @@
 
   function saveTaskState() { try { localStorage.setItem(TS_KEY, JSON.stringify(taskState)); } catch (_) {} }
 
+  // ── Saved filter presets: name -> snapshot of taskState (the 9 filter/sort
+  //    fields; the live search box is intentionally excluded). Multiple presets
+  //    with sticky selection, all client-side in localStorage. [TASK_FILTER_PRESETS_V1]
+  const TP_KEY = 'taskloop.presets.v1';
+  const TP_SEL_KEY = 'taskloop.presets.sel.v1';
+  const PRESET_DATE_VALS = ['pending', 'pending-exc', 'today', 'past', 'no-date', 'all'];
+  const asStrArr = a => Array.isArray(a) ? a.filter(x => typeof x === 'string') : [];
+  // Coerce an arbitrary object into the canonical taskState shape (also clones arrays).
+  function normState(s) {
+    s = (s && typeof s === 'object') ? s : {};
+    return {
+      sort:    typeof s.sort === 'string' ? s.sort : '',
+      dir:     s.dir === 'desc' ? 'desc' : 'asc',
+      date:    PRESET_DATE_VALS.includes(s.date) ? s.date : 'pending',
+      status:  asStrArr(s.status),
+      area:    asStrArr(s.area),
+      type:    asStrArr(s.type),
+      person:  asStrArr(s.person),
+      project: asStrArr(s.project),
+      flags:   asStrArr(s.flags),
+    };
+  }
+  function newPresetId() {
+    try { if (window.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (_) {}
+    return 'p' + Date.now() + Math.random().toString(36).slice(2);
+  }
+  // Canonical signature built from CLONED, sorted arrays so member order is ignored
+  // and neither taskState nor stored presets are ever mutated in place.
+  function stateSig(s) {
+    s = normState(s);
+    return JSON.stringify({
+      sort: s.sort, dir: s.dir, date: s.date,
+      status: [...s.status].sort(), area: [...s.area].sort(), type: [...s.type].sort(),
+      person: [...s.person].sort(), project: [...s.project].sort(), flags: [...s.flags].sort(),
+    });
+  }
+  let presets = [];
+  let selectedPresetId = null;
+  function loadPresets() {
+    let raw = [];
+    try { raw = JSON.parse(localStorage.getItem(TP_KEY) || '[]'); } catch (_) { raw = []; }
+    if (!Array.isArray(raw)) raw = [];
+    const seen = new Set();   // lowercased names -> enforce uniqueness incl. legacy data
+    const out = [];
+    for (const e of raw) {
+      if (!e || typeof e !== 'object') continue;
+      const id = (typeof e.id === 'string' && e.id) ? e.id : newPresetId();
+      let name = (typeof e.name === 'string' ? e.name : '').trim();
+      if (!name) continue;
+      if (seen.has(name.toLowerCase())) {          // de-dupe pre-existing collisions
+        let n = 2, cand;
+        do { cand = name + ' (' + (n++) + ')'; } while (seen.has(cand.toLowerCase()));
+        name = cand;
+      }
+      seen.add(name.toLowerCase());
+      out.push({ id, name, state: normState(e.state) });
+    }
+    presets = out;
+    let sel = null;
+    try { sel = localStorage.getItem(TP_SEL_KEY); } catch (_) {}
+    selectedPresetId = presets.some(p => p.id === sel) ? sel : null;   // clear stale pointer
+    return presets;
+  }
+  function savePresets() {
+    try { localStorage.setItem(TP_KEY, JSON.stringify(presets)); } catch (_) {}
+    try {
+      if (selectedPresetId) localStorage.setItem(TP_SEL_KEY, selectedPresetId);
+      else localStorage.removeItem(TP_SEL_KEY);
+    } catch (_) {}
+  }
+  function snapshotState() { return normState(taskState); }   // normState clones the arrays
+  function findPresetByName(name) {
+    const low = name.trim().toLowerCase();
+    return presets.find(p => p.name.toLowerCase() === low) || null;
+  }
+  function addPreset(name) {
+    name = name.trim(); if (!name) return null;
+    const existing = findPresetByName(name);
+    if (existing) { existing.state = snapshotState(); selectedPresetId = existing.id; savePresets(); return existing; }
+    const p = { id: newPresetId(), name, state: snapshotState() };
+    presets.push(p); selectedPresetId = p.id; savePresets(); return p;
+  }
+  function updateSelectedPreset() {
+    const p = presets.find(x => x.id === selectedPresetId); if (!p) return;
+    p.state = snapshotState(); savePresets();
+  }
+  function deletePreset(id) {
+    presets = presets.filter(p => p.id !== id);
+    if (selectedPresetId === id) selectedPresetId = null;
+    savePresets();
+  }
+  function applyPreset(id) {
+    const p = presets.find(x => x.id === id); if (!p) return;
+    taskState = normState(p.state);   // clones every array
+    selectedPresetId = p.id;
+    saveTaskState(); savePresets();
+    buildFilterMenus(lastTasks); renderTasks(lastTasks);
+  }
+  function selectedPreset() { return presets.find(p => p.id === selectedPresetId) || null; }
+  function isPresetDirty() { const p = selectedPreset(); return p ? (stateSig(taskState) !== stateSig(p.state)) : false; }
+  loadPresets();
+
   function applyTaskView(tasks) {
     let list = tasks.slice();
     const today = todayStr();
@@ -4111,6 +4710,37 @@
   // -- Rich task detail: intermediate objective (history), dated progress feed,
   //    related emails + drafts. Backed by MariaDB via /tasks/<file>/{objectives,
   //    progress,emails}. Single source of truth; no .md. [TASKDETAIL_UI_V1]
+  // [TASK_ROOMS_UI_V1] Ordered, multi-valued conference-room links for a task.
+  // A short display label for one room association.
+  function roomLinkLabel(rm) {
+    if (rm.label && String(rm.label).trim()) return String(rm.label).trim();
+    const k = String(rm.room_key || '');
+    return k.length > 20 ? (k.slice(0, 8) + '\u2026' + k.slice(-6)) : k;
+  }
+  // Compact, read-only list rendered inline right after the Objective. Each entry
+  // is a live ?room= deep-link opened in a new/adjacent tab (buildShareUrl). Full
+  // add/remove management lives in the task-details overlay.
+  function renderInlineRooms(detail, t) {
+    const rooms = Array.isArray(t.rooms) ? t.rooms : [];
+    if (!rooms.length) return;
+    const f = document.createElement('div'); f.className = 'tr-field tr-rooms';
+    const l = document.createElement('span'); l.className = 'tr-field-label';
+    l.textContent = rooms.length > 1 ? 'Conference rooms' : 'Conference room';
+    const b = document.createElement('span'); b.className = 'tr-field-val';
+    b.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px';
+    rooms.forEach(rm => {
+      const a = document.createElement('a');
+      a.textContent = '\uD83D\uDCAC ' + roomLinkLabel(rm);
+      a.href = buildShareUrl(rm.room_key);
+      a.target = '_blank'; a.rel = 'noopener';
+      a.title = 'Open this conference room in a new tab';
+      a.style.cssText = 'font-size:12px;text-decoration:none;color:var(--accent,#6ea8fe);border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 6px';
+      a.addEventListener('click', e => e.stopPropagation());  // don't toggle the row
+      b.appendChild(a);
+    });
+    f.appendChild(l); f.appendChild(b); detail.appendChild(f);
+  }
+
   function openTaskDetails(t) {
     const base = `${API_BASE}/tasks/${encodeURIComponent(t.file)}`;
     const ov = document.createElement('div'); ov.className = 'task-confirm-overlay'; ov.style.zIndex = '100000';
@@ -4260,6 +4890,55 @@
       }
     }
 
+    // Conference rooms  [TASK_ROOMS_UI_V1] — ordered, multi-valued, each a live link.
+    const roomSec = el('div'); bodyWrap.appendChild(roomSec);
+    function parseRoomKey(raw){
+      raw = String(raw || '').trim();
+      const m = raw.match(/[?#&]room=([A-Za-z0-9_-]+)/);
+      return m ? m[1] : raw;
+    }
+    async function renderRooms(){
+      roomSec.innerHTML = ''; roomSec.appendChild(secTitle('Conference rooms'));
+      const data = await jget(`${base}/rooms`); const list = (data && data.rooms) || [];
+      if (list.length){
+        const lw = el('div', 'display:flex;flex-direction:column;gap:6px;margin-bottom:8px'); roomSec.appendChild(lw);
+        list.forEach((rm, i) => {
+          const row = el('div', 'display:flex;gap:8px;align-items:center;font-size:13px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04)');
+          const num = el('div', 'flex:0 0 auto;font-size:11px;opacity:.5;width:16px', String(i + 1));
+          const a = el('a', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;color:var(--accent,#6ea8fe)', '\uD83D\uDCAC ' + roomLinkLabel(rm));
+          a.href = buildShareUrl(rm.room_key); a.target = '_blank'; a.rel = 'noopener'; a.title = 'Open this room in a new tab';
+          const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '\u00d7');
+          del.onclick = async () => { if (await jsend(`${base}/rooms/${rm.rid}`, 'DELETE')) { renderRooms(); loadTasks(); } };
+          row.appendChild(num); row.appendChild(a); row.appendChild(del); lw.appendChild(row);
+        });
+      } else {
+        roomSec.appendChild(el('div', 'font-size:12px;opacity:.5;margin-bottom:8px', 'No conference rooms linked yet.'));
+      }
+      const form = el('div', 'display:flex;gap:6px;flex-wrap:wrap');
+      const key = el('input', 'flex:2 1 180px;font-size:13px;padding:6px 8px'); key.placeholder = 'Paste a room link or key\u2026';
+      const lbl = el('input', 'flex:1 1 120px;font-size:13px;padding:6px 8px'); lbl.placeholder = 'Label (optional)';
+      const add = el('button', 'flex:0 0 auto', 'Link'); add.className = 'tc-ok';
+      const addRoom = async (rawKey, label) => {
+        const rk = parseRoomKey(rawKey);
+        if (!rk) return;
+        if (rk.startsWith('draft-')) { showToast('That room was never started \u2014 open it and send a message first', 'info'); return; }
+        if (await jsend(`${base}/rooms`, 'POST', { room_key: rk, label: label || '' })) { key.value = ''; lbl.value = ''; renderRooms(); loadTasks(); }
+        else showToast('Could not link that room (invalid or unshareable key)', 'error');
+      };
+      add.onclick = () => addRoom(key.value, lbl.value);
+      key.addEventListener('keydown', e => { if (e.key === 'Enter') add.click(); });
+      form.appendChild(key); form.appendChild(lbl); form.appendChild(add);
+      // One-click: link the room currently open in this browser (non-draft only).
+      const cur = currentRoomId;
+      if (cur && !String(cur).startsWith('draft-')){
+        const curBtn = el('button', 'flex:0 0 auto', '\uFF0B Link current room'); curBtn.className = 'tc-cancel';
+        curBtn.title = 'Link the conference room currently open in this tab';
+        curBtn.onclick = () => addRoom(cur, '');
+        form.appendChild(curBtn);
+      }
+      roomSec.appendChild(form);
+    }
+
     // Progress
     const progSec = el('div'); bodyWrap.appendChild(progSec);
     async function renderProgress(){
@@ -4370,7 +5049,7 @@
       for (const it of items){ if (it.type && it.type.indexOf('image') === 0){ const f = it.getAsFile(); if (f) { e.preventDefault(); uploadImageFile(f); } } }
     });
 
-    renderQuestions(); renderObjectives(); renderProgress(); renderEmails(); renderImages();
+    renderQuestions(); renderObjectives(); renderRooms(); renderProgress(); renderEmails(); renderImages();
   }
 
   // ── Read-only view of a task's raw .md (incl. Loop Log). [TASKFILE_VIEWER_V1] ──
@@ -4535,6 +5214,7 @@
       f.appendChild(l); f.appendChild(b); detail.appendChild(f);
     };
     addField('Objective', t.objective, 'tr-objective');
+    renderInlineRooms(detail, t);   // [TASK_ROOMS_UI_V1] conference-room links, right after Objective
     addField('Description', t.description, 'tr-desc');
     if (t.notes) {
       const nl = document.createElement('div'); nl.className = 'tr-field-label tr-notes-label'; nl.textContent = 'Notes / context';
@@ -4613,6 +5293,73 @@
       btn.classList.toggle('active', taskState.date !== 'pending');
     }
   }
+  // ── Saved-preset dropdown (button label + menu) ───────────────────────────
+  function setPresetBtn() {
+    const btn = $('tf-preset'); if (!btn) return;
+    const p = selectedPreset();
+    if (p) { btn.textContent = p.name + (isPresetDirty() ? ' \u2022' : '') + ' \u25be'; btn.classList.add('active'); }
+    else { btn.textContent = 'Presets \u25be'; btn.classList.remove('active'); }
+  }
+  function buildPresetMenu(force) {
+    const menu = $('tf-preset-menu'); if (!menu) return;
+    if (!force && !menu.classList.contains('hidden')) return;   // don't clobber an open menu on background renders
+    menu.innerHTML = '';
+    const scroll = document.createElement('div'); scroll.className = 'tf-scroll';
+    if (!presets.length) {
+      const em = document.createElement('div'); em.className = 'tf-preset-empty'; em.textContent = 'No presets yet.';
+      scroll.appendChild(em);
+    } else {
+      for (const p of presets) {
+        const isSel = p.id === selectedPresetId;
+        const row = document.createElement('div'); row.className = 'tf-opt tf-preset-opt';
+        const name = document.createElement('span'); name.className = 'tf-preset-name';
+        name.textContent = (isSel ? '\u25cf ' : '') + p.name + ((isSel && isPresetDirty()) ? ' (modified)' : '');
+        name.title = p.name;
+        name.addEventListener('click', (e) => { e.stopPropagation(); applyPreset(p.id); closeDropdowns(); });
+        const del = document.createElement('button'); del.type = 'button'; del.className = 'tf-preset-del';
+        del.textContent = '\u{1F5D1}'; del.title = 'Delete preset';
+        del.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const ok = await confirmDialog('Delete preset "' + p.name + '"?');
+          if (!ok) return;
+          deletePreset(p.id); buildPresetMenu(true); setPresetBtn(); renderTasks(lastTasks);
+        });
+        row.appendChild(name); row.appendChild(del); scroll.appendChild(row);
+      }
+    }
+    menu.appendChild(scroll);
+    const sep = document.createElement('div'); sep.className = 'tf-sep'; menu.appendChild(sep);
+    const actWrap = document.createElement('div'); actWrap.className = 'tf-preset-actions';
+    const saveBtn = document.createElement('button'); saveBtn.type = 'button'; saveBtn.className = 'tf-preset-save';
+    saveBtn.textContent = '\uFF0B Save current as preset\u2026';
+    saveBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const raw = prompt('Preset name:'); if (raw == null) return;
+      const name = raw.trim(); if (!name) return;
+      const dupe = findPresetByName(name);
+      const commit = () => {
+        addPreset(name); closeDropdowns(); setPresetBtn(); renderTasks(lastTasks);
+        showToast('Preset "' + name + '" saved', 'success');
+      };
+      if (dupe) { confirmDialog('Replace existing preset "' + dupe.name + '"?').then(ok => { if (ok) commit(); }); return; }
+      commit();
+    });
+    actWrap.appendChild(saveBtn);
+    const sp = selectedPreset();
+    if (sp && isPresetDirty()) {
+      const upd = document.createElement('button'); upd.type = 'button'; upd.className = 'tf-preset-save';
+      upd.textContent = '\u21bb Update "' + sp.name + '"';
+      upd.addEventListener('click', (e) => {
+        e.stopPropagation();
+        updateSelectedPreset(); closeDropdowns(); setPresetBtn(); renderTasks(lastTasks);
+        showToast('Preset "' + sp.name + '" updated', 'success');
+      });
+      actWrap.appendChild(upd);
+    }
+    menu.appendChild(actWrap);
+  }
+  function refreshPresetUI() { buildPresetMenu(); setPresetBtn(); }
+
   function buildFilterMenus(tasks) {
     const noneLabel = v => v === '__none__' ? '(unassigned)' : v;
     const optsFor = key => {
@@ -4698,6 +5445,7 @@
     wireDropdown('tf-type', 'tf-type-menu');
     wireDropdown('tf-person', 'tf-person-menu');
     wireDropdown('tf-project', 'tf-project-menu');
+    wireDropdown('tf-preset', 'tf-preset-menu');
     wireDropdown('tf-flag', 'tf-flag-menu');
     buildDateMenu();
     document.querySelectorAll('#tasks-thead .th[data-sort]').forEach(th => {
@@ -4717,6 +5465,7 @@
     const pendingCount = tasks.filter(t => t.status !== 'done' && !isFuture(t.scheduled)).length;
     if (tasksCountEl) tasksCountEl.textContent = pendingCount || '';
     buildFilterMenus(tasks);
+    refreshPresetUI();
     updateSortHeader();
     if (!tasks.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks yet.</div>'; return; }
     const list = applyTaskView(tasks);
@@ -4878,7 +5627,29 @@
 
   // ── Init ──────────────────────────────────────────────────────────────────
   loadSessions();
+  loadRoomBgs();
+  // [ROOMBG_SYNC_V1] Converge on colour changes made in another browser when this tab regains
+  // focus (eventually-consistent; not a live push). Throttled so refocus can't spam GETs.
+  (function () {
+    let _last = Date.now();
+    function maybe() { const now = Date.now(); if (now - _last < 5000) return; _last = now; loadRoomBgs(); }
+    try { window.addEventListener('focus', maybe); document.addEventListener('visibilitychange', () => { if (!document.hidden) maybe(); }); } catch {}
+  })();
   updateTitlebar();
   // History is restored from server via fetchAndRestoreHistory() on first WS connect
   connect();
+  // [CONFERENCE_HISTORY_V1] Gated test hook — exposes internal handlers to a jsdom
+  // behavioural test. Completely inert in production (window.__CCB_TEST__ is undefined).
+  try {
+    if (typeof window !== 'undefined' && window.__CCB_TEST__) {
+      window.__ccbHooks = {
+        handleMsg,
+        get messagesEl() { return messagesEl; },
+        get storedMsgData() { return storedMsgData; },
+        get pendingConfSync() { return _pendingConfSync; },
+        get busy() { return busy; },
+        get activeConf() { return activeConf; },
+      };
+    }
+  } catch (e) {}
 })();

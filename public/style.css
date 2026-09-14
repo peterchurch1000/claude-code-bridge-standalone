@@ -567,14 +567,14 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
   /* Uniform icon buttons in the header: hamburger, status, tasks, settings all
      render as identical rounded rects (31 wide × 21 tall) with their icon centred. */
-  #btn-menu, #btn-status, #btn-search, #btn-tasks, #btn-settings {
+  #btn-menu, #btn-status, #btn-search, #btn-tasks, #btn-settings, #btn-browser-toggle {
     display: inline-flex; align-items: center; justify-content: center;
     width: 31px; height: 21px; padding: 0; gap: 0;
     background: none; border: 1px solid var(--border); color: var(--text-dim);
     border-radius: 6px; font-size: 15px; line-height: 1;
     cursor: pointer; font-family: inherit; box-sizing: border-box; flex-shrink: 0;
   }
-  #btn-menu:hover, #btn-status:hover, #btn-tasks:hover, #btn-settings:hover {
+  #btn-menu:hover, #btn-status:hover, #btn-tasks:hover, #btn-settings:hover, #btn-browser-toggle:hover {
     color: var(--text); border-color: var(--accent);
   }
   /* Status button is just the dot now — no "Status ▾" text on mobile. */
@@ -801,10 +801,38 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 }
 #divider:hover, #divider.dragging { background: var(--accent); }
 
+/* ── Tasks-panel resize handle (mirrors #divider; sits on the panel’s chat-facing edge) ── */
+#tasks-divider {
+  width: 5px; background: var(--divider-col); cursor: col-resize;
+  flex-shrink: 0; order: -1; transition: background 0.15s; display: none;
+}
+#tasks-divider:hover, #tasks-divider.dragging { background: var(--accent); }
+#app:has(#tasks-panel.tasks-panel-visible) #tasks-divider { display: block; }
+
 /* ── Browser panel ── */
 #browser-panel { flex: 1; position: relative; overflow: hidden; background: var(--room-bg, #000); min-width: 0; }
 
 #vnc-frame { width: 100%; height: 100%; border: none; display: block; }
+
+/* ── Live-browser toggle (BROWSER_TOGGLE_V1): collapse the pane; chat fills the space ── */
+#btn-browser-toggle {
+  background: none; border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 4px; padding: 4px 8px; font-size: 12px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: color 0.2s, border-color 0.2s;
+}
+#btn-browser-toggle:hover { color: var(--accent); border-color: var(--accent); }
+#btn-browser-toggle[aria-expanded="false"] { color: var(--accent); border-color: var(--accent); }
+
+/* Desktop: hide the pane + resize divider, and override the chat-panel width cap
+   (incl. any inline width the divider drag set — stylesheet !important beats a
+   normal inline decl) so the chat fills the released space. Showing again drops
+   these rules and the inline width reasserts, restoring the prior resized width. */
+html[data-browser-hidden="1"] #browser-panel,
+html[data-browser-hidden="1"] #divider { display: none !important; }
+html[data-browser-hidden="1"] #chat-panel {
+  width: 100% !important; max-width: none !important; min-width: 0 !important;
+}
 
 /* ── Toast ── */
 #toast-container {
@@ -877,6 +905,13 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
   /* The resize divider is desktop-only. */
   #divider { display: none; }
+  /* Equal-specificity + later-source override so the mobile hide beats the :has() show rule. */
+  #app:has(#tasks-panel.tasks-panel-visible) #tasks-divider { display: none; }
+
+  /* BROWSER_TOGGLE_V1 — collapse the whole live-browser region on mobile;
+     #messages (flex:1) then consumes the freed height. */
+  html[data-browser-hidden="1"] #browser-panel,
+  html[data-browser-hidden="1"] #zoom-bar { display: none !important; }
 }
 
 /* ── Live-browser zoom slider (mobile only) ─────────────────────────────────
@@ -1171,3 +1206,16 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
 
 /* Room-list colour strip (mirrors each room's background colour) */
 .sess-color { flex: 0 0 auto; width: 12px; align-self: stretch; background: transparent; border-radius: 2px; margin-right: 2px; }
+
+/* SESSIDBTN_V2: neutralise native selection / long-press callout so the press-and-hold copy on #st-id wins */
+#st-id{ -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+
+/* [TASK_FILTER_PRESETS_V1] Saved filter-preset dropdown */
+.tf-preset-opt { justify-content: space-between; text-transform: none; }
+.tf-preset-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tf-preset-del { flex: 0 0 auto; background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 12px; padding: 0 2px; line-height: 1; }
+.tf-preset-del:hover { color: #f87171; }
+.tf-preset-empty { font-size: 11px; color: var(--text-dim); font-style: italic; padding: 3px 5px; }
+.tf-preset-actions { display: flex; flex-direction: column; gap: 3px; }
+.tf-preset-save { width: 100%; background: none; border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 4px 6px; font-size: 11px; cursor: pointer; font-family: inherit; text-align: left; transition: color .15s, border-color .15s; }
+.tf-preset-save:hover { border-color: var(--accent); color: var(--accent); }

@@ -67,6 +67,21 @@ const fs = require('fs');
     try { ROOMVIEW_PORT = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'roomview-port'), 'utf8').trim(); } catch {}
   }
   const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-8';
+  // Credential steward: canonical refresh tokens never enter Claude room homes;
+  // Codex (which requires a refresh token) runs one short turn at a time under
+  // the per-account flock. Set to 0 for an immediate legacy-path rollback.
+  const CREDENTIAL_STEWARD_ENABLED = process.env.CREDENTIAL_STEWARD_ENABLED !== '0';
+  const CREDENTIAL_STEWARD = path.join(process.env.HOME || os.homedir(), 'credential-steward.js');
+  const CREDENTIAL_STATE_DIR = path.join(process.env.HOME || os.homedir(), '.credential-steward');
+  // [CONF_CRED_RETRY_V1] Conference credential-issuance retry policy.
+  const CONF_CRED_MAX_ATTEMPTS = 3;            // total attempts (1 initial + 2 retries)
+  const CONF_CRED_BACKOFF_MS = [2000, 8000];   // before retry #1, #2
+  const CONF_CRED_LEASE_MS = 180000;           // > CLAUDE_STARTUP_TIMEOUT (120s)
+  function _confJitter(ms) { return Math.round(ms * (0.75 + Math.random() * 0.5)); }
+  function stewardText(args) {
+    return execFileSync(process.execPath, [CREDENTIAL_STEWARD, ...args],
+      { encoding: 'utf8', timeout: 45000, env: { ...process.env, HOME: process.env.HOME || os.homedir() } }).trim();
+  }
   // LLM engine for this tenant: 'claude' (default) or 'codex'. Unset => the bridge
   // behaves EXACTLY as before (Claude), so live panes are unaffected. Flip one pane
   // with the ENGINE env var or by writing 'codex' into ~/.claude/engine.
@@ -89,6 +104,42 @@ app.get('/config.js', (req, res) => {
 });
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ── [CONF_ACTIVATION_V1] Activation build id + loopback probe/emitter ─────────
+// buildId is a constant baked into THIS code. A conference records the build it is
+// waiting for before it self-restarts; on respawn the boot resume only proceeds when
+// this constant matches — proving the new code is actually loaded (behaviour, not mtime).
+const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1';
+function _confLoopbackOnly(req, res) {
+  const ip = (req.socket && req.socket.remoteAddress) || '';
+  if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
+  res.status(403).json({ ok: false, error: 'loopback only' });
+  return false;
+}
+app.get('/__conf/build', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  res.json({ ok: true, buildId: CONF_BUILD_ID, pid: process.pid });
+});
+// Emitter: a conference at the verification stage asks the host to restart so a
+// restart-gated fix goes live, then self-verifies. Checkpoint FIRST (durable on the
+// conference record), then self-restart via exit(0) — ccbmon relaunches in ~3s and the
+// boot resume re-opens verification. The trigger is deliberate/operator-driven, never
+// automatic: only a running conference currently at 'verification' may request it.
+app.post('/__conf/activate', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  const key = req.body && req.body.key;
+  if (!key || typeof key !== 'string') return res.status(400).json({ ok: false, error: 'key required' });
+  const S = clientSessions.get(key);
+  const c = (S && S.conf) || confLoad(key);
+  if (!c || c.status !== 'running') return res.status(409).json({ ok: false, error: 'no running conference for key' });
+  if (c.stage !== 'verification') return res.status(409).json({ ok: false, error: 'conference is at stage ' + c.stage + ', not verification' });
+  const expectBuildId = (req.body && typeof req.body.buildId === 'string' && req.body.buildId) || CONF_BUILD_ID;
+  const target = S || { key, conf: c, send() {}, killCurrentProc() {} };
+  try { confRequestActivation(target, { expectBuildId }); }
+  catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  res.json({ ok: true, restarting: true, expectBuildId, oldPid: process.pid });
+});
+
 
 // [ROOMTABS_V1] Per-room tab-health diagnostic + live screenshot for Settings > Room
 // browser health. The room-view relay binds localhost only (reachable from here, not
@@ -140,6 +191,34 @@ app.post('/roombg/recents', (req, res) => {
   try { fs.writeFileSync(ROOMBG_RECENTS_FILE, JSON.stringify(colors)); res.json({ ok: true, colors }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
+// ── Per-room background colour: room->colour assignment map (shared across this user's browsers) ──
+// [ROOMBG_SYNC_V1] The room->colour assignment used to live only in each browser's localStorage,
+// so colours never followed the user across browser profiles/devices. Persist it server-side like
+// recents. Every read+write goes through one in-process promise chain: a GET runs only after
+// already-enqueued writes commit, and concurrent writes to different rooms can't clobber
+// (atomic read-modify-write; server arrival order = last-write-wins). Each op catches so a single
+// failed read/write can't leave the chain permanently rejected.
+const ROOMBG_ROOMS_FILE = path.join(process.env.HOME || os.homedir(), '.claude', 'roombg-rooms.json');
+let _roombgChain = Promise.resolve();
+function roombgEnqueue(fn) { const p = _roombgChain.then(fn, fn); _roombgChain = p.then(() => {}, () => {}); return p; }
+function roombgReadMap() { try { const o = JSON.parse(fs.readFileSync(ROOMBG_ROOMS_FILE, 'utf8')); return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {}; } catch { return {}; } }
+app.get('/roombg/rooms', (req, res) => {
+  roombgEnqueue(() => { res.json(roombgReadMap()); }).catch(() => { try { res.json({}); } catch {} });
+});
+app.post('/roombg/rooms', (req, res) => {
+  const roomId = (req.body && typeof req.body.roomId === 'string') ? req.body.roomId : '';
+  let color = (req.body && typeof req.body.color === 'string') ? req.body.color : '';
+  if (!roomId) return res.status(400).json({ error: 'roomId required' });
+  if (color && !/^#[0-9a-fA-F]{6}$/.test(color)) return res.status(400).json({ error: 'bad color' });
+  color = color ? color.toLowerCase() : '';
+  roombgEnqueue(() => {
+    const map = roombgReadMap();
+    if (color) map[roomId] = color; else delete map[roomId];
+    fs.writeFileSync(ROOMBG_ROOMS_FILE, JSON.stringify(map));
+    res.json({ ok: true, rooms: map });
+  }).catch(e => { try { res.status(500).json({ error: e.message }); } catch {} });
+});
+
 
 // [INFRA_HEALTH_V1] Serve the daily infra-health snapshot for Settings > Infra Health.
 // infra-health-check.sh (cron, 04:00 BA) writes ~/.claude/autonomy/infra-health-status.json
@@ -752,6 +831,26 @@ function healEmptyUserText(id, messages) {
 
 app.get('/history/:sessionId', (req, res) => {
   const id = req.params.sessionId;
+  // [CONFERENCE_HISTORY_V1] A conference room is served from its authoritative,
+  // ordered conference log — NOT from the divergent raw-stream chatData/transcript
+  // (which caused the "jumbled / out of order" rendering). Sits inside the existing
+  // handler, so it inherits the same access gating as every other /history read;
+  // it only changes WHICH representation an already-authorized read returns. Skips
+  // inert 'superseded' tombstones left by an atomic room rekey.
+  try {
+    // [CONF_CONTAINED_V1] Serve a conference room from its OWN store (chatData) so the
+    // room is self-contained. Backfill from the operational side-file on first read.
+    const _cd = chatData[id];
+    if (_cd && _cd.conf && Array.isArray(_cd.messages) && _cd.messages.length) {
+      return res.json({ messages: _cd.messages });
+    }
+    const _conf = confLoad(id);
+    if (_conf && _conf.status !== 'superseded' && Array.isArray(_conf.log) && _conf.log.length) {
+      const _msgs = confLogToMessages(_conf);
+      try { chatData[id] = { messages: _msgs, updated_at: Date.now(), conf: true }; saveChatData(); } catch (_) {}
+      return res.json({ messages: _msgs });
+    }
+  } catch (e) { /* fall through to the normal record on any error */ }
   const data = chatData[id];
   const fromTranscript = transcriptToMessages(id);
   if (data && Array.isArray(data.messages) && data.messages.length) {
@@ -782,7 +881,20 @@ app.post('/history/:sessionId', (req, res) => {
     if (prevLen > msgs.length) {
       return res.json({ ok: true, kept: prevLen, ignored: msgs.length, note: 'shrink-ignored' });
     }
-    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now() };
+    // [CONF_CONTAINED_V1] A self-contained conference room is server-authoritative and
+    // APPEND-ONLY from the client: the stored canonical messages must be an exact prefix
+    // of the payload, else reject (409) so a stale/reformatted client cannot flatten or
+    // overwrite the conference record (the shrink guard above already blocks truncation).
+    if (existing && existing.conf && Array.isArray(existing.messages) && existing.messages.length) {
+      const _canon = existing.messages;
+      let _isPrefix = msgs.length >= _canon.length;
+      if (_isPrefix) for (let _i = 0; _i < _canon.length; _i++) {
+        const _a = _canon[_i] || {}, _b = msgs[_i] || {};
+        if ((_a.type || '') !== (_b.type || '') || String(_a.text || '') !== String(_b.text || '')) { _isPrefix = false; break; }
+      }
+      if (!_isPrefix) return res.status(409).json({ ok: false, error: 'conf-canonical-conflict', note: 'conference record is append-only' });
+    }
+    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now(), conf: (existing && existing.conf) ? true : undefined };   // [CONF_CONTAINED_V1] preserve self-contained marker
     saveChatData();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1331,6 +1443,27 @@ app.post('/accounts/switch', (req, res) => {
     if (err) return res.status(500).json({ ok: false, error: out || err.message });
     try { fs.writeFileSync(ENGINE_FILE, 'claude'); } catch {}
     try { broadcastGlobalEngineChange(); } catch {}
+    // [CONF_ACCT_SWITCH_V1] The Claude account is global, but a live session pins the
+    // account it was first spawned under (S.credentialClaudeAccount, set-once) and a
+    // persistent/kept-alive worker (esp. a conference, which is never idle-evicted) keeps
+    // its original CLAUDE_CONFIG_DIR for its whole life. Propagate the switch into every
+    // live session so each adopts the new account on its NEXT turn: clear the set-once
+    // pin, and retire the Claude worker at a safe boundary. An idle Claude worker is
+    // dropped now (direct kill, NOT killCurrentProc, which would pause a conference); a
+    // busy worker is flagged to retire when it next goes idle. Sessions with no worker or
+    // a non-Claude worker only need the pin cleared. A fresh spawn re-reads the active
+    // account, so transcripts resume seamlessly (shared projects symlink).
+    try {
+      for (const S of clientSessions.values()) {
+        S.credentialClaudeAccount = null;
+        if (S.currentProc && S.procEngine === 'claude') {
+          if (!S.processing) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false; }
+          else { S.pendingCredentialRefresh = true; }
+        } else {
+          S.pendingCredentialRefresh = false;
+        }
+      }
+    } catch (e) { console.log('[Bridge] [CONF_ACCT_SWITCH_V1] account-switch propagation failed:', e.message); }
     res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'claude', ...listAccounts() });
   });
 });
@@ -2422,13 +2555,112 @@ function restoreRoom(S) {
 // orchestration state; the browser only renders events. Consensus design agreed
 // jointly by Claude and Codex (see design discussion 2026-09-05).
 const CONF_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-conference');
-const CONF_MAX_ROUNDS_DEFAULT = 4;
-const CONF_HARD_ROUND_CAP = 8;
+const CONF_MAX_ROUNDS_DEFAULT = 16;   // [CONFERENCE_CAP16] was 4
+const CONF_HARD_ROUND_CAP = 16;   // [CONFERENCE_CAP16] was 8
 function confFile(key) { return path.join(CONF_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
 function confLoad(key) { try { return JSON.parse(fs.readFileSync(confFile(key), 'utf8')); } catch { return null; } }
 function confSave(S) { if (!S || !S.conf) return; try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.writeFileSync(confFile(S.key), JSON.stringify(S.conf)); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confSave failed:', e.message); } }
+// [CONF_CONTAINED_V1] Mirror a conference's user-visible content (brief + both-engine log)
+// into the room's OWN store so the room is self-contained and survives deletion of the
+// operational side-file. The server is the sole writer of a conference record.
+function confMirrorToChat(key, c) {
+  try {
+    if (!key || !c || !Array.isArray(c.log) || c.status === 'superseded') return;
+    const messages = confLogToMessages(c);
+    if (!messages.length) return;
+    chatData[key] = { messages, updated_at: Date.now(), conf: true };
+    saveChatData();
+  } catch (e) { console.log('[Bridge] [CONF_CONTAINED_V1] mirror failed:', e.message); }
+}
 function confClearFile(key) { try { fs.unlinkSync(confFile(key)); } catch {} }
 function confExistsRunning(key) { const c = confLoad(key); return !!(c && c.status === 'running'); }
+// [CONF_ACTIVATION_V1] Checkpoint the verification intent onto the conference record and
+// self-restart. On respawn the boot resume detects this and re-opens verification. This
+// is the whole "external restarter" — the supervisor (ccbmon) IS the external actor; the
+// bridge merely exits, exactly as the memory-recycle guard already does.
+function confRequestActivation(S, opts) {
+  const c = S.conf; if (!c) throw new Error('no conference on session');
+  opts = opts || {};
+  const gen = ((c.activation && c.activation.resumeGeneration) || 0) + 1;
+  c.activation = {
+    state: 'requested',
+    expectBuildId: opts.expectBuildId || CONF_BUILD_ID,
+    oldPid: process.pid,
+    requestedAt: Date.now(),
+    resumeGeneration: gen,
+    resumeDone: (c.activation && c.activation.resumeDone) || 0,
+    stageAtRequest: c.stage,
+  };
+  // Visible, ordered breadcrumb in the authoritative log.
+  c.log = c.log || [];
+  c.log.push({ turnId: 'activation-req-' + Date.now().toString(36), engine: c.leadEngine, role: 'system',
+               stage: c.stage, subphase: c.subphase, round: c.round,
+               text: '⏻ Activation requested — restarting host to load build `' + c.activation.expectBuildId +
+                     '`. Verification will auto-resume against the live code on respawn.',
+               verdict: null, verdictStage: null, ts: Date.now() });
+  // Pause so nothing dispatches during the exit window; boot resume re-opens it.
+  c.status = 'paused'; c.pausedReason = 'awaiting activation restart'; c.activeTurnId = null;
+  try { confSave(S); } catch (e) { console.log('[Bridge] [CONF_ACTIVATION_V1] checkpoint save failed:', e.message); }
+  try { confMirrorToChat(S.key, c); } catch {}
+  console.log('[Bridge] [CONF_ACTIVATION_V1] activation requested for', S.key, '-> restarting (pid', process.pid + ')');
+  // Kill every child proc so none is orphaned, then exit for the supervisor relaunch.
+  try { for (const s of clientSessions.values()) { try { s.currentProc && s.currentProc.kill('SIGKILL'); } catch {} } } catch {}
+  setTimeout(() => process.exit(0), 250);
+}
+
+// [CONF_ACTIVATION_V1] Boot resume: called once, after the server is listening. Scans every
+// conference with a pending activation; if the host is genuinely new (pid changed) and this
+// build matches what the conference asked for, idempotently re-opens verification so the
+// engines produce the real verdict. resumeDone===resumeGeneration guarantees exactly-once
+// (single-threaded boot; no lock needed). Reaching 'restarted' proves ACTIVATION only — it
+// never fabricates the conference's verification verdict.
+function confResumeActivations() {
+  let files = [];
+  try { files = fs.existsSync(CONF_DIR) ? fs.readdirSync(CONF_DIR).filter(f => f.endsWith('.json')) : []; } catch { return; }
+  for (const f of files) {
+    let c;
+    try { c = JSON.parse(fs.readFileSync(path.join(CONF_DIR, f), 'utf8')); } catch { continue; }
+    const a = c && c.activation;
+    if (!a || a.state !== 'requested') continue;
+    if (a.resumeDone && a.resumeDone === a.resumeGeneration) continue;   // idempotent: already done
+    // Liveness gate (Codex's point: prove by new PID + behaviour, never mtime).
+    const pidChanged = process.pid !== a.oldPid;
+    const buildOk = CONF_BUILD_ID === a.expectBuildId;
+    if (!pidChanged || !buildOk) {
+      console.log('[Bridge] [CONF_ACTIVATION_V1] liveness NOT satisfied for', f,
+                  '(pidChanged=' + pidChanged + ', buildOk=' + buildOk + ') — leaving pending');
+      continue;
+    }
+    const key = f.replace(/.json$/, '');
+    try {
+      let S = clientSessions.get(key);
+      if (!S) { S = makeSession(key); restoreRoom(S); clientSessions.set(key, S); }
+      S.conf = c;
+      a.state = 'restarted';
+      a.newPid = process.pid;
+      a.restartedAt = Date.now();
+      a.resumeDone = a.resumeGeneration;   // exactly-once marker
+      c.log = c.log || [];
+      c.log.push({ turnId: 'activation-live-' + Date.now().toString(36), engine: c.leadEngine, role: 'system',
+                   stage: c.stage, subphase: c.subphase, round: c.round,
+                   text: '✅ Host restarted (pid ' + a.oldPid + '→' + process.pid + '); build `' + CONF_BUILD_ID +
+                         '` is live. Re-opening verification — the engines will now record the verdict against the live code.',
+                   verdict: null, verdictStage: null, ts: Date.now() });
+      // Re-open verification: fresh turn (drop any truncated activeTurnId), back to running.
+      c.status = 'running'; c.pausedReason = null; c.activeTurnId = null; c._afterTurn = null;
+      S._confRecovered = true;   // we drive the dispatch ourselves; don't double-fire on attach
+      confSave(S);
+      confMirrorToChat(S.key, c);
+      console.log('[Bridge] [CONF_ACTIVATION_V1] verification re-opened for', key, '— dispatching');
+      // Autonomous, no-client resume. If dispatch throws, disk stays status=running so the
+      // on-attach confRecover path resumes it when the room is next opened (belt-and-braces).
+      try { confDispatch(S); }
+      catch (e) { S._confRecovered = false; console.log('[Bridge] [CONF_ACTIVATION_V1] autonomous dispatch failed (will resume on attach):', e.message); }
+    } catch (e) {
+      console.log('[Bridge] [CONF_ACTIVATION_V1] resume failed for', key, '-', e.message);
+    }
+  }
+}
 function confActive(S) { return !!(S && S.conf && S.conf.status === 'running'); }
 
 function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7); }
@@ -2436,7 +2668,7 @@ function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.
 function confSendStatus(S) {
   if (!S || !S.conf) return;
   const c = S.conf;
-  S.send({ type: 'conf_status', status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
+  S.send({ type: 'conf_status', task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
            round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
            leadEngine: c.leadEngine, reviewEngine: c.reviewEngine, nextEngine: c.nextEngine, reason: c.pausedReason || null });
 }
@@ -2448,6 +2680,25 @@ const CONF_STAGES = ['diagnosis', 'solution_design', 'implementation', 'verifica
 function confStageLabel(st) {
   return ({ diagnosis: 'Diagnosis', solution_design: 'Solution design', implementation: 'Implementation',
             verification: 'Verification', final: 'Final synthesis' })[st] || String(st || '');
+}
+// [CONFERENCE_HISTORY_V1] The authoritative, ordered, both-engine record for a
+// conference room. Each log entry (including a role:'conclusion' entry) maps to one
+// assistant bubble carrying divider metadata (engine/role/stage/round/turnId) so the
+// client renders a stable, chronological transcript instead of the divergent raw
+// stream. This is the single source of truth for GET /history of a conference room.
+function confLogToMessages(c) {
+  const out = [];
+  // [CONF_BRIEF_V1] Lead with the user's original brief as a user bubble so the
+  // reopened / synced conference view shows the original message. The brief lives in
+  // c.brief (never in c.log); test emptiness on a trimmed copy but render it verbatim.
+  const _brief = (c && typeof c.brief === 'string') ? c.brief : '';
+  if (_brief.trim()) out.push({ type: 'user', text: _brief });
+  for (const e of ((c && c.log) || [])) {
+    out.push({ type: 'assistant', engine: e.engine || null, role: e.role || null,
+               stage: e.stage || null, stageLabel: confStageLabel(e.stage), round: e.round || null,
+               turnId: e.turnId || null, text: e.text || '' });
+  }
+  return out;
 }
 // [CONFERENCE_V2 FSMFIX] An engine turn that is actually a usage/rate-limit or transient
 // error banner (not real work). Used to stop an errored/limited implementation turn from
@@ -2573,7 +2824,8 @@ function _confConsumeInterjections(S) {
 }
 
 // Dispatch the next (or, on recovery, the same) conference turn.
-function confDispatch(S, reuseTurnId) {
+function confDispatch(S, reuseTurnId, opts) {
+  opts = opts || {};
   const c = S.conf;
   if (!c || c.status !== 'running') return;
   const engine = c.nextEngine;
@@ -2582,9 +2834,9 @@ function confDispatch(S, reuseTurnId) {
   // spawned under a different mode; spawnProc re-reads the stage and applies flags.
   if (engine === 'claude') {
     const need = confRestrictionMode(c);
-    if (S.currentProc && S.procEngine === 'claude' && !S.processing && S._spawnedConfMode !== need) {
+    if (S.currentProc && S.procEngine === 'claude' && !S.processing && (S._spawnedConfMode !== need || S.pendingCredentialRefresh)) {
       try { S.currentProc.kill('SIGKILL'); } catch {}
-      S.currentProc = null; S.procEngine = null;
+      S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false;   // [CONF_ACCT_SWITCH_V1] retire the idle worker so this turn respawns under the new account
     }
   }
   const turnId = reuseTurnId || _confNewTurnId();
@@ -2592,7 +2844,7 @@ function confDispatch(S, reuseTurnId) {
   S._confTurnId = turnId;
   c._acc = ''; c._accParts = '';
   const prompt = confBuildPrompt(S, engine);
-  _confConsumeInterjections(S);
+  if (!opts.isRetry) _confConsumeInterjections(S);
   confClearDenials(S.key);   // fresh denial window for this turn
   confSave(S);
   S.send({ type: 'conf_turn', engine, role: (engine === c.leadEngine ? 'lead' : 'reviewer'),
@@ -2601,6 +2853,135 @@ function confDispatch(S, reuseTurnId) {
   confSendStatus(S);
   try { S.sendToEngine(engine, prompt); }
   catch (e) { console.log('[Bridge] [CONFERENCE_V2] dispatch failed:', e.message); c.status = 'paused'; c.pausedReason = 'dispatch-error'; confSave(S); confSendStatus(S); }
+}
+
+// ── [CONF_CRED_RETRY_V1] Credential-issuance failure handling ────────────────
+// Deterministic classification of a steward issuance failure. Reads exit status /
+// STEWARD_ERR token / node exec error INTERNALLY only — never surfaced to the user.
+function classifyIssueError(e) {
+  const status = e && typeof e.status === 'number' ? e.status : null;
+  const stderr = String((e && e.stderr) || '');
+  const m = stderr.match(/STEWARD_ERR\s+([a-z_]+)/);
+  const kind = m ? m[1] : '';
+  if (status === 75) return 'transient';                                   // flock -E 75: lock not acquired
+  if (e && e.code === 'ETIMEDOUT') return 'transient';                     // 45s exec timeout (authoritative on Node 20: code=ETIMEDOUT, signal=SIGTERM). A bare SIGTERM WITHOUT ETIMEDOUT (maxBuffer/resource kill/cancel) is NOT inferred transient — falls through to unknown (fail-safe pause).
+  if (kind === 'reauth') return 'reauth';
+  if (kind === 'refresh_transient' || kind === 'lock' || kind === 'timeout') return 'transient';
+  return 'unknown';                                                        // never inferred transient
+}
+// Safe, allowlisted user-facing text. NEVER interpolate raw stderr/exception/paths.
+function confCredMessage(cat, ctx) {
+  ctx = ctx || {}; const eng = ctx.engineLabel || 'Claude';
+  if (cat === 'reauth') return 'The ' + eng + ' account for this room needs re-authentication. Re-authenticate, then Resume.';
+  if (cat === 'retry') return 'Temporarily could not obtain ' + eng + ' credentials — retrying (attempt ' + ctx.attempt + ' of ' + (CONF_CRED_MAX_ATTEMPTS - 1) + ')…';
+  if (cat === 'exhausted') return 'Could not obtain ' + eng + ' credentials after ' + CONF_CRED_MAX_ATTEMPTS + ' attempts. Resume to try again.';
+  if (cat === 'runtime') return 'The ' + eng + ' engine exited before completing its turn. Resume to retry.';
+  return eng + ' credential setup failed. Resume to try again.';
+}
+// Write/increment the durable credential-attempt lease BEFORE an issuance attempt.
+// Only for a live conference turn on a fresh credential-backed spawn.
+function confLeaseBeginAttempt(S, engine) {
+  const c = S && S.conf;
+  if (!c || c.status !== 'running' || !c.activeTurnId) return;
+  const attempt = (c.spawnRetries || 0) + 1;
+  c.spawnRetries = attempt;
+  c.pendingRetry = { turnId: c.activeTurnId, engine: engine, attempt: attempt, state: 'dispatching',
+                     owner: { pid: process.pid, gen: c.retryGen || 0 }, leaseExpiresAt: Date.now() + CONF_CRED_LEASE_MS };
+  try { confSave(S); } catch (e) {}
+}
+// Commit: a credential-backed process actually started — clear the lease.
+function confLeaseCommit(S, turnId) {
+  const c = S && S.conf;
+  if (!c || !c.pendingRetry || !turnId) return;
+  if (c.pendingRetry.state === 'dispatching' && c.pendingRetry.turnId === turnId) {
+    c.pendingRetry = null;
+    try { confSave(S); } catch (e) {}
+  }
+}
+// A conference turn's fresh credential-backed spawn failed before/at issuance.
+// Decide retry vs pause; emit exactly ONE allowlisted message; never strand the FSM.
+function confSpawnFailed(S, err) {
+  const c = S && S.conf;
+  if (!c || c.status !== 'running' || !c.activeTurnId) return;
+  err = err || {};
+  const engineLabel = err.engine === 'codex' ? 'Codex' : 'Claude';
+  const cat = err.cat || 'unknown';
+  const attempt = c.spawnRetries || 1;   // already incremented by confLeaseBeginAttempt
+  c.retryGen = (c.retryGen || 0) + 1;     // invalidate any stale retry timers
+  if (cat === 'transient' && attempt < CONF_CRED_MAX_ATTEMPTS) {
+    const backoff = _confJitter(CONF_CRED_BACKOFF_MS[Math.min(attempt - 1, CONF_CRED_BACKOFF_MS.length - 1)]);
+    c.status = 'paused';
+    c.pausedReason = confCredMessage('retry', { engineLabel: engineLabel, attempt: attempt });
+    c.pendingRetry = { turnId: c.activeTurnId, engine: err.engine || 'claude', attempt: attempt, state: 'scheduled',
+                       nextRetryAt: Date.now() + backoff, owner: null };
+    const myGen = c.retryGen, myTurn = c.activeTurnId;
+    try { confSave(S); } catch (e) {}
+    confSendStatus(S);
+    S.send({ type: 'status', text: c.pausedReason });
+    S.send({ type: 'done', code: 0 });
+    setTimeout(function () { try { confRetryFire(S, myTurn, myGen); } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] retry fire failed:', e.message); } }, backoff);
+    return;
+  }
+  const finalCat = (cat === 'reauth') ? 'reauth' : (cat === 'transient' ? 'exhausted' : (cat === 'runtime' ? 'runtime' : 'unknown'));
+  c.status = 'paused';
+  c.pausedReason = confCredMessage(finalCat, { engineLabel: engineLabel });
+  c.pendingRetry = null;   // keep activeTurnId so a manual Resume redispatches this turn
+  try { confSave(S); } catch (e) {}
+  confPushConclusion(S, c.pausedReason);
+  confSendStatus(S);
+  S.send({ type: 'done', code: 0 });
+}
+// Fire a scheduled retry (from timer or boot reconciler). CAS-claims the lease so a
+// timer and a reconciler can never both dispatch the same turn.
+function confRetryFire(S, turnId, gen) {
+  const c = S && S.conf; if (!c) return;
+  const pr = c.pendingRetry;
+  if (!pr || pr.state !== 'scheduled' || pr.turnId !== turnId) return;
+  if (typeof gen === 'number' && (c.retryGen || 0) !== gen) return;   // stale timer
+  if (Date.now() < (pr.nextRetryAt || 0)) return;
+  if (S.currentProc || S.processing) return;
+  const claimId = process.pid + ':' + (c.retryGen || 0) + ':' + turnId + ':' + Date.now();
+  pr.state = 'claiming'; pr.owner = { pid: process.pid, gen: c.retryGen || 0, claimId: claimId }; pr.leaseExpiresAt = Date.now() + CONF_CRED_LEASE_MS;
+  try { confSave(S); } catch (e) {}
+  const disk = confLoad(S.key);   // authoritative re-read
+  if (!disk || !disk.pendingRetry || disk.pendingRetry.state !== 'claiming' || !disk.pendingRetry.owner || disk.pendingRetry.owner.claimId !== claimId) return;
+  c.status = 'running'; c.pausedReason = null;
+  try { confSave(S); } catch (e) {}
+  confSendStatus(S);
+  confDispatch(S, turnId, { isRetry: true });   // fresh spawn re-writes the dispatching lease
+}
+// Reclaim one conference's pending retry lease (boot + on-attach), restart-safe.
+function confReclaimRetry(S) {
+  const c = S && S.conf; if (!c || !c.pendingRetry) return;
+  if (S.currentProc || S.processing) return;
+  const pr = c.pendingRetry;
+  if (pr.state === 'scheduled') {
+    const delay = Math.max(0, (pr.nextRetryAt || 0) - Date.now());
+    c.retryGen = (c.retryGen || 0) + 1; const myGen = c.retryGen, myTurn = pr.turnId;
+    try { confSave(S); } catch (e) {}
+    setTimeout(function () { try { confRetryFire(S, myTurn, myGen); } catch (e) {} }, delay);
+  } else if (pr.state === 'dispatching' || pr.state === 'claiming') {
+    if ((pr.leaseExpiresAt || 0) > Date.now() && pr.owner && pr.owner.pid === process.pid) return;   // our own live attempt
+    c.spawnRetries = pr.attempt || c.spawnRetries || 1;   // attempt was persisted pre-issuance
+    if (c.status !== 'running') { c.status = 'running'; }
+    confSpawnFailed(S, { engine: pr.engine || 'claude', cat: 'transient' });
+  }
+}
+// [CONF_CRED_RETRY_V1] Boot reclamation sweep for pending credential-retry leases.
+function confResumeRetries() {
+  let files = [];
+  try { files = fs.existsSync(CONF_DIR) ? fs.readdirSync(CONF_DIR).filter(function (f) { return f.endsWith('.json'); }) : []; } catch (e) { return; }
+  for (const f of files) {
+    let c; try { c = JSON.parse(fs.readFileSync(path.join(CONF_DIR, f), 'utf8')); } catch (e) { continue; }
+    if (!c || c.status === 'superseded' || !c.pendingRetry) continue;
+    const key = f.replace(/\.json$/, '');
+    try {
+      let S = clientSessions.get(key);
+      if (!S) { S = makeSession(key); S.conf = c; restoreRoom(S); clientSessions.set(key, S); }
+      else if (!S.conf) S.conf = c;
+      confReclaimRetry(S);
+    } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] resume-retry failed for', key, '-', e.message); }
+  }
 }
 
 function confStart(S, brief, opts) {
@@ -2616,16 +2997,72 @@ function confStart(S, brief, opts) {
     stage: 'diagnosis', subphase: 'lead', round: 1, maxRounds,
     leadEngine: lead, reviewEngine: review, nextEngine: lead,
     brief: String(brief || '').slice(0, 20000),
+    task: (opts.task || null), startReqId: (typeof opts.reqId === 'string' ? opts.reqId : null),
     activeTurnId: null, log: [], stageVerdicts: {}, lastByEngine: {}, pendingInterject: [],
+    spawnRetries: 0, pendingRetry: null, retryGen: 0,   // [CONF_CRED_RETRY_V1]
     createdAt: Date.now(),
   };
   S._confRecovered = true;
   confClearDenials(S.key);
   confSave(S);
+  confMirrorToChat(S.key, S.conf);   // [CONF_CONTAINED_V1]
   console.log('[Bridge] [CONFERENCE_V2] start room', S.key, 'lead=' + lead, 'rounds=' + maxRounds);
-  S.send({ type: 'conf_started', leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief,
+  S.send({ type: 'conf_started', reqId: S.conf.startReqId || null, task: S.conf.task || null, leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief,
            stage: 'diagnosis', stageLabel: confStageLabel('diagnosis') });
   confDispatch(S);
+}
+
+function confValidReqId(r) { return typeof r === 'string' && /^[a-zA-Z0-9_-]{8,64}$/.test(r); }
+
+// [CONF_TASK_ASSOC_V1] Canonicalize a task decision server-side. Never trusts client
+// title/metadata: for a linked task it re-reads the task file and returns the
+// server's own {id,file,title}. Returns {status:'none'|'linked'|'invalid'}.
+function confCanonicalTask(decision, task) {
+  if (decision === 'none') return { status: 'none', task: null };
+  if (decision === 'linked') {
+    const file = (task && typeof task.file === 'string') ? task.file : '';
+    if (!/^task-[a-z0-9-]+\.md$/.test(file)) return { status: 'invalid' };
+    try {
+      const full = path.join(TASKS_DIR, file);
+      if (!fs.existsSync(full)) return { status: 'invalid' };
+      const t = parseTaskFile(full);
+      if (!t) return { status: 'invalid' };
+      return { status: 'linked', task: { id: String(t.id || '').slice(0, 16), file: file, title: String(t.title || '').slice(0, 200) } };
+    } catch { return { status: 'invalid' }; }
+  }
+  return { status: 'invalid' };
+}
+
+// [CONF_TASK_ASSOC_V1] Single entry for a conference chat/conf_start message.
+// Order is critical: (1) idempotent replay of an already-accepted start BEFORE the
+// interjection fork, so a retried first message never becomes a double interjection;
+// (2) active conference -> interjection (unchanged); (3) fresh start requires a valid
+// reqId AND a valid taskDecision, else fail closed with conf_need_task.
+function confTryStart(S, brief, msg) {
+  const c = S.conf;
+  const reqId = msg && msg.reqId;
+  if (c && c.startReqId && confValidReqId(reqId) && reqId === c.startReqId) {
+    confSendStatus(S);
+    if (Array.isArray(c.log) && c.log.length) {
+      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c),
+               status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
+               round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
+               leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
+    } else {
+      S.send({ type: 'conf_started', reqId: c.startReqId || null, task: c.task || null, leadEngine: c.leadEngine,
+               reviewEngine: c.reviewEngine, maxRounds: c.maxRounds, brief: c.brief,
+               stage: c.stage, stageLabel: confStageLabel(c.stage) });
+    }
+    return;
+  }
+  if (c && (c.status === 'running' || c.status === 'paused')) {
+    confInterject(S, brief); if (c.status === 'paused') confResume(S);
+    return;
+  }
+  if (!confValidReqId(reqId)) { S.send({ type: 'conf_need_task', reason: 'reqid', reqId: (typeof reqId === 'string' ? reqId : null) }); return; }
+  const dec = confCanonicalTask(msg && msg.taskDecision, msg && msg.task);
+  if (dec.status === 'invalid') { S.send({ type: 'conf_need_task', reason: 'task', reqId: reqId }); return; }
+  confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId });
 }
 
 function confInterject(S, text) {
@@ -2639,11 +3076,40 @@ function confInterject(S, text) {
 
 function confPause(S) {
   const c = S.conf; if (!c || (c.status !== 'running')) return;
+  c.retryGen = (c.retryGen || 0) + 1;   // [CONF_CRED_RETRY_V1] kill any pending retry timer
   if (c.activeTurnId) { c._afterTurn = 'pause'; confSave(S); S.send({ type: 'status', text: 'Pausing after the current turn finishes…' }); }
   else { c.status = 'paused'; confSave(S); confSendStatus(S); }
 }
 function confResume(S) {
   const c = S.conf; if (!c || c.status !== 'paused') return;
+  // [CONF_CRED_RETRY_V1] A deliberate resume grants a fresh credential-attempt budget and
+  // re-dispatches the SAME stranded turn (never mints a new one / double-consumes interjections).
+  if (c.activeTurnId && (c.pendingRetry || (c.spawnRetries || 0) > 0)) {
+    c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;
+    c.status = 'running'; c.pausedReason = null; c._afterTurn = null;
+    if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') { c.log.pop(); c.concluded = false; }
+    confSave(S); confMirrorToChat(S.key, c); confSendStatus(S);
+    confDispatch(S, c.activeTurnId, { isRetry: true });
+    return;
+  }
+  // [CONFERENCE_CONCLUDE_V1] Resuming retracts any interim auto-conclusion appended at
+  // the pause, so a continued conference doesn't leave a stale summary mid-transcript.
+  // A fresh conclusion is produced at the next terminal state (c.concluded reset).
+  if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') {
+    c.log.pop();
+    c.concluded = false;
+    c.status = 'running'; c.pausedReason = null; c._afterTurn = null; confSave(S);
+    confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
+    // Repaint the authoritative log so the retracted conclusion disappears everywhere.
+    if (Array.isArray(c.log) && c.log.length) {
+      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
+               subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
+               leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
+    }
+    confSendStatus(S);
+    confDispatch(S);
+    return;
+  }
   c.status = 'running'; c.pausedReason = null; c._afterTurn = null; confSave(S);
   confSendStatus(S);
   confDispatch(S);
@@ -2651,7 +3117,7 @@ function confResume(S) {
 function confStop(S) {
   const c = S.conf; if (!c) return;
   if (c.status === 'running' && c.activeTurnId) { c._afterTurn = 'stop'; confSave(S); S.send({ type: 'status', text: 'Stopping after the current turn finishes…' }); return; }
-  c.status = 'stopped'; c.activeTurnId = null; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 });
+  c.status = 'stopped'; c.activeTurnId = null; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 });
 }
 
 // A disallowed mutation was blocked by the shim during a discussion turn: pause the
@@ -2661,17 +3127,60 @@ function confPolicyPause(S, detail) {
   c.status = 'paused';
   c.pausedReason = 'Policy: a disallowed action was blocked during ' + confStageLabel(c.stage) +
     (detail ? ' (' + detail + ')' : '') + '. The conference was paused for your review.';
-  c.activeTurnId = null; S._confTurnId = null;
-  confSave(S); confSendStatus(S);
+  c.activeTurnId = null; S._confTurnId = null; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;
+  confSave(S); confPushConclusion(S, c.pausedReason); confSendStatus(S);
   S.send({ type: 'conf_policy', stage: c.stage, detail: detail || null, reason: c.pausedReason });
   S.send({ type: 'done', code: 0 });
+}
+
+// [CONFERENCE_CONCLUDE_V1] Deterministic, engine-free closing summary. Used ONLY on
+// terminal paths that lack a usable final-stage synthesis (paused / stopped / blocked /
+// policy-pause / empty-or-junk final), so the chat always ends with a visible outcome
+// even when the engines never converged (e.g. the reviewer could not run verification).
+function confComposeConclusion(c, reason) {
+  const stagesSeen = [];
+  for (const e of ((c && c.log) || [])) { const st = e.stage; if (st && e.role !== 'conclusion' && !stagesSeen.includes(st)) stagesSeen.push(st); }
+  const parts = [];
+  parts.push('## 🏁 Conference concluded (automatic summary)');
+  parts.push(reason || c.pausedReason || 'The conference ended before a verified final synthesis.');
+  if (stagesSeen.length) parts.push('**Progress:** ' + stagesSeen.map(confStageLabel).join(' → ') + ' · reached **' + confStageLabel(c.stage) + '**.');
+  parts.push('_No verified Final synthesis was produced, so this is a deterministic summary. The full turn-by-turn discussion is above; resume the conference to continue, adjust the brief, or stop._');
+  return parts.join('\n\n');
+}
+// Push the summary into the authoritative log EXACTLY ONCE (guarded by c.concluded),
+// persist it, and broadcast it as a normal conference message so it renders in order.
+function confPushConclusion(S, reason) {
+  const c = S.conf;
+  if (!c || c.concluded) return;
+  c.concluded = true;
+  c.log = c.log || [];
+  const text = confComposeConclusion(c, reason);
+  const turnId = 'conclusion-' + Date.now().toString(36);
+  c.log.push({ turnId, engine: c.leadEngine, role: 'conclusion', stage: c.stage, subphase: c.subphase,
+               round: c.round, text, verdict: null, verdictStage: null, ts: Date.now() });
+  confSave(S);
+  S.send({ type: 'conf_msg', turnId, engine: c.leadEngine, role: 'conclusion', stage: c.stage,
+           stageLabel: confStageLabel(c.stage), subphase: c.subphase, round: c.round, text,
+           verdict: null, remainingIssues: [] });
 }
 
 function confComplete(S, finalStatus) {
   const c = S.conf;
   c.status = finalStatus || 'done'; c.finishedAt = Date.now(); c.activeTurnId = null;
+  // [CONFERENCE_CONCLUDE_V1] A GOOD final-stage turn IS the conclusion (no mechanical
+  // recap that would duplicate/dilute it). Only fall back to the deterministic summary
+  // when there is no usable final response (stopped early, or final produced empty/junk).
+  if (c.stage === 'final' && c.status === 'done') {
+    const lastFinal = ((c.log || []).slice().reverse()).find(e => e.stage === 'final' && e.role !== 'conclusion');
+    const good = lastFinal && String(lastFinal.text || '').trim().length > 0 && !_CONF_JUNK_RE.test(lastFinal.text || '');
+    if (good) c.concluded = true;
+    else confPushConclusion(S, 'The final synthesis did not produce usable output; summarising automatically.');
+  } else {
+    confPushConclusion(S, c.pausedReason || 'The conference was stopped before a verified final synthesis.');
+  }
   confClearDenials(S.key);
   confSave(S);
+  confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   confSendStatus(S);
   S.send({ type: 'done', code: 0 });
   console.log('[Bridge] [CONFERENCE_V2] conference', c.status, 'room', S.key, 'stage', c.stage);
@@ -2685,11 +3194,11 @@ function confAdvance(S, engine, verdict, meta) {
   if (verdict === 'blocked') {
     c.status = 'paused'; c.activeTurnId = null;
     c.pausedReason = 'An engine reported it is blocked during ' + confStageLabel(c.stage) + ' and needs your input.';
-    confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 });
+    confSave(S); confPushConclusion(S, c.pausedReason); confSendStatus(S); S.send({ type: 'done', code: 0 });
     return true;
   }
-  const enterStage = (next) => { c.stage = next; c.round = 1; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; };
-  const pauseNoConsensus = (why) => { c.status = 'paused'; c.pausedReason = why; c.activeTurnId = null; confSave(S); confSendStatus(S); S.send({ type: 'done', code: 0 }); };
+  const enterStage = (next) => { c.stage = next; c.round = 1; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1; };
+  const pauseNoConsensus = (why) => { c.status = 'paused'; c.pausedReason = why; c.activeTurnId = null; confSave(S); confPushConclusion(S, why); confSendStatus(S); S.send({ type: 'done', code: 0 }); };
   // [CONFERENCE_V2 FSMFIX] Absolute safety valve: past the hard round cap the conference
   // STOPS (terminal) rather than pausing — a paused/resumed loop must never be unbounded.
   const hardCapStop = () => { c.stage = 'implementation'; c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; return confComplete(S, 'stopped'); };
@@ -2777,7 +3286,9 @@ function confFinishTurn(S, engine) {
   c.lastByEngine = c.lastByEngine || {}; c.lastByEngine[engine] = parsed.visible;
   c.stageVerdicts = c.stageVerdicts || {}; c.stageVerdicts[engine] = parsed.verdict.verdict;
   c.activeTurnId = null; S._confTurnId = null; c._acc = ''; c._accParts = '';
+  c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;   // [CONF_CRED_RETRY_V1]
   confSave(S);   // persist response + cleared active turn BEFORE advancing
+  confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   S.send({ type: 'conf_msg', turnId, engine, role, stage: c.stage, stageLabel: confStageLabel(c.stage),
            subphase: c.subphase, round: c.round, text: parsed.visible, verdict: parsed.verdict.verdict, remainingIssues: parsed.verdict.remainingIssues });
   // [CONFERENCE_V2] If the shim blocked a disallowed mutation during this turn, pause (fail-closed, visible).
@@ -2798,12 +3309,14 @@ function confRecover(S) {
   const c = S.conf;
   confSendStatus(S);
   if (Array.isArray(c.log) && c.log.length) {
-    S.send({ type: 'conf_sync', messages: c.log, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
+    S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
              subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
              leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
   }
+  confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   if (S._confRecovered) return;
   S._confRecovered = true;
+  if (c.pendingRetry) { try { confReclaimRetry(S); } catch (e) {} return; }   // [CONF_CRED_RETRY_V1]
   if (c.status !== 'running') return;
   if (S.processing) return;   // a live turn is already running in this process
   let journaled = false;
@@ -2882,6 +3395,9 @@ function makeSession(key) {
     lastEngine: null,       // [XENGINE_TRANSPLANT_V1] engine that last actually ran a turn in this room
     threadId: null,         // [CODEX_DURABLE_V2] Codex resume handle (persisted in bridge-rooms.json)
     conf: null,             // [CONFERENCE_V1] live conference orchestration state (mirrored to disk)
+    credentialClaudeAccount: null, credentialCodexAccount: null,
+    credentialRuntimeDir: null, credentialTimer: null,
+    pendingCredentialRefresh: false,   // [CONF_ACCT_SWITCH_V1] a live BUSY Claude worker awaits retirement so its next turn re-issues under the newly-selected account
   };
 
   S.engineState = (error = '') => { const _r = resolveRoomEngine(S); return { type: 'room_engine', roomId: S.key,
@@ -2911,11 +3427,22 @@ function makeSession(key) {
 
   S.killCurrentProc = (reason) => {
     S.clearWatch();
+    if (S.credentialTimer) { clearTimeout(S.credentialTimer); S.credentialTimer = null; }
     if (S.currentProc) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; }
     const wasProcessing = S.processing;
     S.processing = false; S.pendingTurns = 0; S.inFlight = []; S.codexQueue = [];   // [CODEX_DURABLE_V4] also clear the Codex queue on kill/cancel/watchdog
     clearPending(S.key);   // in-process end — UI is unblocked, so no blip-replay
-    if (S.conf && S.conf.status === 'running') { S.conf.status = 'paused'; S.conf.pausedReason = 'The active turn was interrupted (' + (reason || 'stopped') + '). Resume to continue.'; S.conf.activeTurnId = S.conf.activeTurnId || null; confSave(S); confSendStatus(S); }   // [CONFERENCE_V1] never silently advance on error
+    // [CONF_CRED_RETRY_V1] A kill while a credential-attempt lease is still OPEN (the process
+    // never reached its start event) is a FAILED in-flight attempt — route to retry/exhaust,
+    // NOT the generic administrative pause (which would strand a running active turn).
+    if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && S.conf.pendingRetry &&
+        S.conf.pendingRetry.state === 'dispatching' && S.conf.pendingRetry.turnId === S.conf.activeTurnId) {
+      const _eng = S.conf.pendingRetry.engine || 'claude';
+      try { confSpawnFailed(S, { engine: _eng, cat: 'transient' }); } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] kill->confSpawnFailed failed:', e.message); }
+      if (reason) console.log('[Bridge] Killed proc (in-flight cred attempt):', reason);
+      return;
+    }
+    if (S.conf && S.conf.status === 'running') { S.conf.status = 'paused'; S.conf.pausedReason = 'The active turn was interrupted (' + (reason || 'stopped') + '). Resume to continue.'; S.conf.activeTurnId = S.conf.activeTurnId || null; S.conf.pendingRetry = null; S.conf.retryGen = (S.conf.retryGen || 0) + 1; confSave(S); confSendStatus(S); }   // [CONFERENCE_V1] never silently advance on error
     if (wasProcessing) S.send({ type: 'done', code: -1 });
     if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   };
@@ -2939,6 +3466,7 @@ function makeSession(key) {
   // process and steer it. Spawned lazily; killed on reset / cancel / timeout /
   // grace-expiry.
   S.spawnProc = () => {
+    S.pendingCredentialRefresh = false;   // [CONF_ACCT_SWITCH_V1] a fresh spawn re-reads the active account, satisfying any pending retirement
     // Drop a stale session id before spawning so we never --resume a missing file.
     if (S.sessionId && !sessionFileExists(S.sessionId)) {
       console.log('[Bridge] Stale session (no transcript), starting fresh:', S.sessionId);
@@ -2987,6 +3515,28 @@ function makeSession(key) {
     // Ensure critical env vars are present for Claude to find settings.json and MCP servers
     if (!claudeEnv.HOME) claudeEnv.HOME = process.env.HOME || '/root';
     if (!claudeEnv.PATH) claudeEnv.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    if (CREDENTIAL_STEWARD_ENABLED) {
+      const _confTurn = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);   // [CONF_CRED_RETRY_V1]
+      if (_confTurn) confLeaseBeginAttempt(S, 'claude');   // durable pre-issuance attempt lease
+      try {
+        if (!S.credentialClaudeAccount) S.credentialClaudeAccount = stewardText(['active-claude']);
+        const safeRoom = S.key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
+        S.credentialRuntimeDir = path.join(CREDENTIAL_STATE_DIR, 'runtime', 'claude', S.credentialClaudeAccount, safeRoom);
+        const issued = JSON.parse(stewardText(['issue-claude', S.credentialClaudeAccount, S.credentialRuntimeDir]));
+        claudeEnv.CLAUDE_CONFIG_DIR = S.credentialRuntimeDir;
+        // Persistent Claude workers are retired before their access-only token expires;
+        // the next turn resumes the transcript with a newly issued generation.
+        const retireIn = Math.max(60000, Number(issued.expiresAt || 0) - Date.now() - 10 * 60000);
+        if (S.credentialTimer) clearTimeout(S.credentialTimer);
+        S.credentialTimer = setTimeout(() => S.killCurrentProc('credential generation retirement'), retireIn);
+      } catch (e) {
+        console.error('[Bridge] credential steward Claude issuance failed:', e.message);   // raw detail: LOG ONLY
+        const cat = classifyIssueError(e);
+        if (_confTurn) { confSpawnFailed(S, { engine: 'claude', cat: cat }); return { ok: false, err: { engine: 'claude', cat: cat } }; }
+        S.send({ type: 'error', text: confCredMessage(cat === 'reauth' ? 'reauth' : (cat === 'transient' ? 'exhausted' : 'unknown'), { engineLabel: 'Claude' }) });
+        return { ok: false, err: { engine: 'claude', cat: cat } };
+      }
+    }
     // Per-user self-service auth: if the user re-authenticated via the
     // settings menu, a long-lived OAuth token sits in ~/.claude/bridge-oauth-token.
     try {
@@ -3034,6 +3584,7 @@ function makeSession(key) {
 
         if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
           S.sessionId = ev.session_id;
+          confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null);   // [CONF_CRED_RETRY_V1] process started
           // Durable viewer alias: (re)assert shim mount->session on EVERY init, so a
           // promotion whose one-shot POST was lost to a shim flap (or the collision
           // path) still links the pane. Retries a transient shim-down. [ALIAS_REASSERT_V1]
@@ -3074,6 +3625,8 @@ function makeSession(key) {
                 confClearDenials(_oldKey);
               } catch (e) { console.log('[Bridge] [CONFERENCE_V2] conf migrate failed:', e.message); }
             }
+            // [CONF_CONTAINED_V1] Move the room's own content store onto the canonical key too.
+            try { if (chatData[_oldKey]) { chatData[ev.session_id] = chatData[_oldKey]; delete chatData[_oldKey]; saveChatData(); } } catch (_) {}
             // Move this room's browser stack onto the real key too, so later MCP/noVNC
             // lookups by S.key (and by the client's promoted room id) find the SAME
             // running stack instead of spawning a second one under the new key.
@@ -3095,9 +3648,12 @@ function makeSession(key) {
             for (const b of ev.message.content) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; }
           } else if (ev.type === 'result' && typeof ev.result === 'string' && ev.result) { S.conf._acc = ev.result; }
         }
-        S.send({ type: 'stream', data: ev });
+        // [CONFERENCE_HISTORY_V1] Tag conference stream chunks with the active turn id
+        // so the client can reconcile the live preview bubble by stable identity.
+        S.send({ type: 'stream', data: ev, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null });
 
         if (ev.type === 'result') {
+          proc._ok = true;   // [CONF_CRED_RETRY_V1] terminal success reached — close is a clean exit
           // One turn finished. More turns follow if the user queued messages.
           const ctx = updateCtxFromResult(ev);
           if (ctx != null) { S.ctxPct = ctx.pct; S.ctxTokens = ctx.tokens; }
@@ -3131,9 +3687,25 @@ function makeSession(key) {
     proc.on('close', code => {
       if (S.currentProc !== proc) return;
       S.clearWatch();
-      S.currentProc = null;
+      S.currentProc = null;   // detach before any routing
       const wasProcessing = S.processing;
       S.processing = false;
+
+      // [CONF_CRED_RETRY_V1] Pre-success exit during a live conference turn → shared FSM
+      // failure path; never strand running+activeTurnId with no proc, never advance on
+      // partial output. An open attempt lease ⇒ transient (credential/startup, retry);
+      // a committed process that then crashed ⇒ runtime (pause, resumable). Skipped for
+      // clean turns (proc._ok) and for all non-conference rooms.
+      if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && !proc._ok) {
+        // Claude credential issuance is fully SYNCHRONOUS in spawnProc; once a proc exists,
+        // issuance already succeeded. A spawned-then-exited-before-`result` Claude is therefore
+        // a runtime failure, never credential/transient — pause honestly (no futile retry).
+        S.pendingTurns = 0; S.inFlight = []; clearPending(S.key);
+        // confSpawnFailed is the sole messaging site (emits its own done/status).
+        try { confSpawnFailed(S, { engine: 'claude', cat: 'runtime' }); }
+        catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] claude conf-fail route failed:', e.message); }
+        return;
+      }
 
       // Self-heal a stale --resume (orphaned session id after an account swap):
       // drop the dead id, respawn fresh, and resend whatever was still in flight.
@@ -3157,11 +3729,20 @@ function makeSession(key) {
     proc.on('error', err => {
       if (S.currentProc !== proc) return;
       S.clearWatch();
-      S.currentProc = null;
+      S.currentProc = null;   // detach before routing
       S.processing = false; S.pendingTurns = 0; S.inFlight = [];
       console.error('[Bridge] spawn error:', err.message);
+      // [CONF_CRED_RETRY_V1] pre-success proc error on a live conference turn → FSM path.
+      if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && !proc._ok) {
+        // Synchronous issuance (see close handler): an async proc error is runtime, not credential.
+        clearPending(S.key);
+        try { confSpawnFailed(S, { engine: 'claude', cat: 'runtime' }); }
+        catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] claude err route failed:', e.message); }
+        return;
+      }
       S.send({ type: 'error', text: `Failed to start Claude: ${err.message}` });
     });
+    return { ok: true };   // [CONF_CRED_RETRY_V1]
   };
 
   // Send one user turn. If the streaming process is already live, the message is
@@ -3180,9 +3761,15 @@ function makeSession(key) {
       try { S.currentProc.kill('SIGKILL'); } catch {}
       S.currentProc = null; S.procEngine = null;
     }
+    // [CONF_ACCT_SWITCH_V1] A global account switch flagged this live idle Claude worker
+    // for retirement; drop it so the turn below spawns fresh under the new account.
+    if (S.pendingCredentialRefresh && S.currentProc && S.procEngine === 'claude' && !S.processing) {
+      try { S.currentProc.kill('SIGKILL'); } catch {}
+      S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false;
+    }
     const fresh = !S.currentProc;
     const wasProcessing = S.processing;
-    if (fresh) S.spawnProc();
+    if (fresh) { const _r = S.spawnProc(); if (_r && _r.ok === false) return; }   // [CONF_CRED_RETRY_V1]
     if (!S.currentProc) return;
     S.inFlight.push(text);
     S.pendingTurns++;
@@ -3242,10 +3829,38 @@ function makeSession(key) {
     // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
     // codex exec on gpt-5.6-sol). CLI proxies to this room's Playwright shim.
     if (_mcpUrl) { env.CODEX_BROWSER_MCP_URL = _mcpUrl; env.PATH = '/usr/local/bin:' + (env.PATH || ''); }
-    let proc;
+    let proc, codexAccount = null;
     touchBrowserWanted();
-    try { proc = spawn('codex', args, { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch (e) { S.processing = false; S.inFlight = []; S.codexQueue = []; clearPending(S.key); S.send({ type: 'error', text: 'Codex spawn failed: ' + e.message }); S.send({ type: 'done', code: -1 }); return; }   // [CODEX_DURABLE_V4]
+    const _cxConfTurn = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);   // [CONF_CRED_RETRY_V1]
+    if (CREDENTIAL_STEWARD_ENABLED) {
+      if (_cxConfTurn) confLeaseBeginAttempt(S, 'codex');
+      try {
+        if (!S.credentialCodexAccount) S.credentialCodexAccount = stewardText(['active-codex']);
+        codexAccount = S.credentialCodexAccount;
+        env.CODEX_HOME = stewardText(['prepare-codex', codexAccount]);
+      } catch (e) {
+        console.error('[Bridge] credential steward Codex issuance failed:', e.message);   // raw detail: LOG ONLY
+        const cat = classifyIssueError(e);
+        S.processing = false; S.inFlight = []; S.codexQueue = []; clearPending(S.key);
+        if (_cxConfTurn) { confSpawnFailed(S, { engine: 'codex', cat: cat }); return; }
+        S.send({ type: 'error', text: confCredMessage(cat === 'reauth' ? 'reauth' : (cat === 'transient' ? 'exhausted' : 'unknown'), { engineLabel: 'Codex' }) });
+        S.send({ type: 'done', code: -1 }); return;
+      }
+    }
+    try {
+      if (CREDENTIAL_STEWARD_ENABLED) {
+        const lock = path.join(CREDENTIAL_STATE_DIR, `codex-${codexAccount}.lock`);
+        // [CONF_CRED_RETRY_V1] Durable lock-contention discriminator: the instant flock
+        // holds the lock, the wrapper prints __LOCK_ACQUIRED__ to stderr. A nonzero exit
+        // with NO sentinel seen ⇒ flock timed out before acquiring (retryable transient);
+        // a nonzero exit AFTER the sentinel ⇒ Codex's own exit (runtime), regardless of
+        // Codex's exit-code space. Sentinel is stripped from all user-visible output.
+        proc = spawn('flock', ['-w', '30', lock, 'bash', '-c', 'printf "__LOCK_ACQUIRED__\\n" >&2; exec codex "$@"', 'flockwrap', ...args], { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      } else {
+        proc = spawn('codex', args, { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      }
+    }
+    catch (e) { S.processing = false; S.inFlight = []; S.codexQueue = []; clearPending(S.key); if (_cxConfTurn) { confSpawnFailed(S, { engine: 'codex', cat: 'transient' }); return; } S.send({ type: 'error', text: 'Codex could not start. Resume to try again.' }); S.send({ type: 'done', code: -1 }); return; }   // [CONF_CRED_RETRY_V1]
     S.currentProc = proc;
     S.procEngine = 'codex';
     S.lastEngine = 'codex';
@@ -3254,6 +3869,10 @@ function makeSession(key) {
     try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
     const errors = createCodexErrorReporter(data => S.send(data), accountEmail);
     let buf = '';
+    // [CONF_CRED_RETRY_V1] async-failure discriminators for the terminal handlers:
+    // lockAcquired = flock sentinel seen (across chunk boundaries); sawFailure = Codex
+    // reported turn.failed/error before exit (partial output must NOT advance the FSM).
+    let lockAcquired = false, sawFailure = false, _stderrTail = '';
     proc.stdout.on('data', chunk => {
       buf += chunk.toString();
       const lines = buf.split('\n'); buf = lines.pop();
@@ -3262,11 +3881,12 @@ function makeSession(key) {
         let ev; try { ev = JSON.parse(line); } catch { continue; }
         if (!ev || !ev.type) continue;
         if (ev.type === 'turn.failed' || ev.type === 'error') {
+          sawFailure = true;   // [CONF_CRED_RETRY_V1] pre-exit failure signal
           errors.failed((ev.error && ev.error.message) || ev.message || '');
         }
         for (const m of parseCodexEvent(ev)) {
-          if (m.kind === 'session') { S.threadId = m.id; persistRoom(S); S.send({ type: 'session_id', id: m.id }); }  // [CODEX_DURABLE_V2]
-          else if (m.kind === 'stream') { if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data }); }
+          if (m.kind === 'session') { S.threadId = m.id; persistRoom(S); confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null); S.send({ type: 'session_id', id: m.id }); }  // [CODEX_DURABLE_V2]
+          else if (m.kind === 'stream') { if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null }); }
           else if (m.kind === 'result' && m.usage) {
             // cached_input_tokens is a subset of input_tokens in Codex usage.
             S.codexCtxTokens = Number(m.usage.input_tokens || 0);
@@ -3277,13 +3897,53 @@ function makeSession(key) {
       }
     });
     proc.stderr.on('data', d => {
-      console.log('[codex stderr]', d.toString().slice(0, 300));
-      errors.stderr(d.toString());
+      let s = d.toString();
+      // [CONF_CRED_RETRY_V1] detect the flock sentinel across chunk boundaries, then
+      // strip it so it never reaches logs or the user.
+      if (!lockAcquired) {
+        const combined = _stderrTail + s;
+        if (combined.indexOf('__LOCK_ACQUIRED__') !== -1) lockAcquired = true;
+        _stderrTail = combined.slice(-32);
+      }
+      s = s.replace(/__LOCK_ACQUIRED__\n?/g, '');
+      if (s) { console.log('[codex stderr]', s.slice(0, 300)); errors.stderr(s); }
     });
-    proc.on('error', e => console.log('[Bridge] codex proc error:', e.message));
+    // [CONF_CRED_RETRY_V1] Route a pre-completion conference failure through the shared
+    // FSM handler (transient=retry, runtime=pause) instead of stranding or advancing.
+    // NON-conference rooms and clean successes are byte-identical to before.
+    const _cxConfFail = (cat) => {
+      S.inFlight = []; S.codexQueue = []; clearPending(S.key);
+      try { confSpawnFailed(S, { engine: 'codex', cat: cat }); }
+      catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] codex conf-fail route failed:', e.message); }
+    };
+    proc.on('error', e => {
+      if (S.currentProc !== proc) return;
+      S.currentProc = null; S.clearWatch(); S.processing = false;   // detach before routing
+      console.log('[Bridge] codex proc error:', e.message);
+      if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) return _cxConfFail('runtime');
+    });
     proc.on('close', code => {
       if (S.currentProc !== proc) return;
-      S.clearWatch(); S.currentProc = null; S.processing = false;
+      S.currentProc = null;   // [CONF_CRED_RETRY_V1] detach before any routing/scheduling
+      if (CREDENTIAL_STEWARD_ENABLED && codexAccount) {
+        try { stewardText(['finalize-codex', codexAccount]); }
+        catch (e) { console.error('[Bridge] Codex credential reconciliation failed:', e.message); }
+      }
+      S.clearWatch(); S.processing = false;
+      // [CONF_CRED_RETRY_V1] Pre-success exit during a live conference turn: a nonzero
+      // exit or a reported failure must NOT run confFinishTurn (which would advance on
+      // empty/partial output). Lock-timeout (no sentinel) or an open attempt lease ⇒
+      // transient (retry); any other pre-success exit ⇒ runtime (pause, resumable).
+      const _confActive = S.conf && S.conf.status === 'running' && S.conf.activeTurnId;
+      if (_confActive && (code !== 0 || sawFailure)) {
+        // Codex credential issuance (prepare/active-codex) is synchronous too; the ONLY async
+        // credential/lock signal is flock never acquiring the lock (no sentinel). That alone is
+        // lock-transient (retry). Any other nonzero exit — Codex ran (sentinel seen) then failed —
+        // is runtime (pause). Never infer transient from the recovery lease being open.
+        const _lockTimeout = CREDENTIAL_STEWARD_ENABLED && !lockAcquired;
+        // confSpawnFailed is the sole messaging site (emits its own done/status).
+        return _cxConfFail(_lockTimeout ? 'transient' : 'runtime');
+      }
       S.send({ type: 'done', code: code || 0 });
       if (S.inFlight.length) S.inFlight.shift();   // [CODEX_DURABLE_V4] drop the completed prompt only
       const q = S.codexQueue || [];
@@ -3514,15 +4174,15 @@ wss.on('connection', (ws) => {
       if (!prompt.trim()) return;
       // Broadcast the user's text to all OTHER sockets so every device shows the prompt.
       const displayText = (msg.text || '').trim();
-      for (const sock of S.sockets) {
+      const _confFreshStart = (msg.engineMode === 'conference' && typeof msg.reqId === 'string' && !!msg.reqId);   // [CONF_TASK_ASSOC_V1]
+      if (!_confFreshStart) for (const sock of S.sockets) {
         if (sock !== ws && sock.readyState === WebSocket.OPEN) {
           sock.send(JSON.stringify({ type: 'user_msg', text: displayText }));
         }
       }
       // [CONFERENCE_V1] Conference is its own orchestration flow — handle first, before the guard.
       if (msg.engineMode === 'conference' || confActive(S)) {
-        if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) { confInterject(S, prompt); if (S.conf.status === 'paused') confResume(S); }
-        else confStart(S, prompt, { leadEngine: msg.leadEngine, maxRounds: msg.maxRounds });
+        confTryStart(S, prompt, msg);   // [CONF_TASK_ASSOC_V1] idempotency + task-association gate
         return;
       }
       // [CODEX_DURABLE_V6] Never switch engines mid-turn — it would interleave the two
@@ -3582,8 +4242,7 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'conf_start') {   // [CONFERENCE_V1]
       const brief = (msg.brief || '').toString().trim();
       if (!brief) return;
-      if (S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')) { confInterject(S, brief); if (S.conf.status === 'paused') confResume(S); }
-      else confStart(S, brief, { leadEngine: msg.leadEngine, maxRounds: msg.maxRounds });
+      confTryStart(S, brief, msg);   // [CONF_TASK_ASSOC_V1]
     } else if (msg.type === 'conf_pause') { confPause(S);
     } else if (msg.type === 'conf_resume') { confResume(S);
     } else if (msg.type === 'conf_stop') { confStop(S);
@@ -3634,6 +4293,28 @@ server.on('error', (err) => {
   process.exit(1);
 });
 
+// [CONF_CONTAINED_V1] Boot reconciler: backfill every existing conference side-file's
+// user-visible content into the room's own store (chatData), so already-existing rooms
+// become self-contained without waiting for a new turn. Idempotent; never deletes the
+// side-file (operational FSM state) — only mirrors display content.
+try {
+  const _files = fs.existsSync(CONF_DIR) ? fs.readdirSync(CONF_DIR).filter(f => f.endsWith('.json')) : [];
+  let _bn = 0;
+  for (const _f of _files) {
+    try {
+      const _c = JSON.parse(fs.readFileSync(path.join(CONF_DIR, _f), 'utf8'));
+      if (!_c || _c.status === 'superseded' || !Array.isArray(_c.log) || !_c.log.length) continue;
+      const _key = _f.replace(/\.json$/, '');
+      const _msgs = confLogToMessages(_c);
+      const _have = chatData[_key];
+      if (_have && _have.conf && Array.isArray(_have.messages) && _have.messages.length >= _msgs.length) continue;
+      chatData[_key] = { messages: _msgs, updated_at: Date.now(), conf: true };
+      _bn++;
+    } catch (_) {}
+  }
+  if (_bn) { saveChatData(); console.log('[Bridge] [CONF_CONTAINED_V1] backfilled', _bn, 'conference room(s) into chatData'); }
+} catch (e) { console.log('[Bridge] [CONF_CONTAINED_V1] boot reconcile failed:', e.message); }
+
 server.listen(BRIDGE_PORT, '0.0.0.0', () => {
   console.log(`\n✅ Claude Code Bridge running`);
   console.log(`   HTTP:      http://0.0.0.0:${BRIDGE_PORT}`);
@@ -3644,4 +4325,8 @@ server.listen(BRIDGE_PORT, '0.0.0.0', () => {
   // (a blip). No-op unless RESUME_TURNS is enabled.
   try { setInterval(pollEngineMarker, 3000); } catch (e) {}
   try { replayPending(); } catch (e) { console.log('[Bridge] replayPending failed:', e.message); }
+  // [CONF_ACTIVATION_V1] After the server + engines are up, re-open any conference whose
+  // host was restarted to activate a fix. Deferred so sendToEngine has a live server.
+  setTimeout(() => { try { confResumeActivations(); } catch (e) { console.log('[Bridge] [CONF_ACTIVATION_V1] resume sweep failed:', e.message); } }, 1500);
+  setTimeout(() => { try { confResumeRetries(); } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] retry sweep failed:', e.message); } }, 1600);
 });
