@@ -55,6 +55,16 @@ const CDP_BASE = `http://127.0.0.1:${CDP_PORT}`;
 // legacy self-created window per room (user-drivable, not coupled to Claude).
 const SHIM_PORT = parseInt(process.env.SHIM_PORT || '0', 10);
 const FOLLOW_MS = parseInt(process.env.FOLLOW_MS || '1000', 10);
+// [ROOMVIEW_PAINT_PUMP_V1] Paint pump: a backgrounded tab in the one shared Chrome
+// window stops emitting Page.screencastFrame (only the foreground tab composites under
+// Xvfb), so a viewed-but-backgrounded room freezes on its last frame. captureScreenshot
+// renders a tab on demand even when backgrounded, so we pump such rooms at a bounded rate.
+const PUMP_MS               = parseInt(process.env.PUMP_MS || '250', 10);          // reconcile/kick tick (0 disables)
+const PUMP_NATIVE_STALE_MS  = parseInt(process.env.PUMP_NATIVE_STALE_MS || '700', 10);   // native-frame staleness before pumping
+const PUMP_MIN_INTERVAL_MS  = parseInt(process.env.PUMP_MIN_INTERVAL_MS || '500', 10);   // per-room min gap between pump ATTEMPTS
+const PUMP_MAX_PER_SEC      = parseInt(process.env.PUMP_MAX_PER_SEC || '20', 10);         // global attempt cap / sec
+const PUMP_MIN_DISPATCH_GAP_MS = parseInt(process.env.PUMP_MIN_DISPATCH_GAP_MS || '50', 10); // min gap between global dispatch starts
+const PUMP_CAPTURE_TIMEOUT_MS  = parseInt(process.env.PUMP_CAPTURE_TIMEOUT_MS || '2000', 10); // lateness marker (does NOT free the slot)
 
 // ---- upstream (Chrome browser-level) CDP client -------------------------
 let up = null;              // upstream WebSocket
@@ -197,6 +207,11 @@ async function connectUpstream() {
   up.on('message', onUpstreamMessage);
   up.on('close', () => {
     upReady = false; log('upstream closed — reconnecting in 2s');
+    // [ROOMVIEW_PAINT_PUMP_V1] Settle every in-flight CDP request so a capture (or any
+    // send) awaiting a response during a Chrome flap can't hang forever — which would
+    // otherwise pin the one-in-flight pump slot and stall the pump after reconnect.
+    for (const [, p] of pending) { try { p.reject(new Error('upstream closed')); } catch {} }
+    pending.clear();
     for (const r of rooms.values()) r.casting = false;
     setTimeout(connectUpstream, 2000);
   });
@@ -227,7 +242,7 @@ function onUpstreamMessage(raw) {
     if (!roomId) return;
     const room = rooms.get(roomId);
     if (!room) return;
-    room._lastFrameAt = Date.now();   // [ROOMTABS_V1] freshness for the "painting" column
+    { const _nowF = Date.now(); room._lastFrameAt = _nowF; room._lastScreencastAt = _nowF; room._lastFrameKind = 'native'; room.nativeFrames = (room.nativeFrames || 0) + 1; }   // [ROOMTABS_V1]/[ROOMVIEW_PAINT_PUMP_V1]
     // Screencast metadata reports deviceWidth/Height in DEVICE pixels (CSS * dpr), but the
     // client maps clicks into CDP's CSS-pixel space using those values. When a room's page
     // has devicePixelRatio !== 1 (seen: 0.5), deviceWidth is half the CSS width, so every
@@ -581,6 +596,20 @@ const server = http.createServer((req, res) => {
   // [ROOMTABS_V1] Read-only per-room paint state (the "painting" truth). For each room
   // the relay is casting: which target is composited (viewing), how many viewers, and
   // whether a frame arrived recently (=> actually painting, not frozen).
+  // [ROOMVIEW_PAINT_PUMP_V1] Global pump telemetry: dispatch rate (attempt-based), in-flight,
+  // eligible-room count, and config — so verification can prove the cap holds. Read-only.
+  if (req.url === '/pumpstats' || req.url.startsWith('/pumpstats?')) {
+    const now = Date.now();
+    let eligible = 0; for (const r of rooms.values()) if (_pumpEligible(r, now)) eligible++;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: !!PUMP_MS, inFlight: _globalInFlight, dispatchRatePerSec: _rateCount(now),
+      eligible, rooms: rooms.size,
+      cfg: { PUMP_MS, PUMP_NATIVE_STALE_MS, PUMP_MIN_INTERVAL_MS, PUMP_MAX_PER_SEC, PUMP_MIN_DISPATCH_GAP_MS, PUMP_CAPTURE_TIMEOUT_MS },
+      ts: now,
+    }));
+    return;
+  }
   if (req.url === '/state' || req.url.startsWith('/state?')) {
     const now = Date.now();
     const out = {};
@@ -593,6 +622,16 @@ const server = http.createServer((req, res) => {
         pinned: !!r.pinned,
         lastFrameAt: r._lastFrameAt || 0,
         painting: !!(r.targetId && r._lastFrameAt && now - r._lastFrameAt < 4000),
+        // [ROOMVIEW_PAINT_PUMP_V1] native vs pumped truth + counters
+        lastScreencastAt: r._lastScreencastAt || 0,
+        nativeFresh: !!(r._lastScreencastAt && now - r._lastScreencastAt < PUMP_NATIVE_STALE_MS),
+        lastFrameKind: r._lastFrameKind || null,
+        nativeFrames: r.nativeFrames || 0,
+        pumpAttempts: r.pumpAttempts || 0,
+        pumpDelivered: r.pumpDelivered || 0,
+        pumpDiscarded: r.pumpDiscarded || 0,
+        pumpLate: r.pumpLate || 0,
+        pumpErrors: r.pumpErrors || 0,
       };
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -910,6 +949,87 @@ wss.on('connection', async (vw, req) => {
 
 function log(...a) { console.log(new Date().toISOString(), '[relay]', ...a); }
 
+// ---- [ROOMVIEW_PAINT_PUMP_V1] paint pump -------------------------------------
+// Keeps every VIEWED room's pane fresh on the tab it is following, even when that tab is
+// backgrounded (non-foreground tabs stop compositing in the one shared Chrome window). The
+// single foreground room keeps its efficient native screencast (its _lastScreencastAt stays
+// fresh, so it is never pumped). Work-conserving drain: one capture in flight globally, a
+// >=PUMP_MIN_DISPATCH_GAP_MS gap between dispatch starts, and <=PUMP_MAX_PER_SEC attempts/sec.
+let _globalInFlight = 0;
+let _lastDispatchStartAt = 0;
+let _rrIdx = 0;
+const _rateWindow = [];            // attempt timestamps (trailing 1s)
+const _pumpLogAt = new Map();      // roomId -> last error-log time
+function _rateCount(now) { while (_rateWindow.length && now - _rateWindow[0] > 1000) _rateWindow.shift(); return _rateWindow.length; }
+function _pumpEligible(room, now) {
+  return !!(room && room.viewers && room.viewers.size > 0 && room.casting && room.sessionId && !room.waiting
+    && (now - (room._lastScreencastAt || 0) > PUMP_NATIVE_STALE_MS)
+    && (now - (room._lastPumpAttemptAt || 0) >= PUMP_MIN_INTERVAL_MS)
+    && !room._pumpInFlight);
+}
+async function pumpDispatch(roomId, room) {
+  const startAt = Date.now();
+  room._pumpInFlight = true;
+  _globalInFlight++;
+  _lastDispatchStartAt = startAt;
+  _rateWindow.push(startAt);                 // count ATTEMPTS (failed captures cost CPU too)
+  room._lastPumpAttemptAt = startAt;
+  room.pumpAttempts = (room.pumpAttempts || 0) + 1;
+  const startedScreencastAt = room._lastScreencastAt || 0;
+  const startedTargetId = room.targetId;
+  const startedSessionId = room.sessionId;
+  let late = false;
+  const lateTimer = setTimeout(() => { late = true; }, PUMP_CAPTURE_TIMEOUT_MS);
+  try {
+    const shot = await send('Page.captureScreenshot', { format: 'jpeg', quality: 55 }, room.sessionId);
+    // Discard (never deliver, never stamp freshness) if the frame is stale/irrelevant.
+    if (late) { room.pumpLate = (room.pumpLate || 0) + 1; return; }
+    if (!shot || !shot.data) { room.pumpDiscarded = (room.pumpDiscarded || 0) + 1; return; }
+    if ((room._lastScreencastAt || 0) > startedScreencastAt) { room.pumpDiscarded = (room.pumpDiscarded || 0) + 1; return; }
+    if (room.targetId !== startedTargetId || room.sessionId !== startedSessionId) { room.pumpDiscarded = (room.pumpDiscarded || 0) + 1; return; }
+    if (!room.viewers || room.viewers.size === 0) { room.pumpDiscarded = (room.pumpDiscarded || 0) + 1; return; }
+    const meta = {};
+    if (room.cssW && room.cssH) { meta.deviceWidth = room.cssW; meta.deviceHeight = room.cssH; }
+    const payload = JSON.stringify({ t: 'frame', data: shot.data, meta });
+    for (const vw of room.viewers) if (vw.readyState === 1) vw.send(payload);
+    const t2 = Date.now();
+    room._lastFrameAt = t2; room._lastPumpAt = t2; room._lastFrameKind = 'pump';
+    room.pumpDelivered = (room.pumpDelivered || 0) + 1;
+  } catch (e) {
+    room.pumpErrors = (room.pumpErrors || 0) + 1;
+    const la = _pumpLogAt.get(roomId) || 0;
+    if (Date.now() - la > 10000) { _pumpLogAt.set(roomId, Date.now()); log('pump err', roomId, String((e && e.message) || e)); }
+  } finally {
+    clearTimeout(lateTimer);
+    room._pumpInFlight = false;
+    _globalInFlight--;                       // slot held for the REAL command duration (one-in-flight preserved)
+    drainPump();                             // work-conserving: attempt the next room immediately
+  }
+}
+function drainPump() {
+  if (!PUMP_MS || !upReady) return;
+  const now = Date.now();
+  if (_globalInFlight >= 1) return;
+  const gap = now - _lastDispatchStartAt;
+  if (gap < PUMP_MIN_DISPATCH_GAP_MS) { setTimeout(drainPump, PUMP_MIN_DISPATCH_GAP_MS - gap); return; }
+  if (_rateCount(now) >= PUMP_MAX_PER_SEC) { setTimeout(drainPump, 50); return; }
+  const keys = [...rooms.keys()];
+  if (!keys.length) return;
+  for (let i = 0; i < keys.length; i++) {
+    _rrIdx = (_rrIdx + 1) % keys.length;     // round-robin for fairness above the cap
+    const rid = keys[_rrIdx];
+    const room = rooms.get(rid);
+    if (_pumpEligible(room, now)) { pumpDispatch(rid, room); return; }  // async, not awaited
+  }
+  // nothing eligible this pass; the reconcile tick re-kicks
+}
+function startPaintPump() {
+  if (!PUMP_MS) { log('paint pump DISABLED (PUMP_MS=0)'); return; }
+  const t = setInterval(drainPump, PUMP_MS); if (t.unref) t.unref();
+  log('paint pump ON: tick', PUMP_MS + 'ms', 'nativeStale', PUMP_NATIVE_STALE_MS + 'ms', 'minInterval', PUMP_MIN_INTERVAL_MS + 'ms', 'cap', PUMP_MAX_PER_SEC + '/s', 'minGap', PUMP_MIN_DISPATCH_GAP_MS + 'ms');
+}
+
 connectUpstream();
+startPaintPump();
 server.listen(RELAY_PORT, '127.0.0.1', () => log(`listening on 127.0.0.1:${RELAY_PORT} -> CDP ${CDP_PORT}`));
 if (SHIM_PORT) setInterval(sweepOrphanBlanks, 60000);

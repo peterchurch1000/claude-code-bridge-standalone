@@ -1219,3 +1219,24 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
 .tf-preset-actions { display: flex; flex-direction: column; gap: 3px; }
 .tf-preset-save { width: 100%; background: none; border: 1px solid var(--border); color: var(--text); border-radius: 5px; padding: 4px 6px; font-size: 11px; cursor: pointer; font-family: inherit; text-align: left; transition: color .15s, border-color .15s; }
 .tf-preset-save:hover { border-color: var(--accent); color: var(--accent); }
+
+
+/* [ASK_QUESTION_V1] Interactive AskUserQuestion widget */
+.msg-question { border:1px solid #3a4a63; background:#141c2b; border-radius:10px; padding:12px 14px; margin:8px 0; max-width:640px; }
+.msg-question .q-title { font-weight:600; font-size:13px; color:#9fc0ff; margin-bottom:8px; }
+.msg-question .q-block { margin:10px 0; }
+.msg-question .q-header { display:inline-block; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:#8aa0c0; background:#1e2a3e; border-radius:6px; padding:2px 8px; margin-bottom:6px; }
+.msg-question .q-question { font-size:14px; color:#e6edf6; margin:4px 0 8px; }
+.msg-question .q-options { display:flex; flex-direction:column; gap:6px; }
+.msg-question .q-option { text-align:left; display:flex; flex-direction:column; gap:2px; border:1px solid #33425c; background:#0f1725; color:#dfe8f4; border-radius:8px; padding:8px 10px; cursor:pointer; transition:background .12s,border-color .12s; }
+.msg-question .q-option:hover { background:#182236; }
+.msg-question .q-option.sel { border-color:#4f8cff; background:#1b2942; }
+.msg-question .q-option:disabled { cursor:default; opacity:.7; }
+.msg-question .q-option-label { font-weight:600; font-size:13px; }
+.msg-question .q-option-desc { font-size:12px; color:#9fb0c8; }
+.msg-question .q-other { margin-top:6px; width:100%; box-sizing:border-box; background:#0f1725; border:1px solid #33425c; color:#dfe8f4; border-radius:8px; padding:6px 9px; font-size:13px; }
+.msg-question .q-submit { margin-top:10px; background:#2f6bd6; color:#fff; border:none; border-radius:8px; padding:8px 16px; font-size:13px; font-weight:600; cursor:pointer; }
+.msg-question .q-submit:disabled { background:#2a3a54; color:#8798b0; cursor:default; }
+.msg-question .q-status { margin-top:8px; font-size:12px; color:#9fb0c8; }
+.msg-question .q-status.answered { color:#67d38b; }
+.msg-question .q-status.expired { color:#e6a04f; }

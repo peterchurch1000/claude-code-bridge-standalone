@@ -571,6 +571,7 @@
   let pendingLinkRoomId = _isSelfDraft(PINNED_ROOM) ? null : PINNED_ROOM;
   let roomServerConfirmed = false;
   let _copyLinkBtn = null;
+  let _linkTaskBtn = null, _roomTaskChip = null;   // [ROOMTASK_BTN_V1] room-side task-link button + chip
   let _roomUnresolvedBanner = null;
   // Session id namespaced per pinned room so rooms in one profile stay independent.
   let SESSION_KEY  = 'bridge_session_id' + (PINNED_ROOM ? '::' + PINNED_ROOM : '');
@@ -701,7 +702,7 @@
     b.className = 'conf-banner';
     b.style.cssText = 'display:none;position:sticky;top:0;z-index:20;padding:8px 12px;margin:0 0 6px;border-radius:8px;background:#1f2937;color:#e5e7eb;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 1px 4px rgba(0,0,0,.3)';
     b.innerHTML = '<span id="conf-banner-text" style="flex:1 1 auto">Conference</span>' +
-      '<span id="conf-banner-task" style="display:none;padding:2px 8px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px" title="Tarea asociada"></span>' +
+      '<span id="conf-banner-task" style="display:none;padding:2px 8px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px" title="Associated task"></span>' +
       '<button id="conf-btn-pause" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Pause</button>' +
       '<button id="conf-btn-resume" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb;display:none">Resume</button>' +
       '<button id="conf-btn-stop" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#991b1b;color:#fee2e2">Stop</button>';
@@ -733,7 +734,7 @@
     if (c.status === 'paused') txt = '\u23F8 Paused' + (c.reason ? (' \u2014 ' + c.reason) : '') + ' \u00B7 round ' + (c.round || 1) + '/' + (c.maxRounds || 4);
     b.querySelector('#conf-banner-text').textContent = txt;
     const _tc = b.querySelector('#conf-banner-task');
-    if (_tc) { if (c.task && (c.task.id || c.task.file)) { _tc.textContent = '\uD83D\uDDC2 task-' + (c.task.id || ''); _tc.title = c.task.title || ('Tarea ' + (c.task.file || '')); _tc.style.display = ''; } else { _tc.style.display = 'none'; } }
+    if (_tc) { if (c.task && (c.task.id || c.task.file)) { _tc.textContent = '\uD83D\uDDC2 task-' + (c.task.id || ''); _tc.title = c.task.title || ('Task ' + (c.task.file || '')); _tc.style.display = ''; } else { _tc.style.display = 'none'; } }
     b.querySelector('#conf-btn-pause').style.display = c.status === 'running' ? '' : 'none';
     b.querySelector('#conf-btn-resume').style.display = c.status === 'paused' ? '' : 'none';
     b.querySelector('#conf-btn-stop').style.display = '';
@@ -833,7 +834,7 @@
     closeConfTaskModalUI();   // hide UI but KEEP guard + pending until accept / need_task / cancel
     try {
       ws.send(JSON.stringify({ type: 'chat', text: p.text, attachments: p.attachments, engineMode: 'conference', roomId: currentRoomId, reqId: p.reqId, taskDecision: taskDecision, task: p.task }));
-    } catch (e) { confAwaitingAck = false; showToast('No se pudo iniciar \u2014 reintenta', 'warning'); openConfTaskModal(null, true); }
+    } catch (e) { confAwaitingAck = false; showToast('Could not start \u2014 try again', 'warning'); openConfTaskModal(null, true); }
   }
   function openConfTaskModal(payload, reuse) {
     closeConfTaskModalUI();
@@ -851,14 +852,14 @@
   function _confModalRootView() {
     const p = _confPanel(); if (!p) return;
     p.innerHTML =
-      '<div style="font-size:15px;font-weight:600;margin-bottom:4px">\uD83E\uDD1D \u00bfAsociar esta conferencia con una tarea?</div>' +
-      '<div style="font-size:12px;opacity:.7;margin-bottom:14px">Elige una opci\u00f3n para continuar. La conferencia empezar\u00e1 despu\u00e9s de tu elecci\u00f3n.</div>' +
+      '<div style="font-size:15px;font-weight:600;margin-bottom:4px">\uD83E\uDD1D Associate this conference with a task?</div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:14px">Choose an option to continue. The conference will start after your choice.</div>' +
       '<div style="display:flex;flex-direction:column;gap:8px">' +
-      '<button id="conf-t-find" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\uD83D\uDD0D Buscar una tarea existente</button>' +
-      '<button id="conf-t-new" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2795 Crear una tarea nueva</button>' +
-      '<button id="conf-t-none" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2014 Continuar sin tarea</button>' +
+      '<button id="conf-t-find" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\uD83D\uDD0D Find an existing task</button>' +
+      '<button id="conf-t-new" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2795 Create a new task</button>' +
+      '<button id="conf-t-none" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2014 Continue without a task</button>' +
       '</div>' +
-      '<div style="margin-top:14px;text-align:right"><button id="conf-t-cancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancelar</button></div>';
+      '<div style="margin-top:14px;text-align:right"><button id="conf-t-cancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
     p.querySelector('#conf-t-find').onclick = _confModalFindView;
     p.querySelector('#conf-t-new').onclick = _confModalCreateView;
     p.querySelector('#conf-t-none').onclick = function () { submitConfStart('none', null); };
@@ -867,9 +868,9 @@
   function _confModalFindView() {
     const p = _confPanel(); if (!p) return;
     p.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Buscar una tarea</div></div>' +
-      '<input id="conf-t-search" placeholder="Filtrar por t\u00edtulo o n\u00famero\u2026" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin-bottom:10px">' +
-      '<div id="conf-t-list" style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:4px">Cargando\u2026</div>';
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Find a task</div></div>' +
+      '<input id="conf-t-search" placeholder="Filter by title or number\u2026" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin-bottom:10px">' +
+      '<div id="conf-t-list" style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:4px">Loading\u2026</div>';
     p.querySelector('#conf-t-back').onclick = _confModalRootView;
     const searchEl = p.querySelector('#conf-t-search');
     let all = [];
@@ -877,7 +878,7 @@
       const listEl = p.querySelector('#conf-t-list'); if (!listEl) return;
       const q = (searchEl.value || '').toLowerCase().trim();
       const rows = all.filter(function (t) { return !q || (String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0); });
-      if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">Sin coincidencias.</div>'; return; }
+      if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">No matches.</div>'; return; }
       listEl.innerHTML = '';
       rows.slice(0, 200).forEach(function (t) {
         const row = document.createElement('button');
@@ -891,18 +892,18 @@
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) { all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : []; draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0); })
-      .catch(function () { const listEl = p.querySelector('#conf-t-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">No se pudo cargar la lista. <button id="conf-t-retry" style="cursor:pointer;margin-left:6px;padding:2px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Reintentar</button></div>'; const rb = listEl.querySelector('#conf-t-retry'); if (rb) rb.onclick = _confModalFindView; } });
+      .catch(function () { const listEl = p.querySelector('#conf-t-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">Could not load the list. <button id="conf-t-retry" style="cursor:pointer;margin-left:6px;padding:2px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Retry</button></div>'; const rb = listEl.querySelector('#conf-t-retry'); if (rb) rb.onclick = _confModalFindView; } });
   }
   function _confModalCreateView() {
     const p = _confPanel(); if (!p) return;
     const prefill = (pendingConfStart && pendingConfStart.text ? pendingConfStart.text : '').replace(/\s+/g, ' ').trim().slice(0, 120);
     p.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Crear una tarea nueva</div></div>' +
-      '<label style="font-size:12px;opacity:.7">T\u00edtulo</label>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Create a new task</div></div>' +
+      '<label style="font-size:12px;opacity:.7">Title</label>' +
       '<input id="conf-t-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
-      '<label style="font-size:12px;opacity:.7">Descripci\u00f3n (opcional)</label>' +
+      '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
       '<textarea id="conf-t-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
-      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="conf-t-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancelar</button><button id="conf-t-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Crear y empezar</button></div>' +
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="conf-t-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button><button id="conf-t-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Create and start</button></div>' +
       '<div id="conf-t-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
     const titleEl = p.querySelector('#conf-t-title'); titleEl.value = prefill;
     const descEl = p.querySelector('#conf-t-desc');
@@ -913,11 +914,11 @@
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
       const errEl = p.querySelector('#conf-t-err');
       if (title.length < 3) { if (errEl) errEl.textContent = 'El t\u00edtulo debe tener al menos 3 caracteres.'; return; }
-      createBtn.disabled = true; createBtn.textContent = 'Creando\u2026';
+      createBtn.disabled = true; createBtn.textContent = 'Creating\u2026';
       fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim() }) })
         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
         .then(function (res) { if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error'); submitConfStart('linked', { id: String(res.j.id || ''), file: String(res.j.file || ''), title: String(res.j.title || title) }); })
-        .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Crear y empezar'; if (errEl) errEl.textContent = 'No se pudo crear la tarea. Reintenta.'; });
+        .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Create and start'; if (errEl) errEl.textContent = 'Could not create the task. Try again.'; });
     };
     setTimeout(function () { try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch (e) {} }, 0);
   }
@@ -1094,8 +1095,22 @@
     return div;
   }
 
-  function appendToolMsg(name, args) {
+  function appendToolMsg(name, args, id, opts) {
     removeThinking();
+
+    // [ASK_QUESTION_V1] AskUserQuestion renders as an interactive widget, not raw JSON.
+    if (name === 'AskUserQuestion' && args && Array.isArray(args.questions)) {
+      const qwrap = buildQuestionWidget(args, id, (opts && opts.answered) || null);
+      messagesEl.appendChild(qwrap);
+      scrollBottom();
+      lastToolEl = qwrap;
+      if (!_restoring) {
+        storedMsgData.push({ type: 'tool', toolName: name, args, result: null, id: id || null, answered: (opts && opts.answered) || null });
+        lastToolDataIdx = storedMsgData.length - 1;
+        saveToStorage();
+      }
+      return;
+    }
 
     const wrap = document.createElement('div');
     wrap.className = 'msg-tool';
@@ -1148,7 +1163,7 @@
     lastToolEl = wrap;
 
     if (!_restoring) {
-      storedMsgData.push({ type: 'tool', toolName: name, args, result: null });
+      storedMsgData.push({ type: 'tool', toolName: name, args, result: null, id: id || null });
       lastToolDataIdx = storedMsgData.length - 1;
       saveToStorage();
     }
@@ -1301,6 +1316,25 @@
 
       case 'pong': break;
 
+      // [ASK_QUESTION_V1] Answer acknowledged / expired for an AskUserQuestion widget.
+      case 'question_ack': {
+        const w = _questionWidgets[msg.tool_use_id];
+        const map = w ? w.getMap() : null;
+        if (w) w.markAnswered(map);
+        try {
+          for (const r of storedMsgData) { if (r && r.type === 'tool' && r.id === msg.tool_use_id) { r.answered = map || {}; } }
+          saveToStorage();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'save_history', sessionId: currentSessionId, messages: storedMsgData }));
+        } catch (e) {}
+        break;
+      }
+      case 'question_expired': {
+        const w = _questionWidgets[msg.tool_use_id];
+        if (w) w.markExpired();
+        _submittedQuestionIds.delete(msg.tool_use_id);
+        break;
+      }
+
       // [CONFERENCE_V1] server-orchestrated collaboration events
       case 'conf_started':
         confCommitPending(msg.reqId);   // [CONF_TASK_ASSOC_V1] deferred commit-once (append + clear)
@@ -1357,7 +1391,7 @@
         if (pendingConfStart && (!msg.reqId || pendingConfStart.reqId === msg.reqId)) {
           confAwaitingAck = false;
           openConfTaskModal(null, true);
-          showToast(msg.reason === 'task' ? 'Esa tarea ya no existe \u2014 elige otra opci\u00f3n' : 'Elige una opci\u00f3n de tarea para continuar', 'warning');
+          showToast(msg.reason === 'task' ? 'That task no longer exists \u2014 pick another option' : 'Choose a task option to continue', 'warning');
         }
         break;
       case 'conf_sync':
@@ -2074,7 +2108,7 @@
           saveToStorage();
           scrollBottom();
         } else if (block.type === 'tool_use') {
-          appendToolMsg(block.name, block.input);
+          appendToolMsg(block.name, block.input, block.id);
           setActivity(toolIntent(block.name, block.input));
           currentAssistantEl   = null;
           currentAssistantText = '';
@@ -2127,7 +2161,7 @@
 
   function renderOneStored(m) {            // bottom-append, mirrors the live path
     if (m.type === 'tool') {
-      appendToolMsg(m.toolName, m.args);
+      appendToolMsg(m.toolName, m.args, m.id, { answered: m.answered });
       if (m.result !== null && m.result !== undefined && lastToolEl) {
         const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
         if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
@@ -2169,6 +2203,132 @@
     return wrap;
   }
 
+  // [ASK_QUESTION_V1] Interactive renderer + submission for the AskUserQuestion tool.
+  const _questionWidgets = {};              // tool_use_id -> { markAnswered, markExpired, getMap }
+  const _submittedQuestionIds = new Set();
+
+  function buildQuestionWidget(input, id, answeredState) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg-question';
+    const questions = (input && Array.isArray(input.questions)) ? input.questions : [];
+    const selections = {};   // qi -> Set (multiSelect) or single label
+    const otherText = {};    // qi -> free text
+
+    const title = document.createElement('div');
+    title.className = 'q-title';
+    title.textContent = '\u2753 ' + (questions.length > 1 ? (questions.length + ' questions') : 'A question for you');
+    wrap.appendChild(title);
+
+    const submitBtn = document.createElement('button');
+    submitBtn.className = 'q-submit';
+    submitBtn.textContent = 'Submit answer';
+    const status = document.createElement('div');
+    status.className = 'q-status';
+
+    function complete() {
+      return questions.every((q, qi) => {
+        const s = selections[qi];
+        const hasSel = s && ((s instanceof Set) ? s.size > 0 : !!s);
+        const hasOther = otherText[qi] && otherText[qi].trim();
+        return hasSel || hasOther;
+      });
+    }
+    function refresh() { submitBtn.disabled = !complete(); }
+
+    questions.forEach((q, qi) => {
+      const qb = document.createElement('div'); qb.className = 'q-block';
+      if (q.header) { const h = document.createElement('span'); h.className = 'q-header'; h.textContent = q.header; qb.appendChild(h); }
+      const qt = document.createElement('div'); qt.className = 'q-question'; qt.textContent = q.question || ''; qb.appendChild(qt);
+      const multi = !!q.multiSelect;
+      if (multi) selections[qi] = new Set();
+      const opts = document.createElement('div'); opts.className = 'q-options';
+      (Array.isArray(q.options) ? q.options : []).forEach(opt => {
+        const b = document.createElement('button');
+        b.className = 'q-option';
+        const lab = document.createElement('span'); lab.className = 'q-option-label'; lab.textContent = opt.label || ''; b.appendChild(lab);
+        if (opt.description) { const d = document.createElement('span'); d.className = 'q-option-desc'; d.textContent = opt.description; b.appendChild(d); }
+        b.addEventListener('click', () => {
+          if (wrap.dataset.answered) return;
+          if (multi) {
+            if (selections[qi].has(opt.label)) { selections[qi].delete(opt.label); b.classList.remove('sel'); }
+            else { selections[qi].add(opt.label); b.classList.add('sel'); }
+          } else {
+            selections[qi] = opt.label;
+            opts.querySelectorAll('.q-option').forEach(x => x.classList.remove('sel'));
+            b.classList.add('sel');
+          }
+          refresh();
+        });
+        opts.appendChild(b);
+      });
+      qb.appendChild(opts);
+      const other = document.createElement('input');
+      other.type = 'text'; other.className = 'q-other'; other.placeholder = 'Other\u2026 (type your own answer)';
+      other.addEventListener('input', () => { otherText[qi] = other.value; refresh(); });
+      qb.appendChild(other);
+      wrap.appendChild(qb);
+    });
+
+    function answersMap() {
+      const out = {};
+      questions.forEach((q, qi) => {
+        const key = q.question || ('question ' + (qi + 1));
+        const parts = [];
+        const s = selections[qi];
+        if (s instanceof Set) s.forEach(l => parts.push(l));
+        else if (s) parts.push(s);
+        if (otherText[qi] && otherText[qi].trim()) parts.push(otherText[qi].trim());
+        out[key] = q.multiSelect ? parts : (parts[0] || '');
+      });
+      return out;
+    }
+
+    function lock() {
+      wrap.dataset.answered = '1';
+      submitBtn.disabled = true;
+      wrap.querySelectorAll('.q-option, .q-other').forEach(x => { x.disabled = true; });
+    }
+    function markAnswered(map) {
+      lock();
+      const chosen = map || answersMap();
+      status.className = 'q-status answered';
+      status.textContent = '\u2713 Answered: ' + Object.values(chosen).map(v => Array.isArray(v) ? v.join(', ') : v).filter(Boolean).join(' \u00b7 ');
+    }
+    function markExpired() {
+      lock();
+      status.className = 'q-status expired';
+      status.textContent = '\u26a0 This question expired \u2014 the session that asked it is no longer running.';
+    }
+
+    submitBtn.addEventListener('click', () => {
+      if (!complete() || wrap.dataset.answered) return;
+      if (!id) { status.className = 'q-status expired'; status.textContent = '\u26a0 Cannot submit \u2014 missing question id. Type your answer in the chat instead.'; return; }
+      if (_submittedQuestionIds.has(id)) return;
+      _submittedQuestionIds.add(id);
+      const map = answersMap();
+      wrap._pendingMap = map;
+      wrap.dataset.answered = '1';
+      submitBtn.disabled = true;
+      wrap.querySelectorAll('.q-option, .q-other').forEach(x => { x.disabled = true; });
+      status.className = 'q-status';
+      status.textContent = '\u23f3 Sending\u2026';
+      try { ws.send(JSON.stringify({ type: 'question_answer', roomId: currentRoomId, tool_use_id: id, answers: map })); }
+      catch (e) {
+        _submittedQuestionIds.delete(id); wrap.dataset.answered = '';
+        wrap.querySelectorAll('.q-option, .q-other').forEach(x => { x.disabled = false; });
+        submitBtn.disabled = false;
+        status.className = 'q-status expired'; status.textContent = '\u26a0 Send failed \u2014 try again.';
+      }
+    });
+
+    wrap.appendChild(submitBtn);
+    wrap.appendChild(status);
+
+    if (id) _questionWidgets[id] = { markAnswered, markExpired, getMap: () => wrap._pendingMap || answersMap() };
+    if (answeredState) markAnswered(answeredState); else refresh();
+    return wrap;
+  }
+
   function ensureOlderBtn() {
     if (!_pendingOlder.length) { _olderBtn?.remove(); _olderBtn = null; return; }
     if (!_olderBtn) {
@@ -2189,7 +2349,9 @@
     const prevH = messagesEl.scrollHeight, prevTop = messagesEl.scrollTop;
     const frag = document.createDocumentFragment();
     for (const m of batch) {
-      const node = m.type === 'tool' ? buildToolNode(m.toolName, m.args, m.result) : buildMsgNode(m.type, m.text || '', m.engine);
+      const node = m.type === 'tool'
+        ? ((m.toolName === 'AskUserQuestion' && m.args && Array.isArray(m.args.questions)) ? buildQuestionWidget(m.args, m.id, m.answered || null) : buildToolNode(m.toolName, m.args, m.result))
+        : buildMsgNode(m.type, m.text || '', m.engine);
       if (node) frag.appendChild(node);
     }
     const anchor = _olderBtn ? _olderBtn.nextSibling : messagesEl.firstChild;
@@ -2460,7 +2622,7 @@
       : '');
     // [CONF_TASK_ASSOC_V1] Fresh conference: ask about task association BEFORE any optimistic render/send.
     if (confModeOn(currentRoomId) && !activeConf && !(confState && (confState.status === 'running' || confState.status === 'paused'))) {
-      if (confStartGuard) { showToast('Termina el paso de asociaci\u00f3n de tarea primero', 'info'); return; }
+      if (confStartGuard) { showToast('Finish the task-association step first', 'info'); return; }
       openConfTaskModal({ text: text, echo: echo, attachments: attachments });
       return;
     }
@@ -2832,6 +2994,7 @@
     _copyLinkBtn.disabled = !on;
     _copyLinkBtn.title = on ? 'Copy a shareable link to this room'
                             : 'Send a message first to get a shareable link for this room';
+    try { if (typeof refreshRoomTaskChip === 'function') refreshRoomTaskChip(); } catch (e) {}   // [ROOMTASK_BTN_V1]
   }
   (function wireCopyLinkBtn() {   // [ROOMLINK_V1c] robust anchor: btn-room is absent in index.html
     _copyLinkBtn = document.createElement('button');
@@ -2853,6 +3016,163 @@
     else { _copyLinkBtn = null; return; }
     refreshCopyLinkBtn();
   })();
+
+  // ── [ROOMTASK_BTN_V1] Room-side "link this room to a task" control ───────────
+  // A 🗂 titlebar button (beside 🔗 Copy-link) available on any confirmed room. It
+  // writes to the canonical task_rooms M:N store via the same Laravel-proxied task
+  // API the task-detail panel already uses (POST/DELETE /tasks/{file}/rooms). No new
+  // storage: a room may link to many tasks and a task to many rooms. The chip shows
+  // how many tasks THIS room is linked to, read from the in-memory lastTasks cache.
+  let _rtTasks = [];
+  function roomTaskEnabled() { return !!(roomServerConfirmed && currentRoomId && !String(currentRoomId).startsWith('draft-')); }
+  function _rtLinkedTasks() {
+    const rid = String(currentRoomId || '');
+    if (!rid || typeof lastTasks === 'undefined' || !Array.isArray(lastTasks)) return [];
+    return lastTasks.filter(t => t && Array.isArray(t.rooms) && t.rooms.some(rm => String(rm.room_key) === rid));
+  }
+  function refreshRoomTaskChip() {
+    if (!_linkTaskBtn) return;
+    const on = roomTaskEnabled();
+    _linkTaskBtn.disabled = !on;
+    _linkTaskBtn.style.opacity = on ? '0.85' : '0.35';
+    _linkTaskBtn.title = on ? 'Link this room to a task' : 'Send a message first, then you can link this room to a task';
+    if (!_roomTaskChip) return;
+    const linked = on ? _rtLinkedTasks() : [];
+    if (linked.length === 1) {
+      _roomTaskChip.textContent = '🗂 task-' + (linked[0].id || '');
+      _roomTaskChip.title = linked[0].title || '';
+      _roomTaskChip.style.display = '';
+    } else if (linked.length > 1) {
+      _roomTaskChip.textContent = '🗂 ' + linked.length + ' tasks';
+      _roomTaskChip.title = linked.map(t => 'task-' + (t.id || '') + ' ' + (t.title || '')).join('\n');
+      _roomTaskChip.style.display = '';
+    } else {
+      _roomTaskChip.style.display = 'none';
+    }
+  }
+  function _rtSyncChip() {
+    try { Promise.resolve(typeof loadTasks === 'function' ? loadTasks() : null).then(() => refreshRoomTaskChip()).catch(() => refreshRoomTaskChip()); }
+    catch (e) { refreshRoomTaskChip(); }
+  }
+  function _rtClose() { const m = document.getElementById('roomtask-modal'); if (m) m.remove(); document.removeEventListener('keydown', _rtEsc, true); }
+  function _rtEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _rtClose(); } }
+  function _rtPanelEl() { return document.getElementById('roomtask-panel'); }
+  function _rtCurrentFilter() { const s = document.getElementById('rt-search'); return s ? s.value : ''; }
+  async function _rtPost(file, roomKey) {
+    const r = await fetch(API_BASE + '/tasks/' + encodeURIComponent(file) + '/rooms', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ room_key: roomKey, label: '' }) });
+    return r.ok;
+  }
+  async function _rtDelete(file, rid) {
+    const r = await fetch(API_BASE + '/tasks/' + encodeURIComponent(file) + '/rooms/' + encodeURIComponent(rid), { method: 'DELETE' });
+    return r.ok;
+  }
+  function _rtReload() {
+    fetch(API_BASE + '/tasks', { cache: 'no-store' }).then(r => r.ok ? r.json() : { tasks: [] })
+      .then(d => { _rtTasks = (d && Array.isArray(d.tasks)) ? d.tasks : _rtTasks; if (_rtPanelEl()) _rtPaint(_rtCurrentFilter()); }).catch(() => {});
+    _rtSyncChip();
+  }
+  function openRoomTaskModal() {
+    if (!roomTaskEnabled()) { showToast('Send a message first to link this room', 'info'); return; }
+    _rtClose();
+    const wrap = document.createElement('div');
+    wrap.id = 'roomtask-modal';
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    wrap.innerHTML = '<div id="roomtask-panel" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:18px">Loading…</div>';
+    wrap.addEventListener('mousedown', e => { if (e.target === wrap) _rtClose(); });
+    document.body.appendChild(wrap);
+    document.addEventListener('keydown', _rtEsc, true);
+    fetch(API_BASE + '/tasks', { cache: 'no-store' }).then(r => r.ok ? r.json() : { tasks: [] })
+      .then(d => { _rtTasks = (d && Array.isArray(d.tasks)) ? d.tasks : []; _rtPaint(''); })
+      .catch(() => { const p = _rtPanelEl(); if (p) p.textContent = 'Could not load the task list.'; });
+  }
+  function _rtPaint(filter) {
+    const p = _rtPanelEl(); if (!p) return;
+    const rid = String(currentRoomId || '');
+    const linked = _rtTasks.filter(t => t && Array.isArray(t.rooms) && t.rooms.some(rm => String(rm.room_key) === rid));
+    const q = (filter || '').toLowerCase().trim();
+    const pool = _rtTasks.filter(t => t && t.status !== 'done')
+      .filter(t => !q || String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0);
+    p.innerHTML =
+      '<div style="font-size:15px;font-weight:600;margin-bottom:4px">🗂 Link this room to a task</div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:12px">Saved to task_rooms and shown in the task detail. A room can link to several tasks.</div>' +
+      '<div id="rt-linked"></div>' +
+      '<input id="rt-search" placeholder="Filter tasks by title or number…" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin-bottom:8px">' +
+      '<div id="rt-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>' +
+      '<div style="margin-top:12px;display:flex;justify-content:space-between;gap:8px">' +
+        '<button id="rt-new" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">➕ Create task & link</button>' +
+        '<button id="rt-close" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cerrar</button>' +
+      '</div>';
+    const lw = p.querySelector('#rt-linked');
+    if (linked.length) {
+      const head = document.createElement('div'); head.style.cssText = 'font-size:12px;opacity:.7;margin-bottom:4px'; head.textContent = 'Already linked to:'; lw.appendChild(head);
+      linked.forEach(t => {
+        const rm = t.rooms.find(r => String(r.room_key) === rid);
+        const row = document.createElement('div'); row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;border:1px solid #374151;background:#0b1220;margin-bottom:4px';
+        const lab = document.createElement('div'); lab.style.cssText = 'flex:1 1 auto;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'; lab.textContent = '🗂 task-' + (t.id || '') + ' · ' + (t.title || '');
+        const un = document.createElement('button'); un.style.cssText = 'flex:0 0 auto;cursor:pointer;padding:4px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#3f1d1d;color:#fecaca;font-size:12px'; un.textContent = 'Unlink';
+        un.onclick = () => { un.disabled = true; _rtDelete(t.file, rm.rid).then(ok => { if (ok) { showToast('Unlinked from task-' + (t.id || ''), 'success'); _rtReload(); } else { un.disabled = false; showToast('Could not unlink', 'error'); } }); };
+        row.appendChild(lab); row.appendChild(un); lw.appendChild(row);
+      });
+      const hr = document.createElement('div'); hr.style.cssText = 'height:1px;background:#374151;margin:8px 0'; lw.appendChild(hr);
+    }
+    const listEl = p.querySelector('#rt-list');
+    const linkedFiles = new Set(linked.map(t => t.file));
+    const rows = pool.filter(t => !linkedFiles.has(t.file));
+    if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">No matches.</div>'; }
+    else rows.slice(0, 200).forEach(t => {
+      const b = document.createElement('button'); b.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
+      b.textContent = 'task-' + (t.id || '?') + ' · ' + (t.title || '(sin título)');
+      b.onclick = () => { b.disabled = true; _rtPost(t.file, rid).then(ok => { if (ok) { showToast('Room linked to task-' + (t.id || ''), 'success'); _rtReload(); } else { b.disabled = false; showToast('Could not link (invalid key)', 'error'); } }); };
+      listEl.appendChild(b);
+    });
+    const s = p.querySelector('#rt-search'); s.value = filter || ''; s.oninput = () => _rtPaint(s.value);
+    p.querySelector('#rt-close').onclick = _rtClose;
+    p.querySelector('#rt-new').onclick = _rtCreateView;
+    setTimeout(() => { try { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } catch (e) {} }, 0);
+  }
+  function _rtCreateView() {
+    const p = _rtPanelEl(); if (!p) return;
+    const rid = String(currentRoomId || '');
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rt-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">←</button><div style="font-size:15px;font-weight:600">Create task & link this room</div></div>' +
+      '<label style="font-size:12px;opacity:.7">Title</label>' +
+      '<input id="rt-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
+      '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
+      '<textarea id="rt-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="rt-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button><button id="rt-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Create & link</button></div>' +
+      '<div id="rt-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
+    p.querySelector('#rt-back').onclick = () => _rtPaint('');
+    p.querySelector('#rt-cancel2').onclick = _rtClose;
+    const titleEl = p.querySelector('#rt-title'), descEl = p.querySelector('#rt-desc'), cb = p.querySelector('#rt-create'), errEl = p.querySelector('#rt-err');
+    cb.onclick = () => {
+      const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
+      if (title.length < 3) { errEl.textContent = 'El título debe tener al menos 3 caracteres.'; return; }
+      cb.disabled = true; cb.textContent = 'Creating…';
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim() }) })
+        .then(r => r.json().then(j => ({ ok: r.ok, j })))
+        .then(res => { if (!res.ok || !res.j || !res.j.file) throw new Error('create'); return _rtPost(res.j.file, rid).then(ok => { if (!ok) throw new Error('link'); showToast('Task created and room linked', 'success'); _rtClose(); _rtSyncChip(); }); })
+        .catch(() => { cb.disabled = false; cb.textContent = 'Create & link'; errEl.textContent = 'Could not create/link. Try again.'; });
+    };
+    setTimeout(() => { try { titleEl.focus(); } catch (e) {} }, 0);
+  }
+  (function wireLinkTaskBtn() {
+    _linkTaskBtn = document.createElement('button');
+    _linkTaskBtn.id = 'btn-link-task'; _linkTaskBtn.type = 'button'; _linkTaskBtn.className = 'st-link-task';
+    _linkTaskBtn.textContent = '🗂';
+    _linkTaskBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;font-size:13px;padding:0 4px;opacity:.85';
+    _linkTaskBtn.addEventListener('click', () => { if (!_linkTaskBtn.disabled) openRoomTaskModal(); });
+    _roomTaskChip = document.createElement('span');
+    _roomTaskChip.id = 'roomtask-chip';
+    _roomTaskChip.style.cssText = 'display:none;cursor:pointer;padding:1px 7px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px;margin-left:2px;white-space:nowrap';
+    _roomTaskChip.addEventListener('click', () => openRoomTaskModal());
+    const host = _copyLinkBtn || document.getElementById('btn-copy-room-link');
+    const bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
+    if (host && host.parentNode) { host.parentNode.insertBefore(_linkTaskBtn, host.nextSibling); _linkTaskBtn.parentNode.insertBefore(_roomTaskChip, _linkTaskBtn.nextSibling); }
+    else if (bar) { bar.appendChild(_linkTaskBtn); bar.appendChild(_roomTaskChip); }
+    else { _linkTaskBtn = null; _roomTaskChip = null; return; }
+    refreshRoomTaskChip();
+  })();
+
   function hideRoomUnresolved() { if (_roomUnresolvedBanner) { _roomUnresolvedBanner.remove(); _roomUnresolvedBanner = null; } }
   function showRoomUnresolved(roomId, kind) {
     hideRoomUnresolved();
@@ -3292,24 +3612,41 @@
     if (sessionPollTimer) { clearInterval(sessionPollTimer); sessionPollTimer = null; }
   }
 
+  function openSessionMenu() {
+    if (!sessionDropdown.classList.contains('hidden')) return;
+    const rect = btnMenu.getBoundingClientRect();
+    sessionDropdown.style.top  = (rect.bottom + 6) + 'px';
+    sessionDropdown.style.left = Math.max(4, rect.right - 240) + 'px';
+    loadSessions();
+    sessionDropdown.classList.remove('hidden');
+    // Keep the menu fully on-screen (esp. narrow mobile): clamp after layout.
+    const ddw = sessionDropdown.offsetWidth;
+    sessionDropdown.style.left = Math.max(4, Math.min(rect.right - 240, window.innerWidth - ddw - 4)) + 'px';
+    startSessionPoll();
+  }
+  function closeSessionMenu() {
+    if (sessionDropdown.classList.contains('hidden')) return;
+    sessionDropdown.classList.add('hidden');
+    stopSessionPoll();
+    _teardownRemoteSearch();   // [ROOMSEARCH_CONTENT_V1]
+  }
+
   btnMenu.addEventListener('click', e => {
     e.stopPropagation();
-    if (sessionDropdown.classList.contains('hidden')) {
-      const rect = btnMenu.getBoundingClientRect();
-      sessionDropdown.style.top  = (rect.bottom + 6) + 'px';
-      sessionDropdown.style.left = Math.max(4, rect.right - 240) + 'px';
-      loadSessions();
-      sessionDropdown.classList.remove('hidden');
-      // Keep the menu fully on-screen (esp. narrow mobile): clamp after layout.
-      const ddw = sessionDropdown.offsetWidth;
-      sessionDropdown.style.left = Math.max(4, Math.min(rect.right - 240, window.innerWidth - ddw - 4)) + 'px';
-      startSessionPoll();
-    } else {
-      sessionDropdown.classList.add('hidden');
-      stopSessionPoll();
-      _teardownRemoteSearch();   // [ROOMSEARCH_CONTENT_V1]
-    }
+    if (sessionDropdown.classList.contains('hidden')) openSessionMenu();
+    else closeSessionMenu();
   });
+
+  // [ROOM_MENU_HOVER_V1] Open the room list on hover over the menu button; close
+  // shortly after the pointer leaves BOTH the button and the dropdown. The grace
+  // delay lets you travel from the button onto the menu without it snapping shut.
+  let _menuHoverTimer = null;
+  const _cancelMenuHoverClose = () => { if (_menuHoverTimer) { clearTimeout(_menuHoverTimer); _menuHoverTimer = null; } };
+  const _scheduleMenuHoverClose = () => { _cancelMenuHoverClose(); _menuHoverTimer = setTimeout(closeSessionMenu, 300); };
+  btnMenu.addEventListener('mouseenter', () => { _cancelMenuHoverClose(); openSessionMenu(); });
+  btnMenu.addEventListener('mouseleave', _scheduleMenuHoverClose);
+  sessionDropdown.addEventListener('mouseenter', _cancelMenuHoverClose);
+  sessionDropdown.addEventListener('mouseleave', _scheduleMenuHoverClose);
 
   btnLogout.addEventListener('click', e => {
     e.stopPropagation();
@@ -4300,10 +4637,13 @@
     try { raw = JSON.parse(localStorage.getItem(TP_KEY) || '[]'); } catch (_) { raw = []; }
     if (!Array.isArray(raw)) raw = [];
     const seen = new Set();   // lowercased names -> enforce uniqueness incl. legacy data
+    const seenIds = new Set();   // enforce unique ids so apply/delete can't collide on dup stored ids
     const out = [];
     for (const e of raw) {
       if (!e || typeof e !== 'object') continue;
-      const id = (typeof e.id === 'string' && e.id) ? e.id : newPresetId();
+      let id = (typeof e.id === 'string' && e.id) ? e.id : newPresetId();
+      while (seenIds.has(id)) id = newPresetId();   // regenerate a colliding stored id
+      seenIds.add(id);
       let name = (typeof e.name === 'string' ? e.name : '').trim();
       if (!name) continue;
       if (seen.has(name.toLowerCase())) {          // de-dupe pre-existing collisions
@@ -4734,7 +5074,7 @@
       a.href = buildShareUrl(rm.room_key);
       a.target = '_blank'; a.rel = 'noopener';
       a.title = 'Open this conference room in a new tab';
-      a.style.cssText = 'font-size:12px;text-decoration:none;color:var(--accent,#6ea8fe);border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 6px';
+      a.style.cssText = 'font-size:12px;text-decoration:none;color:#ffffff;border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 6px';
       a.addEventListener('click', e => e.stopPropagation());  // don't toggle the row
       b.appendChild(a);
     });
@@ -4905,7 +5245,7 @@
         list.forEach((rm, i) => {
           const row = el('div', 'display:flex;gap:8px;align-items:center;font-size:13px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04)');
           const num = el('div', 'flex:0 0 auto;font-size:11px;opacity:.5;width:16px', String(i + 1));
-          const a = el('a', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;color:var(--accent,#6ea8fe)', '\uD83D\uDCAC ' + roomLinkLabel(rm));
+          const a = el('a', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;color:#ffffff', '\uD83D\uDCAC ' + roomLinkLabel(rm));
           a.href = buildShareUrl(rm.room_key); a.target = '_blank'; a.rel = 'noopener'; a.title = 'Open this room in a new tab';
           const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '\u00d7');
           del.onclick = async () => { if (await jsend(`${base}/rooms/${rm.rid}`, 'DELETE')) { renderRooms(); loadTasks(); } };
@@ -4937,6 +5277,24 @@
         form.appendChild(curBtn);
       }
       roomSec.appendChild(form);
+      // Picker: link ANY existing room by name (no key hunting). [TASK_ROOMS_PICKER_V1]
+      try {
+        const sd = await (await fetch(`${API_BASE}/sessions`, { cache: 'no-store' })).json();
+        const sess = ((sd && sd.sessions) || []).filter(s => s.id && !String(s.id).startsWith('draft-'));
+        if (sess.length){
+          const linked = new Set(list.map(rm => String(rm.room_key)));
+          const pickRow = el('div', 'display:flex;gap:6px;margin-top:6px;align-items:center');
+          const sel = el('select', 'flex:1 1 auto;font-size:13px;padding:6px 8px');
+          const ph = el('option', '', '\u2026 or pick an existing room to link'); ph.value = ''; sel.appendChild(ph);
+          sess.forEach(s => {
+            const nm = sessionNameById[s.id] || s.name || s.preview || s.id;
+            const o = el('option', '', (linked.has(String(s.id)) ? '\u2713 ' : '') + nm); o.value = s.id; sel.appendChild(o);
+          });
+          const go = el('button', 'flex:0 0 auto', 'Link'); go.className = 'tc-ok';
+          go.onclick = () => { const id = sel.value; if (!id) return; const nm = sel.options[sel.selectedIndex].textContent.replace(/^\u2713 /, ''); addRoom(id, nm); };
+          pickRow.appendChild(sel); pickRow.appendChild(go); roomSec.appendChild(pickRow);
+        }
+      } catch(_){}
     }
 
     // Progress
@@ -5237,14 +5595,24 @@
   }
 
   // ── Filter dropdown menus ──
-  function renderCheckMenu(menuEl, options, selected, onChange, labelFn, allLabel, optRender) {
+  function renderCheckMenu(menuEl, options, selected, onChange, labelFn, allLabel, optRender, masterToggle) {
     if (!menuEl) return;
     const temp = new Set(selected);
     const draw = () => {
       menuEl.innerHTML = '';
       const allRow = document.createElement('label'); allRow.className = 'tf-opt tf-opt-all';
-      const allCb = document.createElement('input'); allCb.type = 'checkbox'; allCb.checked = temp.size === 0;
-      allCb.addEventListener('change', () => { temp.clear(); draw(); });
+      const allCb = document.createElement('input'); allCb.type = 'checkbox';
+      const selectedCount = options.reduce((n, o) => n + (temp.has(o) ? 1 : 0), 0);
+      const allSelected = options.length > 0 && selectedCount === options.length;
+      allCb.checked = masterToggle ? allSelected : (temp.size === 0);
+      allCb.indeterminate = masterToggle && selectedCount > 0 && !allSelected;
+      allCb.addEventListener('change', () => {
+        if (masterToggle) {
+          if (allSelected) { temp.clear(); }
+          else { temp.clear(); for (const o of options) temp.add(o); }
+        } else { temp.clear(); }
+        draw();
+      });
       allRow.appendChild(allCb); allRow.appendChild(document.createTextNode(' ' + (allLabel || 'All')));
       menuEl.appendChild(allRow);
       const sep = document.createElement('div'); sep.className = 'tf-sep'; menuEl.appendChild(sep);
@@ -5369,9 +5737,9 @@
     const menuOpen = id => { const m = $(id); return m && !m.classList.contains('hidden'); };
     if (!menuOpen('tf-status-menu')) renderCheckMenu($('tf-status-menu'),
       Array.from(new Set(tasks.map(t => t.status))).sort(), taskState.status,
-      sel => { taskState.status = sel; saveTaskState(); renderTasks(lastTasks); }, prettyStatus, 'All Statuses');
+      sel => { taskState.status = sel; saveTaskState(); renderTasks(lastTasks); }, prettyStatus, 'All Statuses', null, true);
     if (!menuOpen('tf-area-menu')) renderCheckMenu($('tf-area-menu'), optsFor('area'), taskState.area,
-      sel => { taskState.area = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Areas');
+      sel => { taskState.area = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Areas', null, true);
     if (!menuOpen('tf-type-menu')) renderCheckMenu($('tf-type-menu'), optsFor('type'), taskState.type,
       sel => { taskState.type = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Types',
       (row, opt) => {
@@ -5382,14 +5750,14 @@
         row.appendChild(document.createTextNode(' '));
         row.appendChild(chip);
         row.appendChild(document.createTextNode(' ' + opt));
-      });
+      }, true);
     if (!menuOpen('tf-person-menu')) renderCheckMenu($('tf-person-menu'), optsFor('person'), taskState.person,
-      sel => { taskState.person = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All People');
+      sel => { taskState.person = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All People', null, true);
     if (!menuOpen('tf-project-menu')) renderCheckMenu($('tf-project-menu'), optsFor('project'), taskState.project,
-      sel => { taskState.project = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Projects');
+      sel => { taskState.project = sel; saveTaskState(); renderTasks(lastTasks); }, noneLabel, 'All Projects', null, true);
     const flagOpts = (() => { const set = new Set(flagPresets); tasks.forEach(t => (Array.isArray(t.flags) ? t.flags : []).forEach(f => f && set.add(f))); const arr = Array.from(set).sort(); return arr.concat(tasks.some(t => !(Array.isArray(t.flags) && t.flags.length)) ? ['__none__'] : []); })();
     if (!menuOpen('tf-flag-menu')) renderCheckMenu($('tf-flag-menu'), flagOpts, taskState.flags,
-      sel => { taskState.flags = sel; saveTaskState(); renderTasks(lastTasks); }, v => v === '__none__' ? '(no flag)' : ('🚩 ' + v), 'All Flags');
+      sel => { taskState.flags = sel; saveTaskState(); renderTasks(lastTasks); }, v => v === '__none__' ? '(no flag)' : ('🚩 ' + v), 'All Flags', null, true);
     buildDateMenu();
     setFilterBtn($('tf-status'), taskState.status, 'Status', prettyStatus);
     setFilterBtn($('tf-area'), taskState.area, 'Area', noneLabel);

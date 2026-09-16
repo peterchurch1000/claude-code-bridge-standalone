@@ -66,7 +66,12 @@ const fs = require('fs');
   if (!ROOMVIEW_PORT) {
     try { ROOMVIEW_PORT = fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'roomview-port'), 'utf8').trim(); } catch {}
   }
-  const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-8';
+  // Model resolution: CLAUDE_MODEL env override -> ~/.claude/settings.json "model" -> default.
+  // settings.json is the single source of truth (edit it or use /model); the chat --model and
+  // the UI model badge both derive from CLAUDE_MODEL below.
+  let SETTINGS_MODEL = '';
+  try { SETTINGS_MODEL = (JSON.parse(fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'settings.json'), 'utf8')).model || '').trim(); } catch {}
+  const CLAUDE_MODEL = process.env.CLAUDE_MODEL || SETTINGS_MODEL || 'claude-opus-4-8';
   // Credential steward: canonical refresh tokens never enter Claude room homes;
   // Codex (which requires a refresh token) runs one short turn at a time under
   // the per-account flock. Set to 0 for an immediate legacy-path rollback.
@@ -2414,6 +2419,11 @@ const GENERAL_ASSISTANT_PROMPT =
 function userMsgJSON(text) {
   return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n';
 }
+// [ASK_QUESTION_V1] A user turn answering a pending tool_use MUST lead with a tool_result
+// for that id — plain text is not a valid answer to a blocked AskUserQuestion call.
+function toolResultJSON(id, content) {
+  return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: String(content) }] } }) + '\n';
+}
 
 // Translate one Codex `exec --json` event into the bridge's normalised UI messages
 // (the SAME shapes the Claude stream parser emits), so everything downstream — UI,
@@ -2560,6 +2570,114 @@ const CONF_HARD_ROUND_CAP = 16;   // [CONFERENCE_CAP16] was 8
 function confFile(key) { return path.join(CONF_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
 function confLoad(key) { try { return JSON.parse(fs.readFileSync(confFile(key), 'utf8')); } catch { return null; } }
 function confSave(S) { if (!S || !S.conf) return; try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.writeFileSync(confFile(S.key), JSON.stringify(S.conf)); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confSave failed:', e.message); } }
+
+// ── [CONF_ROOM_ASSOC_V1] Auto-register a promoted conference room into its linked task ──
+// One-way link fix: when a conference is linked to a task, register the room's CANONICAL
+// (promoted, non-draft) key into the task's task_rooms list via the Laravel bridge API,
+// reusing the per-pane service JWT. Idempotent, tuple-tracked (survives rekey/task change),
+// manual-delete-safe (registers once per (task,room) tuple), durably reconciled.
+function confRoomLabel(c) {
+  try {
+    const lines = String((c && c.brief) || '').split('\n').map(s => s.trim()).filter(Boolean);
+    const nice = lines.find(s => !/^https?:\/\//i.test(s) && !s.startsWith('draft-'));
+    if (nice) return nice.slice(0, 200);
+    if (c && c.task && c.task.title) return String(c.task.title).slice(0, 200);
+  } catch {}
+  return 'Conference room';
+}
+function confRegisterRoom(S) {
+  try {
+    const c = S && S.conf;
+    if (!c || !c.task || !c.task.file) return;
+    if (!/^task-[a-z0-9-]+\.md$/.test(String(c.task.file))) return;
+    const key = S.key;
+    if (!key || String(key).startsWith('draft-')) return;   // only canonical, shareable keys
+    if (c.roomAssoc && c.roomAssoc.taskFile === c.task.file && c.roomAssoc.roomKey === key) return; // once per tuple
+    if (S._roomRegInFlight) return;                          // concurrency guard (one in-flight per session)
+    const jwt = bridgeTaskJwt();
+    if (!jwt) return;                                        // no auth yet — a later reconcile retries
+    S._roomRegInFlight = true;
+    const label = confRoomLabel(c);
+    const url = BRIDGE_TASK_API + '/' + encodeURIComponent(c.task.file) + '/rooms';
+    fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' }, body: JSON.stringify({ room_key: key, label }) })
+      .then(async (r) => {
+        S._roomRegInFlight = false;
+        if (r.ok) {
+          let rid = null; try { const j = await r.json(); rid = (j && j.rid) || null; } catch {}
+          c.roomAssoc = { taskFile: c.task.file, taskId: (c.task.id || null), roomKey: key, rid, at: Date.now() };
+          c.roomAssocPending = null;
+          try { confSave(S); } catch {}
+          console.log('[Bridge] [CONF_ROOM_ASSOC_V1] registered room', key, '-> task', c.task.file);
+        } else {
+          c.roomAssocPending = { taskFile: c.task.file, roomKey: key, attempts: (((c.roomAssocPending || {}).attempts) || 0) + 1, nextAt: Date.now() + 300000, lastStatus: r.status };
+          try { confSave(S); } catch {}
+          console.log('[Bridge] [CONF_ROOM_ASSOC_V1] register HTTP', r.status, 'task', c.task.file);
+        }
+      })
+      .catch((e) => {
+        S._roomRegInFlight = false;
+        c.roomAssocPending = { taskFile: c.task.file, roomKey: key, attempts: (((c.roomAssocPending || {}).attempts) || 0) + 1, nextAt: Date.now() + 30000 };
+        try { confSave(S); } catch {}
+        console.log('[Bridge] [CONF_ROOM_ASSOC_V1] register error', e && e.message);
+      });
+  } catch (e) { try { S._roomRegInFlight = false; } catch {} }
+}
+// Generalised draft->canonical promotion (mirrors the Claude init rekey) so a Codex-lead
+// conference also moves off its draft key. No-op unless S.key is a draft key. Conference
+// state is migrated atomically (canonical first, then inert tombstone), fail-closed on
+// conflict — identical semantics to the Claude path.
+function promoteRoomKey(S, canonicalId) {
+  if (!S || !canonicalId) return;
+  if (!(S.key && S.key !== canonicalId && String(S.key).startsWith('draft-'))) return;
+  const _oldKey = S.key;
+  const _existing = clientSessions.get(canonicalId);
+  if (_existing && _existing !== S) { console.log('[Bridge] [CONF_ROOM_ASSOC_V1] promote collision — keeping draft key', _oldKey, 'wanted', canonicalId); return; }
+  clientSessions.delete(S.key);
+  S.key = canonicalId;
+  clientSessions.set(S.key, S);
+  if (S.conf) {
+    try {
+      const _canonFile = confFile(canonicalId);
+      let _conflict = false;
+      try { const _ex = JSON.parse(fs.readFileSync(_canonFile, 'utf8'));
+        if (_ex && (_ex.status === 'running' || _ex.status === 'paused') &&
+            (Array.isArray(_ex.log) ? _ex.log.length : 0) !== (Array.isArray(S.conf.log) ? S.conf.log.length : 0)) _conflict = true; } catch (e) {}
+      if (_conflict) {
+        console.log('[Bridge] [CONF_ROOM_ASSOC_V1] rekey conflict — pausing', _oldKey, '->', canonicalId);
+        S.conf.status = 'paused'; S.conf.activeTurnId = null;
+        S.conf.pausedReason = 'Recovery: conflicting conference state during room promotion. Resume to continue.';
+      }
+      fs.mkdirSync(CONF_DIR, { recursive: true });
+      fs.writeFileSync(_canonFile, JSON.stringify(S.conf));
+      fs.writeFileSync(confFile(_oldKey), JSON.stringify({ status: 'superseded', supersededBy: canonicalId, ts: Date.now() }));
+      confClearDenials(_oldKey);
+    } catch (e) { console.log('[Bridge] [CONF_ROOM_ASSOC_V1] conf migrate failed:', e.message); }
+  }
+  try { if (chatData[_oldKey]) { chatData[canonicalId] = chatData[_oldKey]; delete chatData[_oldKey]; saveChatData(); } } catch (_) {}
+  if (roomStack) { try { roomStack.rekey(_oldKey, canonicalId); } catch {} }
+  if (ROOMVIEW_PORT && SHIM_PORT) { try { fetch(`http://127.0.0.1:${SHIM_PORT}/admin/rekey/${encodeURIComponent(_oldKey)}/${encodeURIComponent(canonicalId)}`, { method: 'POST' }).catch(() => {}); } catch {} }
+  clearPending(_oldKey);
+}
+// Boot/periodic reconciliation: attempt any conference whose linked task has no confirmed
+// association yet (canonical key only). Uses the live session object when present so the
+// in-flight guard is shared; otherwise a minimal stub that still persists via confSave.
+function confReconcileRegistrations() {
+  let files = [];
+  try { files = fs.existsSync(CONF_DIR) ? fs.readdirSync(CONF_DIR).filter(f => f.endsWith('.json')) : []; } catch { return; }
+  for (const f of files) {
+    let c; try { c = JSON.parse(fs.readFileSync(path.join(CONF_DIR, f), 'utf8')); } catch { continue; }
+    if (!c || c.status === 'superseded' || !c.task || !c.task.file) continue;
+    const key = f.replace(/\.json$/, '');
+    if (String(key).startsWith('draft-')) continue;
+    if (c.roomAssoc && c.roomAssoc.taskFile === c.task.file && c.roomAssoc.roomKey === key) continue;
+    if (c.roomAssocPending && Date.now() < (c.roomAssocPending.nextAt || 0)) continue;
+    const existing = clientSessions.get(key);
+    const S = existing || { key, conf: c, send: () => {} };
+    if (!existing) S.conf = c;
+    try { confRegisterRoom(S); } catch {}
+  }
+}
+
 // [CONF_CONTAINED_V1] Mirror a conference's user-visible content (brief + both-engine log)
 // into the room's OWN store so the room is self-contained and survives deletion of the
 // operational side-file. The server is the sole writer of a conference record.
@@ -2668,7 +2786,7 @@ function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.
 function confSendStatus(S) {
   if (!S || !S.conf) return;
   const c = S.conf;
-  S.send({ type: 'conf_status', task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
+  S.send({ type: 'conf_status', task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
            round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
            leadEngine: c.leadEngine, reviewEngine: c.reviewEngine, nextEngine: c.nextEngine, reason: c.pausedReason || null });
 }
@@ -2677,7 +2795,8 @@ function confSendStatus(S) {
 // Stages run in a fixed order; discussion stages (diagnosis, solution_design)
 // require BOTH engines to approve before advancing, and are hard read-only.
 const CONF_STAGES = ['diagnosis', 'solution_design', 'implementation', 'verification', 'final'];
-function confStageLabel(st) {
+function confStageLabel(st, taskType) {
+  if (st === 'diagnosis' && taskType === 'feature') return 'Requirements';   // [CONF_TASKTYPE_V1]
   return ({ diagnosis: 'Diagnosis', solution_design: 'Solution design', implementation: 'Implementation',
             verification: 'Verification', final: 'Final synthesis' })[st] || String(st || '');
 }
@@ -2695,7 +2814,7 @@ function confLogToMessages(c) {
   if (_brief.trim()) out.push({ type: 'user', text: _brief });
   for (const e of ((c && c.log) || [])) {
     out.push({ type: 'assistant', engine: e.engine || null, role: e.role || null,
-               stage: e.stage || null, stageLabel: confStageLabel(e.stage), round: e.round || null,
+               stage: e.stage || null, stageLabel: confStageLabel(e.stage, c.taskType), round: e.round || null,
                turnId: e.turnId || null, text: e.text || '' });
   }
   return out;
@@ -2738,29 +2857,62 @@ function confRolePreamble(S, engine) {
   const isLead = (engine === c.leadEngine);
   const partner = (engine === 'claude') ? 'Codex' : 'Claude';
   const stage = c.stage;
+  const isFeature = (c.taskType === 'feature');   // [CONF_TASKTYPE_V1]
   let s = 'You are collaborating with ' + partner + ' in a shared, STAGED "conference" to solve ONE objective. ' +
     'You share the same workspace and browser and take strict turns (never simultaneously). ' +
     'The conference proceeds through fixed stages: diagnosis -> solution_design -> implementation -> verification -> final. ' +
-    'You are in the "' + stage + '" stage (' + confStageLabel(stage) + '), round ' + c.round + ' of up to ' + c.maxRounds + '. ' +
+    'You are in the "' + stage + '" stage (' + confStageLabel(stage, c.taskType) + '), round ' + c.round + ' of up to ' + c.maxRounds + '. ' +
     'Continue directly; do not re-introduce yourself or restate the whole objective.\n\n';
+
+  // [CONF_TASKTYPE_V1] Announce the (auto-)detected task type once, up front, and require
+  // confirmation instead of a silent assumption. The verdict "stage" token stays "diagnosis".
+  if (stage === 'diagnosis' && c.round === 1) {
+    s += 'TASK TYPE: this conference is classified as a ' + (isFeature ? 'FEATURE (new capability — nothing is broken)' : 'FIX (a problem/defect to correct)') + ' task' +
+      (c.taskTypeAuto ? (' \u2014 auto-detected (' + (c.taskTypeConfidence || 'medium') + ' confidence)') : ' \u2014 set explicitly') + '. ' +
+      (isFeature ? 'If this is actually a fix, say so before doing deep work.'
+                 : 'If this is actually a new feature, say so before doing deep work.') +
+      ((c.taskTypeAuto && c.taskTypeConfidence === 'low')
+        ? ' Confidence is LOW: if the correct type is not obvious from the objective, as LEAD briefly confirm it with the user (verdict "blocked") before proceeding.'
+        : '') + '\n\n';
+  }
 
   const readOnly = 'HARD RULE for this stage: you are in READ-ONLY mode. Do NOT edit files, run mutating shell commands, ' +
     'deploy, restart services, or mutate the browser (navigate/click/type/press/upload/eval/close). The bridge ENFORCES ' +
     'this: those tools are disabled and any attempt is blocked and PAUSES the conference for the user. Investigate only by ' +
     'read-only means (read files, search, read logs, read-only browser snapshots/screenshots) and reason carefully. ';
 
-  if (stage === 'diagnosis') {
-    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the ROOT CAUSE only — propose no fixes yet. ';
+  // [CONF_TASKTYPE_V1] Universal in both modes: never fabricate the user's intent.
+  const noInvent = ' UNIVERSAL RULE: never invent the user\'s intent. If the intended behaviour or scope is ambiguous or ' +
+    'unspecified, STOP and ask the user (set verdict "blocked") rather than agreeing on an assumption.';
+
+  if (stage === 'diagnosis' && isFeature) {
+    s += readOnly + '\n\nGoal of THIS stage (REQUIREMENTS): reach CONSENSUS on WHAT should be built — scope, explicit ' +
+      'acceptance criteria, non-goals, constraints, and the user\'s intent. Do NOT design the implementation or propose code yet.' + noInvent + ' ';
+    s += isLead ? 'As LEAD, produce a concrete requirements specification (behaviour + acceptance criteria + non-goals) for the reviewer to check.'
+                : 'As REVIEWER, challenge missing or ambiguous requirements and any intent assumed rather than stated by the user; approve only when the spec is complete and unambiguous.';
+  } else if (stage === 'diagnosis') {
+    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the ROOT CAUSE only — propose no fixes yet.' + noInvent + ' ';
     s += isLead ? 'As LEAD, present an evidence-based root-cause analysis for the reviewer to check.'
                 : 'As REVIEWER, independently verify the LEAD\'s root-cause analysis and challenge anything weak or unproven.';
+  } else if (stage === 'solution_design' && isFeature) {
+    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the DESIGN only — do NOT implement anything yet. Design the ' +
+      'behaviour, interface/API, data model and UX so that every agreed acceptance criterion is satisfied; trace the design back to the requirements.' + noInvent + ' ';
+    s += isLead ? 'As LEAD, propose a concrete design + implementation plan (steps, files, tests) that meets the agreed requirements.'
+                : 'As REVIEWER, scrutinise the design for gaps against the requirements, risks and bypasses; approve only if it is sound and complete.';
   } else if (stage === 'solution_design') {
-    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the SOLUTION DESIGN/plan only — do NOT implement anything yet. ';
+    s += readOnly + '\n\nGoal of THIS stage: reach CONSENSUS on the SOLUTION DESIGN/plan only — do NOT implement anything yet.' + noInvent + ' ';
     s += isLead ? 'As LEAD, propose a concrete plan (steps, files, tests) to fix the agreed root cause.'
                 : 'As REVIEWER, scrutinise the plan for gaps, risks and bypasses; approve only if it is sound and complete.';
   } else if (stage === 'implementation') {
-    s += 'You now have CONSENSUS on the root cause AND the plan. This stage is WRITE-ENABLED. ' +
+    s += 'You now have CONSENSUS on the ' + (isFeature ? 'requirements AND the design' : 'root cause AND the plan') + '. This stage is WRITE-ENABLED. ' +
       'As LEAD, implement the agreed plan concretely (make the changes, run what you need). Stay within the agreed plan; ' +
       'if you find the plan is wrong, set verdict "blocked" and explain rather than improvising a different design.';
+  } else if (stage === 'verification' && isFeature) {
+    s += 'This stage is INDEPENDENT VERIFICATION by the reviewer, in READ-ONLY mode (no edits/deploys/browser mutation). ' +
+      'A disposable write-sandbox is NOT available here, so run only static and read-only checks; wherever a check would ' +
+      'REQUIRE execution or mutation you cannot perform, explicitly REPORT THE PROOF GAP rather than assuming success. ' +
+      'As REVIEWER, verify the implementation against EACH agreed acceptance criterion from the requirements stage. Approve only if ' +
+      'every criterion is demonstrably met; otherwise set "revise" with the specific unmet criteria.';
   } else if (stage === 'verification') {
     s += 'This stage is INDEPENDENT VERIFICATION by the reviewer, in READ-ONLY mode (no edits/deploys/browser mutation). ' +
       'A disposable write-sandbox is NOT available here, so run only static and read-only checks; wherever a check would ' +
@@ -2848,7 +3000,7 @@ function confDispatch(S, reuseTurnId, opts) {
   confClearDenials(S.key);   // fresh denial window for this turn
   confSave(S);
   S.send({ type: 'conf_turn', engine, role: (engine === c.leadEngine ? 'lead' : 'reviewer'),
-           stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase, round: c.round,
+           stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase, round: c.round,
            turnId, restriction: confRestrictionMode(c) });
   confSendStatus(S);
   try { S.sendToEngine(engine, prompt); }
@@ -2984,6 +3136,26 @@ function confResumeRetries() {
   }
 }
 
+// [CONF_TASKTYPE_V1] Auto-classify a conference brief as a 'fix' or a 'feature' via a
+// zero-cost keyword heuristic. Returns { type:'fix'|'feature', confidence, auto:true }.
+// Deliberately NOT a silent default: the lead announces the detected type on the first
+// turn and confirms with the user when confidence is low (see confRolePreamble).
+const _CONF_FIX_RE = /\b(fix(es|ed|ing)?|bug|broken|break(s|ing)?|errors?|crash(es|ed|ing)?|regress(ion|ed)?|fail(s|ed|ing|ure)?|not working|does ?n'?t work|does not work|wrong|incorrect|stuck|hang(s|ing)?|freeze|glitch|defect|misbehav\w*|stack trace|exception|throws?|debug|troubleshoot|broke)\b/gi;
+const _CONF_FEAT_RE = /\b(add|adds|adding|new|implement(s|ing|ation)?|build(s|ing)?|create(s|d|ing)?|introduce|support for|feature|enhance(ment)?|enabl(e|ing)|integrat(e|ion)|extend|redesign|ability to|make it possible|so that (i|we|users|it) can)\b/gi;
+function confClassifyTaskType(brief) {
+  const t = String(brief || '');
+  const fixHits = (t.match(_CONF_FIX_RE) || []).length;
+  const featHits = (t.match(_CONF_FEAT_RE) || []).length;
+  let type, confidence;
+  if (fixHits === 0 && featHits === 0) { type = 'fix'; confidence = 'low'; }
+  else if (fixHits === featHits) { type = 'feature'; confidence = 'low'; }   // tie: lean feature but flag low so the lead confirms
+  else {
+    type = (fixHits > featHits) ? 'fix' : 'feature';
+    confidence = (Math.abs(fixHits - featHits) >= 2) ? 'high' : 'medium';
+  }
+  return { type, confidence, auto: true };
+}
+
 function confStart(S, brief, opts) {
   opts = opts || {};
   const lead = (opts.leadEngine === 'codex') ? 'codex'
@@ -2992,11 +3164,15 @@ function confStart(S, brief, opts) {
   const review = lead === 'claude' ? 'codex' : 'claude';
   let maxRounds = parseInt(opts.maxRounds, 10);
   if (!(maxRounds >= 1 && maxRounds <= CONF_HARD_ROUND_CAP)) maxRounds = CONF_MAX_ROUNDS_DEFAULT;
+  const _ttOverride = (opts.taskType === 'fix' || opts.taskType === 'feature')   // [CONF_TASKTYPE_V1]
+    ? { type: opts.taskType, confidence: 'high', auto: false } : null;
+  const _tt = _ttOverride || confClassifyTaskType(brief);
   S.conf = {
     version: 2, status: 'running',
     stage: 'diagnosis', subphase: 'lead', round: 1, maxRounds,
     leadEngine: lead, reviewEngine: review, nextEngine: lead,
     brief: String(brief || '').slice(0, 20000),
+    taskType: _tt.type, taskTypeConfidence: _tt.confidence, taskTypeAuto: _tt.auto,   // [CONF_TASKTYPE_V1]
     task: (opts.task || null), startReqId: (typeof opts.reqId === 'string' ? opts.reqId : null),
     activeTurnId: null, log: [], stageVerdicts: {}, lastByEngine: {}, pendingInterject: [],
     spawnRetries: 0, pendingRetry: null, retryGen: 0,   // [CONF_CRED_RETRY_V1]
@@ -3006,9 +3182,10 @@ function confStart(S, brief, opts) {
   confClearDenials(S.key);
   confSave(S);
   confMirrorToChat(S.key, S.conf);   // [CONF_CONTAINED_V1]
-  console.log('[Bridge] [CONFERENCE_V2] start room', S.key, 'lead=' + lead, 'rounds=' + maxRounds);
-  S.send({ type: 'conf_started', reqId: S.conf.startReqId || null, task: S.conf.task || null, leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief,
-           stage: 'diagnosis', stageLabel: confStageLabel('diagnosis') });
+  console.log('[Bridge] [CONFERENCE_V2] start room', S.key, 'lead=' + lead, 'rounds=' + maxRounds, 'taskType=' + _tt.type + '/' + _tt.confidence);
+  S.send({ type: 'conf_started', reqId: S.conf.startReqId || null, task: S.conf.task || null, leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief, taskType: _tt.type,
+           stage: 'diagnosis', stageLabel: confStageLabel('diagnosis', _tt.type) });
+  try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1] already-real room fast path
   confDispatch(S);
 }
 
@@ -3045,13 +3222,13 @@ function confTryStart(S, brief, msg) {
     confSendStatus(S);
     if (Array.isArray(c.log) && c.log.length) {
       S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c),
-               status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage), subphase: c.subphase,
+               status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
                round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
     } else {
       S.send({ type: 'conf_started', reqId: c.startReqId || null, task: c.task || null, leadEngine: c.leadEngine,
                reviewEngine: c.reviewEngine, maxRounds: c.maxRounds, brief: c.brief,
-               stage: c.stage, stageLabel: confStageLabel(c.stage) });
+               stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType) });
     }
     return;
   }
@@ -3062,7 +3239,7 @@ function confTryStart(S, brief, msg) {
   if (!confValidReqId(reqId)) { S.send({ type: 'conf_need_task', reason: 'reqid', reqId: (typeof reqId === 'string' ? reqId : null) }); return; }
   const dec = confCanonicalTask(msg && msg.taskDecision, msg && msg.task);
   if (dec.status === 'invalid') { S.send({ type: 'conf_need_task', reason: 'task', reqId: reqId }); return; }
-  confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId });
+  confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId, taskType: msg && msg.taskType });   // [CONF_TASKTYPE_V1]
 }
 
 function confInterject(S, text) {
@@ -3102,7 +3279,7 @@ function confResume(S) {
     confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
     // Repaint the authoritative log so the retracted conclusion disappears everywhere.
     if (Array.isArray(c.log) && c.log.length) {
-      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
+      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
                subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
     }
@@ -3125,7 +3302,7 @@ function confStop(S) {
 function confPolicyPause(S, detail) {
   const c = S.conf; if (!c) return;
   c.status = 'paused';
-  c.pausedReason = 'Policy: a disallowed action was blocked during ' + confStageLabel(c.stage) +
+  c.pausedReason = 'Policy: a disallowed action was blocked during ' + confStageLabel(c.stage, c.taskType) +
     (detail ? ' (' + detail + ')' : '') + '. The conference was paused for your review.';
   c.activeTurnId = null; S._confTurnId = null; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;
   confSave(S); confPushConclusion(S, c.pausedReason); confSendStatus(S);
@@ -3143,7 +3320,7 @@ function confComposeConclusion(c, reason) {
   const parts = [];
   parts.push('## 🏁 Conference concluded (automatic summary)');
   parts.push(reason || c.pausedReason || 'The conference ended before a verified final synthesis.');
-  if (stagesSeen.length) parts.push('**Progress:** ' + stagesSeen.map(confStageLabel).join(' → ') + ' · reached **' + confStageLabel(c.stage) + '**.');
+  if (stagesSeen.length) parts.push('**Progress:** ' + stagesSeen.map(confStageLabel).join(' → ') + ' · reached **' + confStageLabel(c.stage, c.taskType) + '**.');
   parts.push('_No verified Final synthesis was produced, so this is a deterministic summary. The full turn-by-turn discussion is above; resume the conference to continue, adjust the brief, or stop._');
   return parts.join('\n\n');
 }
@@ -3160,7 +3337,7 @@ function confPushConclusion(S, reason) {
                round: c.round, text, verdict: null, verdictStage: null, ts: Date.now() });
   confSave(S);
   S.send({ type: 'conf_msg', turnId, engine: c.leadEngine, role: 'conclusion', stage: c.stage,
-           stageLabel: confStageLabel(c.stage), subphase: c.subphase, round: c.round, text,
+           stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase, round: c.round, text,
            verdict: null, remainingIssues: [] });
 }
 
@@ -3193,7 +3370,7 @@ function confAdvance(S, engine, verdict, meta) {
   meta = meta || {};
   if (verdict === 'blocked') {
     c.status = 'paused'; c.activeTurnId = null;
-    c.pausedReason = 'An engine reported it is blocked during ' + confStageLabel(c.stage) + ' and needs your input.';
+    c.pausedReason = 'An engine reported it is blocked during ' + confStageLabel(c.stage, c.taskType) + ' and needs your input.';
     confSave(S); confPushConclusion(S, c.pausedReason); confSendStatus(S); S.send({ type: 'done', code: 0 });
     return true;
   }
@@ -3212,11 +3389,11 @@ function confAdvance(S, engine, verdict, meta) {
         enterStage(c.stage === 'diagnosis' ? 'solution_design' : 'implementation');
       } else {
         c.round++;
-        if (c.round > CONF_HARD_ROUND_CAP) { c.pausedReason = 'Hard round cap reached in ' + confStageLabel(c.stage) + '.'; return hardCapStop(); }
+        if (c.round > CONF_HARD_ROUND_CAP) { c.pausedReason = 'Hard round cap reached in ' + confStageLabel(c.stage, c.taskType) + '.'; return hardCapStop(); }
         // Return to the LEAD so a resume makes forward progress (not re-run the reviewer).
         c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {};
         if (c.round > c.maxRounds) {
-          pauseNoConsensus('No consensus reached in ' + confStageLabel(c.stage) + ' within ' + c.maxRounds +
+          pauseNoConsensus('No consensus reached in ' + confStageLabel(c.stage, c.taskType) + ' within ' + c.maxRounds +
             ' rounds. Resume to let the lead try again, adjust the brief, or stop.');
           return true;
         }
@@ -3289,7 +3466,7 @@ function confFinishTurn(S, engine) {
   c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;   // [CONF_CRED_RETRY_V1]
   confSave(S);   // persist response + cleared active turn BEFORE advancing
   confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
-  S.send({ type: 'conf_msg', turnId, engine, role, stage: c.stage, stageLabel: confStageLabel(c.stage),
+  S.send({ type: 'conf_msg', turnId, engine, role, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
            subphase: c.subphase, round: c.round, text: parsed.visible, verdict: parsed.verdict.verdict, remainingIssues: parsed.verdict.remainingIssues });
   // [CONFERENCE_V2] If the shim blocked a disallowed mutation during this turn, pause (fail-closed, visible).
   const denials = confReadDenials(S.key);
@@ -3307,9 +3484,10 @@ function confRecover(S) {
   if (disk.status === 'superseded') return;   // inert tombstone from an atomic rekey
   if (!S.conf) S.conf = disk;
   const c = S.conf;
+  try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
   confSendStatus(S);
   if (Array.isArray(c.log) && c.log.length) {
-    S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage),
+    S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
              subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
              leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
   }
@@ -3641,12 +3819,24 @@ function makeSession(key) {
           S.send({ type: 'session_id', id: S.sessionId });
           journalPending(S);   // upgrade the journal now that we have the real session id
           persistRoom(S);   // [CODEX_DURABLE_V2]
+          try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
         }
 
         if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) {   // [CONFERENCE_V1] capture this turn's text server-side
           if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
             for (const b of ev.message.content) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; }
           } else if (ev.type === 'result' && typeof ev.result === 'string' && ev.result) { S.conf._acc = ev.result; }
+        }
+        // [ASK_QUESTION_V1] Register outstanding AskUserQuestion tool calls, keyed to the
+        // emitting process identity, so a later answer is validated + injected as a proper
+        // tool_result (never stale or fabricated).
+        if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+          for (const _b of ev.message.content) {
+            if (_b && _b.type === 'tool_use' && _b.name === 'AskUserQuestion' && _b.id) {
+              if (!S.pendingQuestions) S.pendingQuestions = new Map();
+              S.pendingQuestions.set(_b.id, { proc });
+            }
+          }
         }
         // [CONFERENCE_HISTORY_V1] Tag conference stream chunks with the active turn id
         // so the client can reconcile the live preview bubble by stable identity.
@@ -3688,6 +3878,8 @@ function makeSession(key) {
       if (S.currentProc !== proc) return;
       S.clearWatch();
       S.currentProc = null;   // detach before any routing
+      // [ASK_QUESTION_V1] the process that asked is gone — expire its pending questions.
+      if (S.pendingQuestions) { for (const [_qid, _e] of S.pendingQuestions) { if (_e && _e.proc === proc) S.pendingQuestions.delete(_qid); } }
       const wasProcessing = S.processing;
       S.processing = false;
 
@@ -3885,7 +4077,7 @@ function makeSession(key) {
           errors.failed((ev.error && ev.error.message) || ev.message || '');
         }
         for (const m of parseCodexEvent(ev)) {
-          if (m.kind === 'session') { S.threadId = m.id; persistRoom(S); confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null); S.send({ type: 'session_id', id: m.id }); }  // [CODEX_DURABLE_V2]
+          if (m.kind === 'session') { if (S.conf) { try { promoteRoomKey(S, m.id); } catch (e) {} } S.threadId = m.id; persistRoom(S); confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null); S.send({ type: 'session_id', id: m.id }); try { confRegisterRoom(S); } catch (e) {} }  // [CODEX_DURABLE_V2] [CONF_ROOM_ASSOC_V1]
           else if (m.kind === 'stream') { if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null }); }
           else if (m.kind === 'result' && m.usage) {
             // cached_input_tokens is a subset of input_tokens in Codex usage.
@@ -4276,6 +4468,25 @@ wss.on('connection', (ws) => {
           console.error('[Bridge] History save error:', e.message);
         }
       }
+    } else if (msg.type === 'question_answer') {
+      // [ASK_QUESTION_V1] Validate against the authoritative registry (id must be outstanding
+      // AND emitted by the CURRENT live process), consume atomically, inject a tool_result.
+      const _qid = (typeof msg.tool_use_id === 'string') ? msg.tool_use_id : null;
+      if (typeof msg.roomId === 'string' && msg.roomId && S && S.key !== msg.roomId.slice(0, 80)) {
+        detach(ws, S); attach(ws._clientId, msg.roomId.slice(0, 80));
+      }
+      const _entry = (_qid && S && S.pendingQuestions) ? S.pendingQuestions.get(_qid) : null;
+      const _qproc = _entry && _entry.proc;
+      if (_entry && _qproc && _qproc === S.currentProc && !_qproc.killed && _qproc.stdin && _qproc.stdin.writable) {
+        S.pendingQuestions.delete(_qid);   // atomic consume
+        let _content;
+        try { _content = JSON.stringify(msg.answers || {}); } catch (e) { _content = String(msg.answers || ''); }
+        try { _qproc.stdin.write(toolResultJSON(_qid, _content)); S.send({ type: 'question_ack', tool_use_id: _qid }); }
+        catch (e) { console.error('[Bridge] question_answer write failed:', e.message); S.send({ type: 'question_expired', tool_use_id: _qid }); }
+      } else {
+        if (_qid && S && S.pendingQuestions) S.pendingQuestions.delete(_qid);
+        S.send({ type: 'question_expired', tool_use_id: _qid });
+      }
     }
   });
 
@@ -4329,4 +4540,6 @@ server.listen(BRIDGE_PORT, '0.0.0.0', () => {
   // host was restarted to activate a fix. Deferred so sendToEngine has a live server.
   setTimeout(() => { try { confResumeActivations(); } catch (e) { console.log('[Bridge] [CONF_ACTIVATION_V1] resume sweep failed:', e.message); } }, 1500);
   setTimeout(() => { try { confResumeRetries(); } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] retry sweep failed:', e.message); } }, 1600);
+  setTimeout(() => { try { confReconcileRegistrations(); } catch (e) { console.log('[Bridge] [CONF_ROOM_ASSOC_V1] reconcile sweep failed:', e.message); } }, 1700);
+  setInterval(() => { try { confReconcileRegistrations(); } catch (e) {} }, 600000);
 });
