@@ -132,3 +132,10 @@ start.sh
 start-browser.sh
 auth-server.js
 init-auth.js
+
+# Editing backups (kept on disk, out of git)
+*.bak*
+
+# Stray shell-redirect junk (e.g. "> 000" typos)
+/000
+/200
