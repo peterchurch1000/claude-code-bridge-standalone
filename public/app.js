@@ -688,8 +688,61 @@
   let _suppressSave = false;
   let _pendingConfSync = null;
   function confModeKey(rid) { return 'confmode:' + (rid || currentRoomId); }
-  function confModeOn(rid) { try { return localStorage.getItem(confModeKey(rid)) === '1'; } catch { return false; } }
-  function setConfMode(rid, on) { try { if (on) localStorage.setItem(confModeKey(rid), '1'); else localStorage.removeItem(confModeKey(rid)); } catch {} }
+  function confModeOn(rid) { try { return localStorage.getItem(confModeKey(rid)) === '1' || confAutoOn(rid); } catch { return false; } }   // [CONF_MODE_AUTHORITATIVE_V3]
+  function setConfMode(rid, on) { try { if (on) localStorage.setItem(confModeKey(rid), '1'); else { localStorage.removeItem(confModeKey(rid)); localStorage.removeItem(confAutoKey(rid)); } } catch {} }   // [CONF_MODE_AUTHORITATIVE_V3]
+  // [CONF_MODE_AUTHORITATIVE_V3] The SERVER owns conference state. A client that never
+  // armed conference mode locally (a second device, or a draft room that was promoted to a
+  // session id) must still send its messages as interjections, not as plain chat.
+  //
+  // This ADOPTED flag is deliberately a separate key from the user's explicit
+  // engine-selector choice: adoption is only ever as live as the conference itself, so it
+  // self-clears the moment the server reports a terminal state (stopped / superseded /
+  // idle / done). Without that, Stop could never hand the room back to ordinary chat.
+  function confAutoKey(rid) { return 'confauto:' + (rid || currentRoomId); }
+  function confAutoOn(rid) { try { return localStorage.getItem(confAutoKey(rid)) === '1'; } catch { return false; } }
+  function confAdoptMode(status, rid) {
+    if (rid && rid !== currentRoomId) return;   // never touch another room's flag
+    try {
+      if (status === 'running' || status === 'paused') localStorage.setItem(confAutoKey(currentRoomId), '1');
+      else localStorage.removeItem(confAutoKey(currentRoomId));
+    } catch {}
+  }
+  // Carry BOTH flags across a draft->session rename, each as its own kind (an adopted flag
+  // must not be promoted into a sticky explicit one).
+  function confMigrateMode(oldRid, newRid) {
+    try {
+      if (localStorage.getItem(confModeKey(oldRid)) === '1') { localStorage.setItem(confModeKey(newRid), '1'); localStorage.removeItem(confModeKey(oldRid)); }
+      if (localStorage.getItem(confAutoKey(oldRid)) === '1') { localStorage.setItem(confAutoKey(newRid), '1'); localStorage.removeItem(confAutoKey(oldRid)); }
+    } catch {}
+  }
+  // [CONF_NEEDTASK_RECOVER_V1] Recovery store for a message the server refused to accept
+  // (conf_need_task). Two hard rules: never write into a room other than the one the frame
+  // names, and never overwrite composer text the user typed afterwards.
+  function confDraftKey(rid) { return 'confdraft:' + (rid || currentRoomId); }
+  function confDraftGet(rid) { try { return localStorage.getItem(confDraftKey(rid)) || ''; } catch { return ''; } }
+  function confDraftSet(rid, text) { try { if (text) localStorage.setItem(confDraftKey(rid), text); else localStorage.removeItem(confDraftKey(rid)); } catch {} }
+  // Entering a room offers its saved draft back — but only into an EMPTY composer.
+  function confRestoreDraft(rid) {
+    const t = confDraftGet(rid);
+    if (!t) return;
+    if (inputEl.value.trim()) { showToast('An unsent message for this room is saved as a draft', 'info'); return; }
+    inputEl.value = t; confDraftSet(rid, ''); autoGrowInput();
+    showToast('Restored your unsent message', 'info');
+  }
+  function confRecoverRejected(text, rid) {
+    const t = String(text || '');
+    if (!t.trim()) return;
+    if (rid && rid !== currentRoomId) { confDraftSet(rid, t); return; }   // another room — hold it there, touch nothing here
+    const cur = inputEl.value;
+    if (!cur.trim()) {
+      inputEl.value = t; autoGrowInput(); confDraftSet(rid || currentRoomId, '');
+      showToast('Your message wasn\u2019t sent \u2014 restored to the box', 'warning');
+      return;
+    }
+    if (cur.indexOf(t) !== -1) return;   // duplicate frame, or the user already has it
+    confDraftSet(rid || currentRoomId, t);
+    showToast('Your earlier message wasn\u2019t sent \u2014 saved as a draft for this room', 'warning');
+  }
   function confStripVerdict(t) { return String(t || '').replace(/<<<CONFERENCE_VERDICT[\s\S]*$/, '').replace(/\s+$/, ''); }
   function confEngineLabel(e) { return e === 'codex' ? 'Codex' : 'Claude'; }
   function confEngineIcon(e) { return e === 'codex' ? '\uD83D\uDFE9' : '\uD83D\uDFE6'; }  // 🟩 / 🟦
@@ -772,6 +825,7 @@
     } finally { _suppressSave = false; }
     confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
     activeConf = (msg.status === 'running');
+    confAdoptMode(msg.status, msg.roomId);   // [CONF_MODE_AUTHORITATIVE_V3]
     renderConfBanner();
   }
 
@@ -814,8 +868,96 @@
     confStartGuard = false; confAwaitingAck = false; pendingConfStart = null;
     closeConfTaskModalUI();
   }
+  // >>> TASK_TITLE_HAIKU_V1_BEGIN
+  // A monotonic token. Every teardown or navigation bumps it, so a generation
+  // result that arrives late can tell it has been superseded and stays inert.
+  let _ttGen = 0;
+  function _ttInvalidate() { _ttGen++; }
+  // [TASK_TITLE_HAIKU_V2] Last resort when the server is unreachable. Mirrors the
+  // server heuristic so the Title is never the raw typed sentence (defect #1).
+  const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new').split(' '));
+  function _ttFallback(s) {
+    const raw = String(s || '').replace(/https?:\/\/\S+/g, ' ').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+    if (!raw.length) return '';
+    const content = raw.filter(w => !_TT_STOP.has(w.toLowerCase()));
+    const picked = (content.length ? content : raw).slice(0, 7);
+    return picked.map(function (w) { w = w.toLowerCase(); return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ').slice(0, 80);
+  }
+  function _ttFetch(body) {
+    const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    // [ROOMTASK_HAIKU_V3] the describe call generates two fields, so it gets the longer
+    // client budget; it must always outlive the server's own kill timer (18s).
+    if (ctl) timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, (body && body.describe) ? 22000 : 15000);
+    const done = function (v) { if (timer) { clearTimeout(timer); timer = null; } return v; };
+    return fetch(API_BASE + '/task-title', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined
+    })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) { return done(d || {}); })
+      .catch(function () { return done({}); });
+  }
+  function _ttGenBody(label) {
+    return '<div style="display:flex;align-items:center;gap:10px;padding:18px 4px 22px">' +
+      '<div style="font-size:20px">\u2728</div>' +
+      '<div><div style="font-size:14px;font-weight:600">Generating title\u2026</div>' +
+      '<div style="font-size:12px;opacity:.65;margin-top:2px">' + label + '</div></div></div>';
+  }
+  // Phase 1 for the conference task-association popup. Deliberately renders NO
+  // input, textarea or create button — the form only exists once the data is in.
+  function _confModalGeneratingView() {
+    _ttInvalidate();
+    const myGen = _ttGen;
+    const p = _confPanel(); if (!p) return;
+    const srcText = (pendingConfStart && pendingConfStart.text) ? String(pendingConfStart.text) : '';
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-gback" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Create a new task</div></div>' +
+      _ttGenBody('Summarising your objective in a few words.') +
+      '<div style="text-align:right"><button id="conf-t-gcancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
+    p.querySelector('#conf-t-gback').onclick = function () { _ttInvalidate(); _confModalRootView(); };
+    p.querySelector('#conf-t-gcancel').onclick = function () { closeConfTaskModal(true); };
+    _ttFetch({ text: srcText }).then(function (d) {
+      if (myGen !== _ttGen) return;        // superseded by a teardown / navigation
+      if (!_confPanel()) return;           // modal is gone
+      _confModalCreateView({
+        title: (d.title || d.fallback || _ttFallback(srcText)),
+        description: (d.source || srcText)
+      });
+    });
+  }
+  // Phase 1 for the room -> task "Create task & link" form. [ROOMTASK_HAIKU_V3] the
+  // server anchors on the room's MOST RECENT user comment (with the two before it as
+  // background) and returns a generated title AND description in one call.
+  function _rtGeneratingView() {
+    _ttInvalidate();
+    const myGen = _ttGen;
+    const p = _rtPanelEl(); if (!p) return;
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rt-gback" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Create task &amp; link this room</div></div>' +
+      _ttGenBody('Summarising your most recent request in this room.') +
+      '<div style="text-align:right"><button id="rt-gcancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
+    p.querySelector('#rt-gback').onclick = function () { _ttInvalidate(); _rtPaint(''); };
+    p.querySelector('#rt-gcancel').onclick = _rtClose;
+    _ttFetch({ roomId: String(currentRoomId || ''), describe: true }).then(function (d) {
+      if (myGen !== _ttGen) return;
+      if (!_rtPanelEl()) return;
+      // An empty room is said out loud, never rendered as two silent blank boxes.
+      if (d && d.hasContent === false) { _rtCreateView({ title: '', description: '', empty: true }); return; }
+      _rtCreateView({
+        title: (d.title || d.fallbackTitle || d.fallback || ''),
+        // Last resort covers a MIXED VERSION (new bundle, server not yet restarted):
+        // the old server sends neither field, and `source` is user text in both versions.
+        description: (d.description || d.fallbackDescription || d.source || '')
+      });
+    });
+  }
+  // An Event (a raw onclick handler arg) is not a seed.
+  function _ttSeed(s) { return (s && typeof s === 'object' && typeof s.title === 'string') ? s : null; }
+  // <<< TASK_TITLE_HAIKU_V1_END
   function _confPanel() { return document.getElementById('conf-task-panel'); }
   function closeConfTaskModalUI() {
+    _ttInvalidate();   // TASK_TITLE_HAIKU_V1: covers Escape, backdrop and Cancel
     const m = document.getElementById('conf-task-modal'); if (m) m.remove();
     document.removeEventListener('keydown', _confModalEsc, true);
   }
@@ -861,7 +1003,7 @@
       '</div>' +
       '<div style="margin-top:14px;text-align:right"><button id="conf-t-cancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
     p.querySelector('#conf-t-find').onclick = _confModalFindView;
-    p.querySelector('#conf-t-new').onclick = _confModalCreateView;
+    p.querySelector('#conf-t-new').onclick = _confModalGeneratingView;   // TASK_TITLE_HAIKU_V1
     p.querySelector('#conf-t-none').onclick = function () { submitConfStart('none', null); };
     p.querySelector('#conf-t-cancel').onclick = function () { closeConfTaskModal(true); };
   }
@@ -894,19 +1036,102 @@
       .then(function (d) { all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : []; draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0); })
       .catch(function () { const listEl = p.querySelector('#conf-t-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">Could not load the list. <button id="conf-t-retry" style="cursor:pointer;margin-left:6px;padding:2px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Retry</button></div>'; const rb = listEl.querySelector('#conf-t-retry'); if (rb) rb.onclick = _confModalFindView; } });
   }
-  function _confModalCreateView() {
+  // ── [CONF_TASK_FIELDS_V1] Area + Project on the create-a-task step ──────────
+  // Options are the distinct values already used across tasks — the same source the
+  // Tasks-panel filter menus read (GET /tasks) — plus a blank default and a "New…"
+  // escape hatch. Area/Project values are user-controlled text, so every option is
+  // built through the DOM (new Option sets .text, never parsed as HTML).
+  function _confDistinctValues(list, key) {
+    return Array.from(new Set((list || [])
+      .map(function (x) { return x && x[key]; })
+      .filter(Boolean).map(String)))
+      .sort(function (a, b) { return a.localeCompare(b); });
+  }
+  // A labelled single-choice field: <select> of known values + an inline text input
+  // revealed only when "New…" is chosen. getValue() returns '' when left unset.
+  function _confPickerField(labelText, idPrefix, blankLabel) {
+    const NEW = '\u0000__new__';   // sentinel; cannot collide with a real area/project
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'flex:1 1 180px;min-width:0';
+    const lab = document.createElement('label');
+    lab.style.cssText = 'font-size:12px;opacity:.7;display:block';
+    lab.textContent = labelText;
+    lab.htmlFor = idPrefix + '-sel';
+    const sel = document.createElement('select');
+    sel.id = idPrefix + '-sel';
+    sel.style.cssText = 'width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 0';
+    const inp = document.createElement('input');
+    inp.id = idPrefix + '-new';
+    inp.type = 'text';
+    inp.placeholder = 'New ' + labelText.toLowerCase() + '\u2026';
+    inp.style.cssText = 'display:none;width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:6px 0 0';
+    wrap.appendChild(lab); wrap.appendChild(sel); wrap.appendChild(inp);
+    // Rebuild the option list, preserving the current choice exactly: blank stays
+    // blank, an existing value stays selected, and a half-typed "New…" custom value
+    // is never disturbed (inp.value is untouched here).
+    function populate(values) {
+      const want = sel.value;
+      sel.textContent = '';
+      sel.appendChild(new Option(blankLabel, ''));
+      values.forEach(function (v) { sel.appendChild(new Option(v, v)); });
+      sel.appendChild(new Option('\u2795 New\u2026', NEW));
+      sel.value = want;
+      if (sel.value !== want) sel.value = '';   // prior value vanished -> blank
+      inp.style.display = (sel.value === NEW) ? '' : 'none';
+    }
+    sel.addEventListener('change', function () {
+      const on = sel.value === NEW;
+      inp.style.display = on ? '' : 'none';
+      if (on) { try { inp.focus(); } catch (e) {} } else { inp.value = ''; }
+    });
+    populate([]);
+    return {
+      el: wrap,
+      populate: populate,
+      getValue: function () {
+        const v = (sel.value === NEW) ? inp.value : sel.value;
+        return String(v || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+      }
+    };
+  }
+  function _confModalCreateView(seed) {
     const p = _confPanel(); if (!p) return;
-    const prefill = (pendingConfStart && pendingConfStart.text ? pendingConfStart.text : '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    // TASK_TITLE_HAIKU_V1: the Haiku 5-7 word title, not the raw typed text.
+    seed = _ttSeed(seed);
+    const prefill = String((seed && seed.title) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const prefillDesc = String((seed && seed.description) || '');
     p.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-t-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">\u2190</button><div style="font-size:15px;font-weight:600">Create a new task</div></div>' +
       '<label style="font-size:12px;opacity:.7">Title</label>' +
       '<input id="conf-t-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
       '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
-      '<textarea id="conf-t-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
+      '<textarea id="conf-t-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px;resize:vertical"></textarea>' +
+      '<div id="conf-t-fields" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 12px"></div>' +
       '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="conf-t-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button><button id="conf-t-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Create and start</button></div>' +
       '<div id="conf-t-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
     const titleEl = p.querySelector('#conf-t-title'); titleEl.value = prefill;
-    const descEl = p.querySelector('#conf-t-desc');
+    const descEl = p.querySelector('#conf-t-desc'); descEl.value = prefillDesc;   // TASK_TITLE_HAIKU_V1
+    // [CONF_TASK_FIELDS_V1]
+    const areaField = _confPickerField('Area', 'conf-t-area', '\u2014 No area \u2014');
+    const projField = _confPickerField('Project', 'conf-t-project', '\u2014 No project \u2014');
+    const fieldsEl = p.querySelector('#conf-t-fields');
+    if (fieldsEl) { fieldsEl.appendChild(areaField.el); fieldsEl.appendChild(projField.el); }
+    // Seed synchronously from whatever the Tasks panel already holds (usually
+    // populated, but empty if the panel was never opened), then merge in the full
+    // server list without disturbing the user's selection. A failed refresh simply
+    // leaves the seeded options in place — "New…" can still supply any value.
+    let _seed = []; try { _seed = lastTasks || []; } catch (e) { _seed = []; }
+    areaField.populate(_confDistinctValues(_seed, 'area'));
+    projField.populate(_confDistinctValues(_seed, 'project'));
+    fetch(API_BASE + '/tasks', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) {
+        if (!fieldsEl || !fieldsEl.isConnected) return;   // user navigated away
+        const all = (d && Array.isArray(d.tasks)) ? d.tasks : [];
+        areaField.populate(_confDistinctValues(all, 'area'));
+        projField.populate(_confDistinctValues(all, 'project'));
+      })
+      .catch(function () {});
     p.querySelector('#conf-t-back').onclick = _confModalRootView;
     p.querySelector('#conf-t-cancel2').onclick = function () { closeConfTaskModal(true); };
     const createBtn = p.querySelector('#conf-t-create');
@@ -915,7 +1140,7 @@
       const errEl = p.querySelector('#conf-t-err');
       if (title.length < 3) { if (errEl) errEl.textContent = 'El t\u00edtulo debe tener al menos 3 caracteres.'; return; }
       createBtn.disabled = true; createBtn.textContent = 'Creating\u2026';
-      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim() }) })
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: areaField.getValue(), project: projField.getValue() }) })
         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
         .then(function (res) { if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error'); submitConfStart('linked', { id: String(res.j.id || ''), file: String(res.j.file || ''), title: String(res.j.title || title) }); })
         .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Create and start'; if (errEl) errEl.textContent = 'Could not create the task. Try again.'; });
@@ -1343,9 +1568,10 @@
         appendMsg('user', '\uD83E\uDD1D Conference started \u2014 lead: ' + confEngineLabel(msg.leadEngine) + ', reviewer: ' + confEngineLabel(msg.reviewEngine) + ' (up to ' + msg.maxRounds + ' rounds)');
         break;
       case 'conf_status':
+        confAdoptMode(msg.status, msg.roomId);   // [CONF_MODE_AUTHORITATIVE_V4] every status, INCLUDING idle, settles adopted mode first
         if (msg.status === 'idle') { resetConfUI(); break; }   // [CONFERENCE_ROOMSWITCH_V1] authoritative: no conference in this room
         confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
-        activeConf = (msg.status === 'running'); renderConfBanner();
+        activeConf = (msg.status === 'running'); renderConfBanner();   // [CONF_MODE_AUTHORITATIVE_V4] adoption already applied above
         break;
       case 'conf_turn':
         confStreamEngine = msg.engine;
@@ -1392,6 +1618,8 @@
           confAwaitingAck = false;
           openConfTaskModal(null, true);
           showToast(msg.reason === 'task' ? 'That task no longer exists \u2014 pick another option' : 'Choose a task option to continue', 'warning');
+        } else {
+          confRecoverRejected(msg.text, msg.roomId);   // [CONF_NEEDTASK_RECOVER_V1] no pending start: never drop the words
         }
         break;
       case 'conf_sync':
@@ -1554,6 +1782,10 @@
             try { localStorage.removeItem('bridge_pending_name::' + currentRoomId); } catch {}
             pendingRoomName = '';
           }
+          // [CONF_MODE_MIGRATE_V1] Carry the per-room conference flag across the
+          // draft->session rename. Without this every later message in the room is sent as
+          // plain chat and is lost when the conference repaints the transcript.
+          confMigrateMode(currentRoomId, msg.id);   // [CONF_MODE_MIGRATE_V3]
           PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
@@ -1566,6 +1798,7 @@
           // stop re-pointing. Previously every session_id re-pointed currentRoomId,
           // so switching engines forked a 2nd room (Claude session id -> Codex thread
           // id). Mirror the draft-promote branch: one stable room across engines.
+          confMigrateMode(currentRoomId, msg.id);   // [CONF_MODE_MIGRATE_V4]
           PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
@@ -2888,6 +3121,7 @@
     lastToolEl = null;
     setBusy(false);
     resetConfUI();   // [CONFERENCE_ROOMSWITCH_V1] clear any prior room's conference banner
+    confRestoreDraft(roomKey);   // [CONF_NEEDTASK_RECOVER_V1] hand back anything the server refused here
     hideContextWarning();
     refreshCompactNudge(roomKey);
     storedMsgData        = [];
@@ -2943,6 +3177,7 @@
     messagesEl.innerHTML = ''; _pendingOlder = []; _olderBtn = null; _restoring = false; currentAssistantEl = null; currentAssistantText = '';
     lastToolEl = null; setBusy(false); storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
     resetConfUI();   // [CONFERENCE_ROOMSWITCH_V1] clear any prior room's conference banner
+    confRestoreDraft(name);   // [CONF_NEEDTASK_RECOVER_V1] hand back anything the server refused here
     currentSessionId = prev;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'switch_session', id: name }));   // re-room this socket live
@@ -3054,7 +3289,7 @@
     try { Promise.resolve(typeof loadTasks === 'function' ? loadTasks() : null).then(() => refreshRoomTaskChip()).catch(() => refreshRoomTaskChip()); }
     catch (e) { refreshRoomTaskChip(); }
   }
-  function _rtClose() { const m = document.getElementById('roomtask-modal'); if (m) m.remove(); document.removeEventListener('keydown', _rtEsc, true); }
+  function _rtClose() { _ttInvalidate(); const m = document.getElementById('roomtask-modal'); if (m) m.remove(); document.removeEventListener('keydown', _rtEsc, true); }
   function _rtEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _rtClose(); } }
   function _rtPanelEl() { return document.getElementById('roomtask-panel'); }
   function _rtCurrentFilter() { const s = document.getElementById('rt-search'); return s ? s.value : ''; }
@@ -3127,28 +3362,58 @@
     });
     const s = p.querySelector('#rt-search'); s.value = filter || ''; s.oninput = () => _rtPaint(s.value);
     p.querySelector('#rt-close').onclick = _rtClose;
-    p.querySelector('#rt-new').onclick = _rtCreateView;
+    p.querySelector('#rt-new').onclick = _rtGeneratingView;   // TASK_TITLE_HAIKU_V1
     setTimeout(() => { try { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } catch (e) {} }, 0);
   }
-  function _rtCreateView() {
+  function _rtCreateView(seed) {
     const p = _rtPanelEl(); if (!p) return;
+    seed = _ttSeed(seed);   // TASK_TITLE_HAIKU_V1
     const rid = String(currentRoomId || '');
     p.innerHTML =
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rt-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">←</button><div style="font-size:15px;font-weight:600">Create task & link this room</div></div>' +
+      '<div id="rt-note" style="display:none;font-size:12px;opacity:.75;margin:0 0 10px"></div>' +
       '<label style="font-size:12px;opacity:.7">Title</label>' +
       '<input id="rt-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
       '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
       '<textarea id="rt-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
+      '<div id="rt-fields" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 12px"></div>' +
       '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="rt-cancel2" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button><button id="rt-create" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">Create & link</button></div>' +
       '<div id="rt-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
     p.querySelector('#rt-back').onclick = () => _rtPaint('');
     p.querySelector('#rt-cancel2').onclick = _rtClose;
     const titleEl = p.querySelector('#rt-title'), descEl = p.querySelector('#rt-desc'), cb = p.querySelector('#rt-create'), errEl = p.querySelector('#rt-err');
+    titleEl.value = String((seed && seed.title) || '').replace(/\s+/g, ' ').trim().slice(0, 120);   // TASK_TITLE_HAIKU_V1
+    descEl.value = String((seed && seed.description) || '');
+    // [ROOMTASK_HAIKU_V3] Area + Project, identical to the conference create form:
+    // same picker widget, same option source (distinct values across all tasks), same
+    // blank default and "New..." escape hatch.
+    const areaField = _confPickerField('Area', 'rt-area', '\u2014 No area \u2014');
+    const projField = _confPickerField('Project', 'rt-project', '\u2014 No project \u2014');
+    const fieldsEl = p.querySelector('#rt-fields');
+    if (fieldsEl) { fieldsEl.appendChild(areaField.el); fieldsEl.appendChild(projField.el); }
+    let _rtSeedTasks = []; try { _rtSeedTasks = lastTasks || []; } catch (e) { _rtSeedTasks = []; }
+    areaField.populate(_confDistinctValues(_rtSeedTasks, 'area'));
+    projField.populate(_confDistinctValues(_rtSeedTasks, 'project'));
+    fetch(API_BASE + '/tasks', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) {
+        if (!fieldsEl || !fieldsEl.isConnected) return;   // user navigated away
+        const all = (d && Array.isArray(d.tasks)) ? d.tasks : [];
+        areaField.populate(_confDistinctValues(all, 'area'));
+        projField.populate(_confDistinctValues(all, 'project'));
+      })
+      .catch(function () {});
+    // [ROOMTASK_HAIKU_V3] Never leave the user staring at two blank boxes with no reason.
+    const noteEl = p.querySelector('#rt-note');
+    if (noteEl && seed && seed.empty) {
+      noteEl.textContent = 'This room has no conversation yet \u2014 write the title and description yourself.';
+      noteEl.style.display = '';
+    }
     cb.onclick = () => {
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
       if (title.length < 3) { errEl.textContent = 'El título debe tener al menos 3 caracteres.'; return; }
       cb.disabled = true; cb.textContent = 'Creating…';
-      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim() }) })
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: areaField.getValue(), project: projField.getValue() }) })
         .then(r => r.json().then(j => ({ ok: r.ok, j })))
         .then(res => { if (!res.ok || !res.j || !res.j.file) throw new Error('create'); return _rtPost(res.j.file, rid).then(ok => { if (!ok) throw new Error('link'); showToast('Task created and room linked', 'success'); _rtClose(); _rtSyncChip(); }); })
         .catch(() => { cb.disabled = false; cb.textContent = 'Create & link'; errEl.textContent = 'Could not create/link. Try again.'; });
@@ -4419,6 +4684,39 @@
       });
       inp.addEventListener('blur', () => { if (!done) { done = true; commit(); } });
     }
+    // [CODEX_ACCT_USAGE_V1] Mini 5h/7d meter — same visual language as the main usage
+    // panel — drawn on every account row (Claude and Codex) so the whole fleet
+    // reads at a glance instead of only the account this pane is signed in as.
+    function acctUsageBars(u) {
+      const wrap = document.createElement('span');
+      wrap.className = 'acct-usage acct-usage-bars';
+      const addRow = (label, pct, expired, resetsAt, includeDay) => {
+        if (pct == null && !expired) return;
+        const p = Math.min(100, Math.max(0, pct || 0));
+        const row = document.createElement('span'); row.className = 'acct-ubar-row';
+        const lab = document.createElement('span'); lab.className = 'acct-ubar-label'; lab.textContent = label;
+        const track = document.createElement('span'); track.className = 'acct-ubar-track';
+        const fill = document.createElement('span'); fill.className = 'acct-ubar-fill';
+        fill.style.width = p + '%'; fill.style.background = usageColor(p);
+        track.appendChild(fill);
+        const pc = document.createElement('span'); pc.className = 'acct-ubar-pct'; pc.textContent = p.toFixed(0) + '%';
+        const t = document.createElement('span'); t.className = 'acct-ubar-time';
+        t.textContent = expired ? 'available' : (resetsAt ? formatResetTime(resetsAt, includeDay) : '');
+        row.appendChild(lab); row.appendChild(track); row.appendChild(pc); row.appendChild(t);
+        wrap.appendChild(row);
+      };
+      addRow('5h', u.five_hour_pct, u.five_hour_reset_expired, u.five_hour_resets_at, false);
+      addRow('7d', u.seven_day_pct, u.seven_day_reset_expired, u.seven_day_resets_at, true);
+      if (u.updated_at) {
+        const asof = document.createElement('span'); asof.className = 'acct-ubar-asof';
+        asof.textContent = 'as of ' + relTime(u.updated_at);
+        wrap.appendChild(asof);
+      }
+      return wrap;
+    }
+    // A Codex row with no snapshot yet means the server is probing it now; re-poll
+    // a couple of times so the meter fills in without the user reopening Settings.
+    let codexUsageTries = 0;
     async function render() {
       try {
         const r = await fetch(`${API_BASE}/accounts`);
@@ -4426,6 +4724,7 @@
         applyEngineMeta(d);
         if (!d.ok) throw new Error(d.error || 'Could not load accounts.');
         listEl.innerHTML = '';
+        let codexPending = false;
         if (!d.accounts || !d.accounts.length) {
           const p = document.createElement('p'); p.className = 'cauth-intro';
           p.textContent = 'No saved accounts yet — add one below.';
@@ -4468,19 +4767,14 @@
           }
           const em = document.createElement('span'); em.className = 'acct-email'; em.textContent = a.email || '';
           b.appendChild(top); b.appendChild(em);
-          const u = isCodex ? null : normalizeAcctUsage(a.usage);
+          const u = normalizeAcctUsage(a.usage);
           if (u && (u.five_hour_pct != null || u.seven_day_pct != null)) {
-            const usg = document.createElement('span'); usg.className = 'acct-usage';
-            const parts = [];
-            if (u.five_hour_pct != null) parts.push('5h ' + (u.five_hour_reset_expired ? 'available' : u.five_hour_pct + '%' + (u.five_hour_resets_at ? ' · resets ' + formatResetTime(u.five_hour_resets_at, false).replace(/^.*\(/, '').replace(/\)$/, '') : '')));
-            if (u.seven_day_pct != null) parts.push('7d ' + (u.seven_day_reset_expired ? 'available' : u.seven_day_pct + '%'));
-            if (u.updated_at) parts.push('as of ' + relTime(u.updated_at));
-            usg.textContent = parts.join('  ·  ');
-            b.appendChild(usg);
+            b.appendChild(acctUsageBars(u));
           } else {
             const usg = document.createElement('span'); usg.className = 'acct-usage acct-usage-none';
-            usg.textContent = isCodex ? 'Codex \u00b7 ChatGPT sign-in' : 'usage unknown (send a message on it to record)';
+            usg.textContent = isCodex ? 'Codex \u00b7 checking usage…' : 'usage unknown (send a message on it to record)';
             b.appendChild(usg);
+            if (isCodex) codexPending = true;
           }
           if (isActive) b.classList.add('acct-current');   // not disabled, so ✎ stays clickable
           b.addEventListener('click', () => { if (isActive) return; doSwitch(a.name, a.type); });
@@ -4490,6 +4784,10 @@
         // accounts the group boundary was never hit, so add it now. Codex add-row last.
         if (!claudeAddDone) { claudeAddDone = true; addClaudeAddRow(); }
         addCodexAddRow();
+        if (codexPending && codexUsageTries < 3) {
+          codexUsageTries++;
+          setTimeout(() => { if (document.body.contains(ov)) render(); }, 4000);
+        }
       } catch (e) { setMsg(e.message, 'err'); }
     }
     // Reset-aware usage: once a window's reset time has passed it has rolled
@@ -5127,6 +5425,42 @@
     const fmt = (s) => s ? String(s).replace('T', ' ').slice(0, 16) : '';
     async function jget(u){ const r = await fetch(u, { cache: 'no-store' }); return r.ok ? r.json() : null; }
     async function jsend(u, method, data){ const r = await fetch(u, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) }); return r.ok; }
+    // [RUN_NOW_QUEUE_V1] Submit & Run feedback. POST only means "queued"; the real
+    // outcome arrives from the status endpoint, so we poll a few times and report it.
+    async function runNowKick(){
+      let j = null;
+      try {
+        const r = await fetch(`${base}/run-now`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        j = await r.json();
+      } catch (e) {}
+      const st = j && j.state;
+      if (st === 'queued' || st === 'already_queued') {
+        showToast(st === 'queued' ? '\u2713 Answer saved \u2014 queued to run next' : '\u23f3 Already queued to run', 'info');
+        runNowPoll();
+      } else if (st === 'blocked') {
+        const why = { not_armed: 'the autonomy loop is not armed', bad_file: 'bad task file', task_file_missing: 'task file missing' }[j.reason] || j.reason || 'unknown';
+        showToast('\u26a0 Not queued: ' + why, 'error');
+      } else {
+        showToast('\u26a0 Could not queue the run', 'error');
+      }
+    }
+    async function runNowPoll(){
+      let sawRunning = false;
+      for (const d of [5000, 15000, 40000, 60000]) {
+        await new Promise(r => setTimeout(r, d));
+        let s = null;
+        try { s = await (await fetch(`${base}/run-now/status`, { cache: 'no-store' })).json(); } catch (e) { continue; }
+        if (!s || !s.found) continue;
+        if (s.state === 'running' && !sawRunning) {
+          sawRunning = true;
+          showToast('\u25b6 Running now on ' + ((s.entry && s.entry.account) || 'a spare account'), 'info');
+        } else if (s.state === 'succeeded') {
+          showToast('\u2713 Turn finished \u2014 open this task\u2019s live room to read it', 'info'); return;
+        } else if (s.state === 'failed' || s.state === 'expired') {
+          showToast('\u26a0 Run ' + s.state + ((s.result && s.result.reason) ? ': ' + s.result.reason : ''), 'error'); return;
+        }
+      }
+    }
 
     // Questions  [TASK_QUESTIONS_UI_V1] — agent asks, Peter answers, in place.
     const qSec = el('div'); bodyWrap.appendChild(qSec);
@@ -5161,7 +5495,7 @@
         // [RUN_NOW_V1] kick an immediate autonomy turn on this task (server-side
         // no-op if no account has spare quota or the loop is not armed).
         if (opts.approve && t.status === 'planned') { try { await jsend(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, 'POST', { status: 'approved' }); } catch (e) {} }
-        if (opts.run) { try { await jsend(`${base}/run-now`, 'POST', {}); } catch (e) {} }
+        if (opts.run) { await runNowKick(); }
         // Several questions can be pending at once — refresh the list in place and keep
         // the modal open until every one is answered; only auto-close on the last.
         await renderQuestions();
@@ -6006,6 +6340,7 @@
   updateTitlebar();
   // History is restored from server via fetchAndRestoreHistory() on first WS connect
   connect();
+  confRestoreDraft(currentRoomId);   // [CONF_NEEDTASK_RECOVER_V1] a cold load on this room gets its draft back too
   // [CONFERENCE_HISTORY_V1] Gated test hook — exposes internal handlers to a jsdom
   // behavioural test. Completely inert in production (window.__CCB_TEST__ is undefined).
   try {

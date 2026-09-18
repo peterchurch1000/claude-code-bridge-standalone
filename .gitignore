@@ -139,3 +139,6 @@ init-auth.js
 # Stray shell-redirect junk (e.g. "> 000" typos)
 /000
 /200
+
+# ...but committed test suites under tests/ are source, not stray root scripts
+!tests/**/test-*.cjs

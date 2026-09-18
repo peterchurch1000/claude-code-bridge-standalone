@@ -822,7 +822,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
   cursor: pointer; transition: color 0.2s, border-color 0.2s;
 }
 #btn-browser-toggle:hover { color: var(--accent); border-color: var(--accent); }
-#btn-browser-toggle[aria-expanded="false"] { color: var(--accent); border-color: var(--accent); }
+#btn-browser-toggle[aria-expanded="true"] { color: var(--accent); border-color: var(--accent); }
 
 /* Desktop: hide the pane + resize divider, and override the chat-panel width cap
    (incl. any inline width the divider drag set — stylesheet !important beats a
@@ -1240,3 +1240,13 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
 .msg-question .q-status { margin-top:8px; font-size:12px; color:#9fb0c8; }
 .msg-question .q-status.answered { color:#67d38b; }
 .msg-question .q-status.expired { color:#e6a04f; }
+
+/* [CODEX_ACCT_USAGE_V1] per-account 5h/7d meter in the Settings > Accounts modal */
+.acct-usage-bars{display:flex;flex-direction:column;gap:2px;width:100%}
+.acct-ubar-row{display:flex;align-items:center;gap:6px;font-size:.95em;line-height:1.3}
+.acct-ubar-label{width:15px;color:#8b8b8b;flex:none}
+.acct-ubar-track{flex:1;min-width:40px;height:5px;border-radius:3px;background:rgba(255,255,255,.10);overflow:hidden}
+.acct-ubar-fill{display:block;height:100%;border-radius:3px;transition:width .3s}
+.acct-ubar-pct{min-width:30px;text-align:right;color:#9aa7bd;flex:none}
+.acct-ubar-time{color:#7a7a7a;flex:none;white-space:nowrap}
+.acct-ubar-asof{color:#6f6f6f;font-style:italic}

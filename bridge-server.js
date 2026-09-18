@@ -114,7 +114,7 @@ app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 // buildId is a constant baked into THIS code. A conference records the build it is
 // waiting for before it self-restarts; on respawn the boot resume only proceeds when
 // this constant matches — proving the new code is actually loaded (behaviour, not mtime).
-const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1';
+const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1';
 function _confLoopbackOnly(req, res) {
   const ip = (req.socket && req.socket.remoteAddress) || '';
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
@@ -341,25 +341,43 @@ function pendingDraftsByTask() {
   return map;
 }
 
-// [RUN_NOW_V1] Submit & Run: fire ONE immediate autonomy turn on this task so a
-// freshly-answered question is acted on within ~1 min instead of waiting for the
-// 15-min usage-pacing cron. Registered BEFORE the /tasks proxy so it is not
-// forwarded to the Laravel task API. Spawns ~/run-now.sh detached and returns at
-// once; that script picks a spare-quota account and runs the actuator (graceful
-// no-op if no account has quota or the loop is not armed).
+// [RUN_NOW_QUEUE_V1] Submit & Run. The click is ENQUEUED synchronously and we return
+// an honest state; the turn itself is run by run-now-dispatch.sh, which takes the NEXT
+// actuator slot. "queued" therefore means ACCEPTED, never "executed" — the previous
+// version fire-and-forgot a detached script and always answered {ok:true}, so a run
+// that never happened (lock busy -> rc=3) was indistinguishable from one that did.
+// Registered BEFORE the /tasks proxy so neither route is forwarded to the Laravel API.
 app.post('/tasks/:file/run-now', (req, res) => {
   const file = path.basename(String(req.params.file || ''));
-  if (!/^task-[\w.-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file' });
+  if (!/^task-[\w.-]+\.md$/.test(file)) return res.status(400).json({ ok: false, state: 'blocked', reason: 'bad_file' });
+  const home = process.env.HOME || os.homedir();
   try {
-    const home = process.env.HOME || os.homedir();
-    const child = require('child_process').spawn('/bin/bash', [path.join(home, 'run-now.sh'), file], {
-      detached: true, stdio: 'ignore', env: process.env,
-    });
-    child.unref();
-    return res.json({ ok: true, file });
+    const out = require('child_process').execFileSync('/bin/bash',
+      [path.join(home, 'run-now.sh'), '--enqueue', file],
+      { timeout: 8000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const line = String(out).trim().split('\n').filter(Boolean).pop() || '{}';
+    let j = {}; try { j = JSON.parse(line); } catch {}
+    const blocked = j.state === 'blocked';
+    return res.status(blocked ? 409 : 202).json(Object.assign({ ok: !blocked, file }, j));
   } catch (e) {
     console.error('[run-now]', e && e.message);
-    return res.status(500).json({ error: 'failed to launch run-now' });
+    return res.status(500).json({ ok: false, state: 'blocked', reason: 'enqueue_failed' });
+  }
+});
+
+// [RUN_NOW_QUEUE_V1] Real outcome of a Submit & Run: the live queue entry while it is
+// queued/claimed/running, else the retained terminal record (succeeded/failed/expired).
+app.get('/tasks/:file/run-now/status', (req, res) => {
+  const file = path.basename(String(req.params.file || ''));
+  if (!/^task-[\w.-]+\.md$/.test(file)) return res.status(400).json({ found: false, reason: 'bad_file' });
+  const home = process.env.HOME || os.homedir();
+  try {
+    const out = require('child_process').execFileSync(process.execPath,
+      [path.join(home, 'run-now-queue.js'), 'status', file],
+      { timeout: 5000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return res.json(JSON.parse(String(out).trim() || '{"found":false}'));
+  } catch (e) {
+    return res.json({ found: false, reason: 'status_unavailable' });
   }
 });
 
@@ -985,6 +1003,264 @@ function purgeAutonameScratch() {
     }
   } catch {}
 }
+// >>> TASK_TITLE_HAIKU_V1_BEGIN
+// Haiku-generated 5-7 word task titles for the conference task-association popup
+// and the room->task "Create task & link" form. Mirrors autoNameRoom's spawn
+// pattern (claude -p --model haiku, isolated scratch cwd) but is request/response.
+
+// [TASK_TITLE_HAIKU_V2] Deterministic 5-7 word label, used when the model call
+// fails. Falling back to the raw sentence would be defect #1 all over again.
+const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new').split(' '));
+function heuristicTaskTitle(text) {
+  const raw = String(text || '').replace(/https?:\/\/\S+/g, ' ').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+  if (!raw.length) return '';
+  const content = raw.filter(w => !_TT_STOP.has(w.toLowerCase()));
+  // Never pad with filler: a short honest label beats "Fix Login Bug The".
+  const picked = (content.length ? content : raw).slice(0, 7);
+  return picked.map(w => { w = w.toLowerCase(); return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ').slice(0, 80);
+}
+// True only for something that reads like a 5-7 word label, not a sentence/refusal.
+function looksLikeTaskTitle(str) {
+  if (!str) return false;
+  const words = String(str).split(' ').filter(Boolean);
+  if (words.length < 5 || words.length > 7) return false;
+  if (/[.?!:;]/.test(str)) return false;
+  if (/\b(instruction|provide|incomplete|sorry|cannot|unable|please|summar|the user|it seems|appears)\b/i.test(str)) return false;
+  return true;
+}
+function _firstUserLineText(line) {
+  if (!line || line.indexOf('"role":"user"') === -1) return '';
+  try {
+    const ev = JSON.parse(line);
+    if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+      const t = extractText(ev.message.content);
+      if (t) return t.replace(/\s+/g, ' ').trim();
+    }
+  } catch {}
+  return '';
+}
+// Unlike firstUserInstruction (400-char cap) this returns the WHOLE first user
+// message — the popup's Description is the full instruction, untruncated.
+// Reads in chunks and returns at the first complete user record, so it never
+// walks a large transcript.
+function firstUserFullText(file) {
+  let fd = null;
+  try {
+    fd = fs.openSync(file, 'r');
+    const { StringDecoder } = require('string_decoder');
+    const dec = new StringDecoder('utf8');
+    const buf = Buffer.alloc(131072);
+    let carry = '';
+    for (;;) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      carry += dec.write(buf.slice(0, n));       // decoder holds split multi-byte chars
+      let nl;
+      while ((nl = carry.indexOf('\n')) !== -1) {
+        const line = carry.slice(0, nl);
+        carry = carry.slice(nl + 1);
+        const t = _firstUserLineText(line);
+        if (t) return t;
+      }
+    }
+    carry += dec.end();
+    if (carry) { const t = _firstUserLineText(carry); if (t) return t; }
+  } catch {}
+  finally { if (fd !== null) { try { fs.closeSync(fd); } catch {} } }
+  return '';
+}
+// The model only needs the head of the request to summarise it.
+function _taskTitlePromptSource(full) {
+  let t = String(full || '').replace(/\s+/g, ' ').trim();
+  if (t.length > 400) { const cut = t.slice(0, 400); t = cut.slice(0, cut.lastIndexOf(' ') + 1).trim() || cut; }
+  return t;
+}
+// A room id may be a client room key (draft) or a Claude session id.
+function _resolveRoomSession(roomId) {
+  if (!roomId || typeof roomId !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(roomId)) return '';
+  try { const S = clientSessions.get(roomId); if (S && S.sessionId) return S.sessionId; } catch {}
+  try { if (sessionFileExists(roomId)) return roomId; } catch {}
+  return '';
+}
+// [ROOMTASK_HAIKU_V3] Room -> task generation is anchored on the MOST RECENT user
+// comment, with the two prior user comments as background. USER TURNS ONLY:
+// assistant/tool output can never reach the prompt, the response, or any fallback.
+const TT_RECENT_TURNS  = 3;     // the latest comment + the two before it
+const TT_TURN_CHARS    = 700;   // per-turn cap inside the prompt
+const TT_SOURCE_CHARS  = 2000;  // whole rendered prompt block cap
+const TT_SUMMARY_CHARS = 400;   // description cap
+function _ttClip(s, n) {
+  let t = String(s || '').replace(/\s+/g, ' ').trim();
+  if (t.length > n) { const cut = t.slice(0, n); t = cut.slice(0, cut.lastIndexOf(' ') + 1).trim() || cut; }
+  return t;
+}
+// The last n genuine USER turns, oldest first. Everything else is dropped here, so
+// exclusion of assistant text is structural rather than a thing callers must remember.
+function _recentUserTurns(msgs, n) {
+  const list = Array.isArray(msgs) ? msgs : [];
+  const want = n || TT_RECENT_TURNS;
+  const out = [];
+  for (let i = list.length - 1; i >= 0 && out.length < want; i--) {
+    const m = list[i];
+    if (!m) continue;
+    const isUser = (m.type === 'user') || (m.type == null && m.role === 'user');
+    if (!isUser) continue;
+    const t = _ttClip(m.text != null ? m.text : extractText(m.content), TT_TURN_CHARS);
+    if (!t) continue;
+    out.push(t);
+  }
+  return out.reverse();
+}
+// Recency is stated in the prompt, not left for the model to infer from order.
+function _renderRecentTurns(turns) {
+  if (!turns || !turns.length) return '';
+  const latest = turns[turns.length - 1];
+  const earlier = turns.slice(0, -1);
+  let s = 'MOST RECENT REQUEST:\n' + latest;
+  if (earlier.length) s += '\n\nEARLIER CONTEXT (older, background only):\n' + earlier.join('\n---\n');
+  return s.length > TT_SOURCE_CHARS ? s.slice(0, TT_SOURCE_CHARS) : s;
+}
+// Engine-neutral room text. roomHistoryMessages merges the client-saved history
+// (chatData, written for EVERY engine) with the Claude transcript, so a Codex room
+// — which has no .jsonl at all — resolves exactly like a Claude one.
+function _roomSourceText(roomId) {
+  const empty = { hasContent: false, recent: [], source: '', latestInstruction: '' };
+  const rid = String(roomId || '');
+  if (!rid || !/^[A-Za-z0-9._-]{1,128}$/.test(rid)) return empty;
+  let sid = '';
+  try { const S = clientSessions.get(rid); if (S && S.sessionId) sid = S.sessionId; } catch {}
+  if (!sid) { try { if (sessionFileExists(rid)) sid = rid; } catch {} }
+  let msgs = [];
+  try { msgs = roomHistoryMessages(rid, sid) || []; } catch { msgs = []; }
+  if (!msgs.length && sid && sid !== rid) { try { msgs = roomHistoryMessages(sid, sid) || []; } catch {} }
+  const recent = _recentUserTurns(msgs, TT_RECENT_TURNS);
+  if (!recent.length) return empty;
+  return {
+    hasContent: true,
+    recent: recent,
+    source: _renderRecentTurns(recent),
+    latestInstruction: _ttClip(recent[recent.length - 1], TT_SUMMARY_CHARS),
+  };
+}
+// A summary must read like prose about the work, not a refusal or a stub.
+function _looksLikeSummary(str) {
+  const t = String(str || '').trim();
+  if (t.length < 15) return false;
+  if (/^(sorry|i\s+cannot|i\s+can't|i'm\s+unable|unable\s+to|as\s+an\s+ai)\b/i.test(t)) return false;
+  return true;
+}
+// Parse the two-field describe reply. TITLE is one line; SUMMARY runs to the end of
+// the output (multiline tolerated) and is then normalised to a single line, so a
+// model that wraps its 1-3 sentences is not treated as a failure.
+function _parseTitleSummary(out) {
+  const raw = String(out || '').replace(/\r/g, '');
+  const tm = raw.match(/^[ \t]*TITLE:[ \t]*(.*)$/m);
+  let title = (tm ? tm[1] : '').replace(/\s+/g, ' ').trim()
+    .replace(/^["'\s]+|["'\s]+$/g, '').replace(/[.]+$/, '');
+  let summary = '';
+  const si = raw.search(/^[ \t]*SUMMARY:/m);
+  if (si !== -1) summary = raw.slice(si).replace(/^[ \t]*SUMMARY:[ \t]*/, '');
+  summary = summary.replace(/\s+/g, ' ').trim().replace(/^["']+|["']+$/g, '');
+  if (summary.length > TT_SUMMARY_CHARS) {
+    const cut = summary.slice(0, TT_SUMMARY_CHARS);
+    const stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+    summary = (stop > 80 ? cut.slice(0, stop + 1) : (cut.slice(0, cut.lastIndexOf(' ') + 1) || cut)).trim();
+  }
+  if (!looksLikeTaskTitle(title)) title = '';
+  if (!_looksLikeSummary(summary)) summary = '';
+  return { title: title, summary: summary };
+}
+const TASK_TITLE_MAX_INFLIGHT = 2;
+let _taskTitleInFlight = 0;
+// deps is injectable so the test harness can drive the lifecycle without a real child.
+function handleTaskTitle(req, res, deps) {
+  deps = deps || {};
+  const _spawn = deps.spawn || spawn;
+  const body = (req && req.body) || {};
+  const describe = body.describe === true;   // [ROOMTASK_HAIKU_V3] title + summary from one call
+  const typed = String(body.text == null ? '' : body.text).replace(/\s+/g, ' ').trim();
+  // source            -> the public text the caller may show (user text, never assistant)
+  // promptSource      -> what the model sees (may carry the recency scaffolding)
+  // latestInstruction -> the single most recent user comment; the only description fallback
+  let source = '', promptSource = '', latestInstruction = '';
+  if (typed) {
+    source = typed; latestInstruction = typed; promptSource = _taskTitlePromptSource(typed);
+  } else {
+    const rs = _roomSourceText(String(body.roomId || ''));   // [ROOMTASK_HAIKU_V3] latest + 2 prior USER turns
+    if (rs.hasContent) {
+      source = rs.latestInstruction; latestInstruction = rs.latestInstruction; promptSource = rs.source;
+    } else {
+      const sid = _resolveRoomSession(String(body.roomId || ''));   // legacy transcript path
+      if (sid) { try { source = firstUserFullText(path.join(transcriptsDir(), sid + '.jsonl')); } catch { source = ''; } }
+      latestInstruction = source; promptSource = _taskTitlePromptSource(source);
+    }
+  }
+  const fallbackTitle = heuristicTaskTitle(latestInstruction) || _ttClip(latestInstruction, 120);   // [TASK_TITLE_HAIKU_V2]
+  const fallbackDescription = _ttClip(latestInstruction, TT_SUMMARY_CHARS);                         // [ROOMTASK_HAIKU_V3]
+  const fallback = fallbackTitle;   // legacy field name; always a title, never a sentence
+  if (!source) { res.json({ ok: true, title: '', description: '', source: '', fallback: '', fallbackTitle: '', fallbackDescription: '', hasContent: false }); return; }
+  if (_taskTitleInFlight >= TASK_TITLE_MAX_INFLIGHT) { res.json({ ok: true, title: '', description: '', source: source, fallback: fallback, fallbackTitle: fallbackTitle, fallbackDescription: fallbackDescription, hasContent: true }); return; }
+
+  let state = 'pending';      // 'pending' | 'responded' | 'cancelled'
+  let cleaned = false, child = null, killer = null, out = '';
+  _taskTitleInFlight++;
+  function cleanup() {
+    if (cleaned) return; cleaned = true;
+    if (killer) { clearTimeout(killer); killer = null; }
+    if (child) { try { child.kill('SIGKILL'); } catch {} }
+    try { purgeAutonameScratch(); } catch {}
+    _taskTitleInFlight = Math.max(0, _taskTitleInFlight - 1);
+  }
+  function settle(title, description) {   // [ROOMTASK_HAIKU_V3] both fields, each with its own fallback
+    if (state !== 'pending') return;
+    if (res.destroyed || res.writableEnded) { state = 'cancelled'; return; }
+    state = 'responded';
+    res.json({
+      ok: true,
+      title: title || '',
+      description: description || '',
+      source: source,
+      fallback: fallback,
+      fallbackTitle: fallbackTitle,
+      fallbackDescription: fallbackDescription,
+      hasContent: true,
+    });
+  }
+  function cancel() { if (state === 'pending') state = 'cancelled'; cleanup(); }
+  res.on('close', function () { if (!res.writableEnded) cancel(); });
+
+  const prompt = describe
+    ? ('You are writing a task card from a chat room. Anchor everything on the MOST RECENT REQUEST; '
+      + 'the earlier context is background only.\n'
+      + 'Reply with EXACTLY these two fields and nothing else:\n'
+      + 'TITLE: <5 to 7 word Title Case label, no punctuation>\n'
+      + 'SUMMARY: <1 to 3 sentences on ONE line saying what needs doing>\n\n'
+      + promptSource)
+    : ('Summarise the objective of this request as a 5 to 7 word Title Case label. '
+      + 'Output ONLY the label — no punctuation, quotes, or explanation. '
+      + 'If the request is cut off, infer the objective from what is present.\n\nRequest: '
+      + promptSource);
+  try {
+    child = _spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
+      { cwd: AUTONAME_SCRATCH, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { settle(''); cleanup(); return; }
+  try { child.stdout.on('data', c => { out += c.toString(); }); } catch {}
+  try { child.stderr.on('data', () => {}); } catch {}
+  killer = setTimeout(function () { cleanup(); settle('', ''); }, describe ? 18000 : 13000);   // [ROOMTASK_HAIKU_V3] two fields take longer
+  child.on('error', function () { settle('', ''); cleanup(); });
+  child.on('close', function () {
+    if (describe) {                                   // [ROOMTASK_HAIKU_V3]
+      const parsed = _parseTitleSummary(out);         // each field falls back on its own
+      settle(parsed.title, parsed.summary); cleanup(); return;
+    }
+    let name = (out || '').replace(/\s+/g, ' ').trim().replace(/^["'\s]+|["'\s]+$/g, '').replace(/[.]+$/, '');
+    if (!looksLikeTaskTitle(name)) name = '';
+    settle(name, ''); cleanup();
+  });
+}
+app.post('/task-title', (req, res) => handleTaskTitle(req, res));
+// <<< TASK_TITLE_HAIKU_V1_END
+
 function autoNameRoom(S) {
   try {
     if (!autoNameEnabled()) return;
@@ -1369,6 +1645,93 @@ function listCodexAccounts() {
   accounts.sort((a, b) => a.name.localeCompare(b.name));
   return { accounts, enabled: fs.existsSync(CODEX_SWITCH_SH) };
 }
+
+// [CODEX_ACCT_USAGE_V1] Per-Codex-account 5h/7d snapshots, so the accounts modal can show a
+// usage meter on every row instead of only the Claude ones. The ACTIVE login is
+// read through the existing metrics cache; an inactive login is probed the same
+// way with CODEX_HOME pointed at a scratch home containing only a copy of that
+// account's auth.json (config.toml is deliberately NOT copied — a remote
+// [mcp_servers.*] block stalls app-server startup). Any token rotation the probe
+// performs is written back so a probe can never desync the stored login.
+const CODEX_USAGE_TTL = 10 * 60 * 1000;
+const _codexProbeQueue = [];
+let _codexProbing = false;
+function codexUsagePath(name) { return path.join(CODEX_ACCT_DIR, name + '.usage.json'); }
+function readCodexAccountUsage(name) {
+  try { return JSON.parse(fs.readFileSync(codexUsagePath(name), 'utf8')); } catch { return null; }
+}
+function codexUsageStale(u) {
+  if (!u || !u.updated_at) return true;
+  return Date.now() - Date.parse(u.updated_at) > CODEX_USAGE_TTL;
+}
+// [CODEX_ACCT_USAGE_WINDOWS_V1] Sort the two returned windows by duration (<=12h is the 5-hour
+// window, anything longer is the weekly one) instead of trusting their position.
+function codexWindows(limits) {
+  const out = { five: {}, seven: {} };
+  for (const w of [limits && limits.primary, limits && limits.secondary]) {
+    if (!w || w.usedPercent == null) continue;
+    if (Number(w.windowDurationMins || 0) <= 720) out.five = w; else out.seven = w;
+  }
+  return out;
+}
+function saveCodexAccountUsage(name, raw) {
+  const limits = (raw && raw.rateLimits && raw.rateLimits.rateLimits) || {};
+  const { five: p, seven: s } = codexWindows(limits);
+  if (p.usedPercent == null && s.usedPercent == null) return null;
+  const snap = {
+    email: (raw.account && raw.account.email) || '',
+    plan: (raw.account && raw.account.planType) || limits.planType || '',
+    five_hour_pct: p.usedPercent ?? null,
+    five_hour_resets_at: p.resetsAt ?? null,
+    seven_day_pct: s.usedPercent ?? null,
+    seven_day_resets_at: s.resetsAt ?? null,
+    updated_at: new Date().toISOString(),
+  };
+  try { fs.writeFileSync(codexUsagePath(name), JSON.stringify(snap)); } catch {}
+  return snap;
+}
+function probeCodexAccount(name, cb) {
+  const src = path.join(CODEX_ACCT_DIR, name + '.auth.json');
+  if (!fs.existsSync(src)) return cb(new Error('No such Codex account.'));
+  let activeId = '', mineId = '';
+  try { activeId = codexAcctId(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+  try { mineId   = codexAcctId(JSON.parse(fs.readFileSync(src, 'utf8'))); } catch {}
+  // The live login already has a collector — never point a scratch home at it.
+  if (activeId && mineId === activeId) {
+    return readCodexMetrics((err, raw) => err ? cb(err) : cb(null, saveCodexAccountUsage(name, raw)));
+  }
+  const home = path.join(os.tmpdir(), 'codex-usage-probe', name);
+  let before = '';
+  try {
+    fs.mkdirSync(home, { recursive: true });
+    before = fs.readFileSync(src, 'utf8');
+    fs.writeFileSync(path.join(home, 'auth.json'), before);
+  } catch (e) { return cb(e); }
+  const script = path.join(os.homedir(), 'bin', 'codex-metrics.js');
+  execFile(script, [], { timeout: 20000, env: { ...process.env, HOME: os.homedir(), CODEX_HOME: home } }, (err, stdout) => {
+    try {
+      const after = fs.readFileSync(path.join(home, 'auth.json'), 'utf8');
+      if (after && after !== before) fs.writeFileSync(src, after);
+    } catch {}
+    let data = null;
+    try { data = JSON.parse(stdout); } catch {}
+    if (err || !data) return cb(err || new Error('Invalid Codex metrics response'));
+    cb(null, saveCodexAccountUsage(name, data));
+  });
+}
+// Probes run one at a time in the background: /accounts always answers from the
+// last snapshot and the client re-polls, so a slow login never blocks the modal.
+function queueCodexProbe(name) {
+  if (_codexProbeQueue.includes(name)) return;
+  _codexProbeQueue.push(name);
+  if (_codexProbing) return;
+  _codexProbing = true;
+  (function next() {
+    const n = _codexProbeQueue.shift();
+    if (!n) { _codexProbing = false; return; }
+    probeCodexAccount(n, () => setTimeout(next, 250));
+  })();
+}
 // Reset-aware view of a stored usage snapshot: a window's percentage is only
 // meaningful until its reset time. Once `resets_at` has passed the window has
 // rolled over, so the account is fully available (0% used) again — otherwise a
@@ -1419,7 +1782,11 @@ app.get('/accounts', (req, res) => {
   const codex = listCodexAccounts();
   // Tag Claude accounts type:'code'; append Codex accounts. Keep top-level `active`
   // (Claude email) for backward compatibility with the current UI.
-  const accounts = base.accounts.map(a => ({ ...a, type: 'code' })).concat(codex.accounts);
+  const accounts = base.accounts.map(a => ({ ...a, type: 'code' })).concat(codex.accounts.map(a => {
+    const u = readCodexAccountUsage(a.name);
+    if (codexUsageStale(u)) queueCodexProbe(a.name);
+    return { ...a, usage: normalizeUsage(u) };
+  }));
   res.json({ ok: true, active: base.active, accounts, enabled: base.enabled, codexEnabled: codex.enabled, engine: currentEngine() });
 });
 app.post('/accounts/switch', (req, res) => {
@@ -2780,13 +3147,17 @@ function confResumeActivations() {
   }
 }
 function confActive(S) { return !!(S && S.conf && S.conf.status === 'running'); }
+// [CONF_ROUTE_PAUSED_V1] A room whose conference is running OR paused owns its chat: a
+// plain message must become an interjection, never leak to a raw engine turn and then get
+// erased by the next conference repaint (which rewrites the room from c.log).
+function confLive(S) { return !!(S && S.conf && (S.conf.status === 'running' || S.conf.status === 'paused')); }
 
 function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7); }
 
 function confSendStatus(S) {
   if (!S || !S.conf) return;
   const c = S.conf;
-  S.send({ type: 'conf_status', task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
+  S.send({ type: 'conf_status', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
            round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
            leadEngine: c.leadEngine, reviewEngine: c.reviewEngine, nextEngine: c.nextEngine, reason: c.pausedReason || null });
 }
@@ -2813,6 +3184,8 @@ function confLogToMessages(c) {
   const _brief = (c && typeof c.brief === 'string') ? c.brief : '';
   if (_brief.trim()) out.push({ type: 'user', text: _brief });
   for (const e of ((c && c.log) || [])) {
+    // [CONF_INTERJECT_LOG_V1] A user interjection is a first-class log entry.
+    if (e && e.role === 'user') { out.push({ type: 'user', text: e.text || '' }); continue; }
     out.push({ type: 'assistant', engine: e.engine || null, role: e.role || null,
                stage: e.stage || null, stageLabel: confStageLabel(e.stage, c.taskType), round: e.round || null,
                turnId: e.turnId || null, text: e.text || '' });
@@ -3194,18 +3567,41 @@ function confValidReqId(r) { return typeof r === 'string' && /^[a-zA-Z0-9_-]{8,6
 // [CONF_TASK_ASSOC_V1] Canonicalize a task decision server-side. Never trusts client
 // title/metadata: for a linked task it re-reads the task file and returns the
 // server's own {id,file,title}. Returns {status:'none'|'linked'|'invalid'}.
-function confCanonicalTask(decision, task) {
+// [CONF_TASK_STORE_V1] The authoritative task store is MariaDB; the .md file is
+// written asynchronously by org_bridge_syncd. A task created seconds ago has no
+// .md yet, so the file-only check below used to reject it and the client replayed
+// the whole task-association popup — the "runs twice" defect. Fall back to the
+// task API (same JWT => same user) when the file is not there yet.
+async function taskFromApi(file) {
+  const jwt = bridgeTaskJwt(); if (!jwt) return null;
+  try {
+    const r = await fetch(BRIDGE_TASK_API, { headers: { Authorization: 'Bearer ' + jwt }, signal: AbortSignal.timeout(4000) });
+    if (!r.ok) return null;
+    const d = await r.json();
+    const list = (d && Array.isArray(d.tasks)) ? d.tasks : [];
+    for (const t of list) {
+      if (t && String(t.file) === file) {
+        return { id: String(t.id || '').slice(0, 16), file: file, title: String(t.title || '').slice(0, 200) };
+      }
+    }
+  } catch {}
+  return null;
+}
+async function confCanonicalTask(decision, task) {
   if (decision === 'none') return { status: 'none', task: null };
   if (decision === 'linked') {
     const file = (task && typeof task.file === 'string') ? task.file : '';
     if (!/^task-[a-z0-9-]+\.md$/.test(file)) return { status: 'invalid' };
     try {
       const full = path.join(TASKS_DIR, file);
-      if (!fs.existsSync(full)) return { status: 'invalid' };
-      const t = parseTaskFile(full);
-      if (!t) return { status: 'invalid' };
-      return { status: 'linked', task: { id: String(t.id || '').slice(0, 16), file: file, title: String(t.title || '').slice(0, 200) } };
-    } catch { return { status: 'invalid' }; }
+      if (fs.existsSync(full)) {
+        const t = parseTaskFile(full);
+        if (t) return { status: 'linked', task: { id: String(t.id || '').slice(0, 16), file: file, title: String(t.title || '').slice(0, 200) } };
+      }
+    } catch {}
+    const api = await taskFromApi(file);   // [CONF_TASK_STORE_V1]
+    if (api) return { status: 'linked', task: api };
+    return { status: 'invalid' };
   }
   return { status: 'invalid' };
 }
@@ -3215,13 +3611,13 @@ function confCanonicalTask(decision, task) {
 // interjection fork, so a retried first message never becomes a double interjection;
 // (2) active conference -> interjection (unchanged); (3) fresh start requires a valid
 // reqId AND a valid taskDecision, else fail closed with conf_need_task.
-function confTryStart(S, brief, msg) {
+async function confTryStart(S, brief, msg) {
   const c = S.conf;
   const reqId = msg && msg.reqId;
   if (c && c.startReqId && confValidReqId(reqId) && reqId === c.startReqId) {
     confSendStatus(S);
     if (Array.isArray(c.log) && c.log.length) {
-      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c),
+      S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c),
                status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
                round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
@@ -3236,17 +3632,30 @@ function confTryStart(S, brief, msg) {
     confInterject(S, brief); if (c.status === 'paused') confResume(S);
     return;
   }
-  if (!confValidReqId(reqId)) { S.send({ type: 'conf_need_task', reason: 'reqid', reqId: (typeof reqId === 'string' ? reqId : null) }); return; }
-  const dec = confCanonicalTask(msg && msg.taskDecision, msg && msg.task);
-  if (dec.status === 'invalid') { S.send({ type: 'conf_need_task', reason: 'task', reqId: reqId }); return; }
+  // [CONF_NEEDTASK_RECOVER_V1] A rejected start still contains the user's words. Echo the room and
+  // the text so the client can hold it as THAT room's draft instead of silently losing it.
+  const _ndText = String(brief || '').slice(0, 8000);
+  if (!confValidReqId(reqId)) { S.send({ type: 'conf_need_task', reason: 'reqid', reqId: (typeof reqId === 'string' ? reqId : null), roomId: S.key, text: _ndText }); return; }
+  const dec = await confCanonicalTask(msg && msg.taskDecision, msg && msg.task);
+  if (dec.status === 'invalid') { S.send({ type: 'conf_need_task', reason: 'task', reqId: reqId, roomId: S.key, text: _ndText }); return; }
   confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId, taskType: msg && msg.taskType });   // [CONF_TASKTYPE_V1]
 }
 
 function confInterject(S, text) {
   const c = S.conf; if (!c) return;
   c.pendingInterject = c.pendingInterject || [];
-  c.pendingInterject.push({ text: String(text || '').slice(0, 8000), ttl: 2 });
+  const _itext = String(text || '').slice(0, 8000);
+  c.pendingInterject.push({ text: _itext, ttl: 2 });
+  // [CONF_INTERJECT_LOG_V2] Record it in the authoritative log so it survives conf_sync /
+  // confMirrorToChat repaints. Insert BEFORE a trailing auto-conclusion so the existing
+  // "pop the conclusion on resume" checks still see the conclusion last.
+  c.log = c.log || [];
+  const _at = (c.log.length && c.log[c.log.length - 1].role === 'conclusion') ? c.log.length - 1 : c.log.length;
+  c.log.splice(_at, 0, { turnId: 'interject-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6),
+                         engine: null, role: 'user', stage: c.stage, subphase: c.subphase, round: c.round,
+                         text: _itext, verdict: null, verdictStage: null, ts: Date.now() });
   confSave(S);
+  try { confMirrorToChat(S.key, c); } catch (e) {}
   if (c.status === 'paused') { S.send({ type: 'status', text: 'Interjection saved — resume the conference to deliver it.' }); }
   else S.send({ type: 'status', text: 'Interjection queued — it will reach both engines on the next turn.' });
 }
@@ -3279,7 +3688,7 @@ function confResume(S) {
     confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
     // Repaint the authoritative log so the retracted conclusion disappears everywhere.
     if (Array.isArray(c.log) && c.log.length) {
-      S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
+      S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
                subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
     }
@@ -3316,7 +3725,7 @@ function confPolicyPause(S, detail) {
 // even when the engines never converged (e.g. the reviewer could not run verification).
 function confComposeConclusion(c, reason) {
   const stagesSeen = [];
-  for (const e of ((c && c.log) || [])) { const st = e.stage; if (st && e.role !== 'conclusion' && !stagesSeen.includes(st)) stagesSeen.push(st); }
+  for (const e of ((c && c.log) || [])) { const st = e.stage; if (st && e.role !== 'conclusion' && e.role !== 'user' && !stagesSeen.includes(st)) stagesSeen.push(st); }   // [CONF_INTERJECT_LOG_V2] user turns aren't stages
   const parts = [];
   parts.push('## 🏁 Conference concluded (automatic summary)');
   parts.push(reason || c.pausedReason || 'The conference ended before a verified final synthesis.');
@@ -3370,6 +3779,10 @@ function confAdvance(S, engine, verdict, meta) {
   meta = meta || {};
   if (verdict === 'blocked') {
     c.status = 'paused'; c.activeTurnId = null;
+    // [CONF_BLOCKED_TO_LEAD_V1] Blocked means "needs the user's answer folded into the
+    // proposal". Point the next turn at the LEAD; otherwise a resume re-runs the same
+    // reviewer against the same unchanged text, which can only block again.
+    if (c.stage !== 'final') { c.subphase = 'lead'; c.nextEngine = c.leadEngine; c.stageVerdicts = {}; }
     c.pausedReason = 'An engine reported it is blocked during ' + confStageLabel(c.stage, c.taskType) + ' and needs your input.';
     confSave(S); confPushConclusion(S, c.pausedReason); confSendStatus(S); S.send({ type: 'done', code: 0 });
     return true;
@@ -3481,13 +3894,15 @@ function confFinishTurn(S, engine) {
 function confRecover(S) {
   const disk = confLoad(S.key);
   if (!disk) return;
-  if (disk.status === 'superseded') return;   // inert tombstone from an atomic rekey
+  // [CONF_SUPERSEDED_IDLE_V1] Tell the client this room has no live conference before returning,
+  // otherwise a client that adopted conference mode for the old key keeps tagging its messages.
+  if (disk.status === 'superseded') { try { S.send({ type: 'conf_status', status: 'idle', roomId: S.key }); } catch (e) {} return; }   // inert tombstone from an atomic rekey
   if (!S.conf) S.conf = disk;
   const c = S.conf;
   try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
   confSendStatus(S);
   if (Array.isArray(c.log) && c.log.length) {
-    S.send({ type: 'conf_sync', task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
+    S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
              subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
              leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
   }
@@ -4274,7 +4689,7 @@ wss.on('connection', (ws) => {
     try {
       const _cdisk = confLoad(S.key);   // [CONFERENCE_ROOMSWITCH_V1] load inside try so a read failure follows the intended error handling
       if (S.conf || (_cdisk && _cdisk.status !== 'superseded')) confRecover(S);
-      else ws.send(JSON.stringify({ type: 'conf_status', status: 'idle' }));   // authoritative "no conference here"; FIFO-ordered after any stale old-room frames
+      else ws.send(JSON.stringify({ type: 'conf_status', status: 'idle', roomId: S.key }));   // [CONF_IDLE_ROOMID_V1] authoritative "no conference here" + the room it belongs to; FIFO-ordered after any stale old-room frames
     } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confRecover failed:', e.message); }
   }
 
@@ -4373,8 +4788,8 @@ wss.on('connection', (ws) => {
         }
       }
       // [CONFERENCE_V1] Conference is its own orchestration flow — handle first, before the guard.
-      if (msg.engineMode === 'conference' || confActive(S)) {
-        confTryStart(S, prompt, msg);   // [CONF_TASK_ASSOC_V1] idempotency + task-association gate
+      if (msg.engineMode === 'conference' || confActive(S) || confLive(S)) {   // [CONF_ROUTE_PAUSED_V1]
+        confTryStart(S, prompt, msg).catch(e => console.error('[CONF_TASK_ASSOC_V1] start failed', e && e.message));   // idempotency + task-association gate
         return;
       }
       // [CODEX_DURABLE_V6] Never switch engines mid-turn — it would interleave the two
@@ -4434,7 +4849,7 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'conf_start') {   // [CONFERENCE_V1]
       const brief = (msg.brief || '').toString().trim();
       if (!brief) return;
-      confTryStart(S, brief, msg);   // [CONF_TASK_ASSOC_V1]
+      confTryStart(S, brief, msg).catch(e => console.error('[CONF_TASK_ASSOC_V1] start failed', e && e.message));
     } else if (msg.type === 'conf_pause') { confPause(S);
     } else if (msg.type === 'conf_resume') { confResume(S);
     } else if (msg.type === 'conf_stop') { confStop(S);
