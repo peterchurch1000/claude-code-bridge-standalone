@@ -6,8 +6,28 @@
   <title>Claude Code Bridge</title>
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <script src="config.js"></script>
-  <link rel="stylesheet" href="style.css?v=acctusage-20260917" />
-  <script>try{var t=localStorage.getItem('ccb-theme')||'dark';document.documentElement.setAttribute('data-theme',t);document.documentElement.setAttribute('data-browser-hidden','0');try{localStorage.setItem('ccb-browser-hidden','0');}catch(e2){}}catch(e){}</script>
+  <link rel="stylesheet" href="style.css?v=bubblets-20260920" />
+  <script>
+  /* [ROOM_LAYOUT_V1] Pre-paint layout seed, part 1 (root state). Resolves the room id the
+     same way app.js does (?room= -> #room= -> bridge_room_id) and applies that room's saved
+     browser-pane visibility before first paint. STRICTLY READ-ONLY: it must never write back
+     to localStorage — doing so is what erased the saved preference on every load. */
+  (function () {
+    try { document.documentElement.setAttribute('data-theme', localStorage.getItem('ccb-theme') || 'dark'); } catch (e) {}
+    var sanitize = function (v) { return (v && v.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60)) || null; };
+    var rid = null;
+    try {
+      rid = sanitize(new URLSearchParams(location.search).get('room'))
+         || sanitize(new URLSearchParams((location.hash || '').replace(/^#/, '')).get('room'))
+         || sanitize(localStorage.getItem('bridge_room_id'));
+    } catch (e) {}
+    var L = {};
+    try { if (rid) L = JSON.parse(localStorage.getItem('ccb-layout::' + rid) || '{}') || {}; } catch (e) {}
+    window.__ccbSeedRoom = rid;
+    window.__ccbSeedLayout = L;
+    try { document.documentElement.setAttribute('data-browser-hidden', L.b === 1 ? '1' : '0'); } catch (e) {}
+  })();
+  </script>
 </head>
 <body>
 <div id="app">
@@ -66,11 +86,10 @@
       <span id="st-name" class="st-name">New room</span>
       <span id="st-edit" class="st-edit" title="Rename room">✎</span>
       <span id="st-color" class="st-color" title="Room background colour">🎨</span>
-      <select id="st-engine" class="st-engine" title="Engine for this room" style="display:none">
-        <option value="global">Global</option>
-        <option value="claude">Claude</option>
-        <option value="codex">Codex</option>
-      </select>
+      <!-- [ENGINE_GLOBAL_ONLY_V1] Options (Claude / Codex, each labelled with its OWN active
+           account's email, plus the two conference rooms) are rendered by app.js from the
+           server's engineAccounts summary, so the markup starts empty. -->
+      <select id="st-engine" class="st-engine" title="LLM for every room" style="display:none"></select>
       <span id="st-task" class="st-task"></span>
       <span id="st-id" class="st-id" title="">—</span>
       <div id="color-pop" class="hidden"></div>
@@ -233,6 +252,46 @@
   <!-- ── Tasks-panel resize handle (chat-facing edge) ── -->
   <div id="tasks-divider"></div>
 
+  <script>
+  /* [ROOM_LAYOUT_V1] Pre-paint layout seed, part 2 (panes). Deliberately here rather than in
+     <head>: #chat-panel and #tasks-panel are parsed by now, so this writes the SAME class and
+     inline-style slots that app.js's applyLayout() owns. One representation of the layout means
+     there are no root-level marker attributes or CSS variables that could drift between rooms.
+     style.css is render-blocking in <head>, so it is already applied when this runs.
+     Desktop only: at <=820px the stacked layout in style.css owns the widths. */
+  (function () {
+    try {
+      var L  = window.__ccbSeedLayout || {};
+      var cp = document.getElementById('chat-panel');
+      var tp = document.getElementById('tasks-panel');
+      var bt = document.getElementById('btn-tasks');
+      var bb = document.getElementById('btn-browser-toggle');
+      if (tp && L.t === 1) {
+        tp.classList.remove('tasks-panel-hidden');
+        tp.classList.add('tasks-panel-visible');
+        if (bt) bt.classList.add('active');
+      }
+      if (bb) {
+        var hid = document.documentElement.getAttribute('data-browser-hidden') === '1';
+        bb.setAttribute('aria-expanded', hid ? 'false' : 'true');
+        bb.title = hid ? 'Show live browser' : 'Hide live browser';
+      }
+      if (window.innerWidth > 820) {
+        var cw = parseInt(L.cw, 10);
+        if (cp && isFinite(cw) && cw > 0) {
+          cp.style.maxWidth = 'none';
+          cp.style.width = Math.max(200, Math.min(cw, Math.round(window.innerWidth * 0.90))) + 'px';
+        }
+        var tw = parseInt(L.tw, 10);
+        if (tp && isFinite(tw) && tw > 0) {
+          tp.style.maxWidth = 'none';
+          tp.style.width = Math.max(300, Math.min(tw, Math.round(window.innerWidth * 0.7))) + 'px';
+        }
+      }
+    } catch (e) {}
+  })();
+  </script>
+
   <!-- Settings panel -->
   <div id="settings-panel" class="hidden">
     <div id="settings-header"><span>Settings</span><button id="btn-close-settings">✕</button></div>
@@ -271,6 +330,6 @@
 <div id="toast-container"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="app.js?v=roomtask-haiku-20260917"></script>
+<script src="app.js?v=titlefirst2-20260921"></script>
 </body>
 </html>

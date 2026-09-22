@@ -353,13 +353,14 @@
 
   // ── Live-browser pane toggle (BROWSER_TOGGLE_V1) ────────────────────────────
   // Collapse the live-browser pane off/on in both layouts; chat fills the space.
-  // State lives on <html data-browser-hidden> (seeded pre-paint by the head script)
-  // + localStorage 'ccb-browser-hidden'. The iframe stays connected (CSS display:none),
-  // so toggling is instant and lossless.
+  // State lives on <html data-browser-hidden> (seeded pre-paint by the head script).
+  // The iframe stays connected (CSS display:none), so toggling is instant and lossless.
+  // [ROOM_LAYOUT_V1] Persistence is per-room now and owned by the layout module below;
+  // this function only moves the DOM. Its init call and click wiring live there too,
+  // because both need currentRoomId, which is not declared until further down.
   const btnBrowserToggle = $('btn-browser-toggle');
   function setBrowserHidden(hidden) {
     document.documentElement.setAttribute('data-browser-hidden', hidden ? '1' : '0');
-    try { localStorage.setItem('ccb-browser-hidden', hidden ? '1' : '0'); } catch (_) {}
     if (btnBrowserToggle) {
       btnBrowserToggle.setAttribute('aria-expanded', hidden ? 'false' : 'true');   // false = pane hidden
       btnBrowserToggle.title = hidden ? 'Show live browser' : 'Hide live browser';
@@ -370,13 +371,7 @@
       try { vncFrame.contentWindow.dispatchEvent(new Event('resize')); } catch (_) {}
     }
   }
-  if (btnBrowserToggle) {
-    setBrowserHidden(document.documentElement.getAttribute('data-browser-hidden') === '1');
-    btnBrowserToggle.addEventListener('click', (e) => {
-      e.preventDefault();
-      setBrowserHidden(document.documentElement.getAttribute('data-browser-hidden') !== '1');
-    });
-  }
+  // [ROOM_LAYOUT_V1] init + click wiring live in the layout module (they need currentRoomId).
 
   // Centroid in stable top-window coords (the iframe's own clientX is relative
   // to a viewport that moves as we pan, so add the iframe's rect to cancel it).
@@ -598,12 +593,16 @@
   // can never yield a BARE url that silently opens a different room on another device.
   try { setRoomUrl(currentRoomId); } catch (e) {}
   try { setTimeout(() => applyRoomBg(currentRoomId), 0); } catch {}
-  // Engine model: a pane-wide GLOBAL engine (set by account switching; read from the
-  // server's /accounts `engine`) is the default every room follows. A room may be
-  // PINNED via its titlebar selector to override the global for that room only.
-  const OVR_KEY = rid => 'bridge_engine_override::' + rid;
-  function roomOverride(rid) { try { const v = localStorage.getItem(OVR_KEY(rid || currentRoomId)); return (v === 'claude' || v === 'codex') ? v : 'global'; } catch { return 'global'; } }
-  function setRoomOverride(mode, rid) { try { const k = OVR_KEY(rid || currentRoomId); if (mode === 'claude' || mode === 'codex') localStorage.setItem(k, mode); else localStorage.removeItem(k); } catch {} }
+  // [ENGINE_GLOBAL_ONLY_V1] Engine model: ONE global engine (the server's ~/.claude/engine
+  // marker) that EVERY room runs on. The titlebar selector sets it; there are no per-room
+  // pins any more, so the old `bridge_engine_override::<room>` keys are swept on load —
+  // leaving them would let a stale key contradict what the selector shows.
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.indexOf('bridge_engine_override::') === 0) localStorage.removeItem(k);
+    }
+  } catch (e) {}
 
   // ── Per-room background colour ─────────────────────────────────────────────
   const ROOMBG_KEY = rid => 'ccb-roombg::' + (rid || currentRoomId);
@@ -655,7 +654,137 @@
     try { const f = document.getElementById('vnc-frame'); f && f.contentWindow && f.contentWindow.postMessage({ type: 'ccb-room-bg', color: c || '' }, '*'); } catch {}
   }
   window.addEventListener('message', e => { if (e && e.data && e.data.type === 'ccb-room-bg-req') applyRoomBg(currentRoomId); });
+  // ── [ROOM_LAYOUT_V1] Per-room pane layout (stored per browser) ──────────────
+  // One blob per room: { b: browser pane hidden 1/0, t: tasks pane open 1/0,
+  // cw/tw: unclamped chat/tasks width preference in px, ts: last write }.
+  // A room with no entry gets the defaults: browser open, tasks closed, CSS widths.
+  // applyLayout() is the SINGLE restore path and always writes EVERY slot — setting or
+  // explicitly CLEARING — so one room's state can never leak into the next. It never writes
+  // back to storage, so entering a room cannot overwrite that room's saved state.
+  // The pre-paint seed in index.html writes these same class/inline-style slots, so there is
+  // exactly one representation of the layout and nothing to keep in sync.
+  const LAYOUT_KEY = rid => 'ccb-layout::' + rid;
+  const LAYOUT_MOBILE_BP = 820;   // matches the stacked-layout media query in style.css
+  const MAX_LAYOUTS = 300;        // rooms accumulate; keep the newest N by write stamp
+  const clampChatW  = px => Math.max(200, Math.min(px, Math.round(window.innerWidth * 0.90)));
+  const clampTasksW = px => Math.max(300, Math.min(px, Math.round(window.innerWidth * 0.7)));
+  function readLayout(rid) {
+    let o = null;
+    try { o = JSON.parse(localStorage.getItem(LAYOUT_KEY(rid || currentRoomId)) || '{}'); } catch {}
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+  }
+  function writeLayout(patch, rid) {
+    const id = rid || currentRoomId;
+    if (!id) return;
+    try { localStorage.setItem(LAYOUT_KEY(id), JSON.stringify(Object.assign(readLayout(id), patch, { ts: Date.now() }))); } catch {}
+    pruneLayouts();
+  }
+  function pruneLayouts() {
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('ccb-layout::') === 0) keys.push(k);
+      }
+      if (keys.length <= MAX_LAYOUTS) return;
+      keys.map(k => { let ts = 0; try { ts = (JSON.parse(localStorage.getItem(k) || '{}') || {}).ts || 0; } catch {} return { k, ts }; })
+          .sort((a, b) => a.ts - b.ts)
+          .slice(0, keys.length - MAX_LAYOUTS)
+          .forEach(e => { try { localStorage.removeItem(e.k); } catch {} });
+    } catch {}
+  }
+  // Carry a draft room's layout across the draft -> session-id promotion, exactly as the
+  // engine override / room colour / conference flag are carried (see the session_id handler).
+  function migrateLayout(oldId, newId) {
+    if (!oldId || !newId || oldId === newId) return;
+    try {
+      const raw = localStorage.getItem(LAYOUT_KEY(oldId));
+      if (raw == null) return;
+      localStorage.setItem(LAYOUT_KEY(newId), raw);
+      localStorage.removeItem(LAYOUT_KEY(oldId));
+    } catch {}
+  }
+  // One-time adoption of the pre-V1 GLOBAL tasks width as this room's preference, so the
+  // width already in use isn't silently lost on upgrade.
+  function migrateLegacyTasksWidth() {
+    try {
+      const n = parseInt(localStorage.getItem('ccb-tasks-w'), 10);
+      if (!Number.isFinite(n) || n <= 0) return;
+      if (readLayout(currentRoomId).tw == null) writeLayout({ tw: n });
+      localStorage.removeItem('ccb-tasks-w');
+    } catch {}
+  }
+  // Widths only: set when the room has a saved preference AND we're on desktop; cleared to ''
+  // otherwise so the CSS defaults (and the <=820px stacked layout) reassert themselves.
+  function applyPaneWidths(rid) {
+    const L = readLayout(rid || currentRoomId);
+    const mobile = window.innerWidth <= LAYOUT_MOBILE_BP;
+    const setW = (el, px, clamp) => {
+      if (!el) return;
+      const n = parseInt(px, 10);
+      if (mobile || !Number.isFinite(n) || n <= 0) { el.style.width = ''; el.style.maxWidth = ''; return; }
+      el.style.maxWidth = 'none';               // lift the CSS max-width cap, as the drag does
+      el.style.width = clamp(n) + 'px';
+    };
+    setW(document.getElementById('chat-panel'),  L.cw, clampChatW);
+    setW(document.getElementById('tasks-panel'), L.tw, clampTasksW);
+  }
+  // Which room's task list is currently rendered. The fetch gate keys on ROOM IDENTITY, not
+  // on a closed -> open visibility transition: the pre-paint seed in index.html already applies
+  // 'tasks-panel-visible', so at boot a restored-open pane never transitions and a
+  // transition-only gate would leave it on its "Loading…" placeholder until the 30s poll.
+  // Keying on the room also refreshes the list when moving between two rooms that both have
+  // the pane open, while a resize re-run (same room) still fetches nothing.
+  let _tasksLoadedForRoom = null;
+  // Full restore for `rid`. Idempotent — safe to re-run on every resize.
+  function applyLayout(rid) {
+    const id = rid || currentRoomId;
+    const L  = readLayout(id);
+    const tp = document.getElementById('tasks-panel');
+    const bt = document.getElementById('btn-tasks');
+    setBrowserHidden(L.b === 1);
+    if (tp) {
+      const open = L.t === 1;
+      tp.classList.toggle('tasks-panel-visible', open);
+      tp.classList.toggle('tasks-panel-hidden', !open);
+      if (bt) bt.classList.toggle('active', open);
+      if (open && _tasksLoadedForRoom !== id && typeof loadTasks === 'function') {
+        _tasksLoadedForRoom = id;
+        loadTasks();
+      }
+    }
+    applyPaneWidths(id);
+  }
+  // Re-clamp on viewport change, and drop/restore inline widths across the 820px breakpoint.
+  window.addEventListener('resize', () => applyLayout(currentRoomId));
+  if (btnBrowserToggle) {
+    btnBrowserToggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      const hide = document.documentElement.getAttribute('data-browser-hidden') !== '1';
+      setBrowserHidden(hide);
+      writeLayout({ b: hide ? 1 : 0 });
+    });
+  }
+
   let globalEngine = 'claude', codexEnabled = false, roomEngineSync = false;
+  // [ENGINE_GLOBAL_ONLY_V1] The ACTIVE account of each engine, used for the selector's
+  // "Claude (email)" labels. `available` is a CREDENTIAL fact from the server (a registered
+  // login with a healthy refresh path) — never usage/quota, so an exhausted account still
+  // reads as signed in. applyEngineAccounts is the ONE consumer: /accounts on load, the 30s
+  // usage poll, every room_engine frame and an account switch all funnel through it.
+  let engineAccts = { claude: { email: '', available: true, reason: '' },
+                      codex:  { email: '', available: false, reason: 'not signed in' } };
+  function applyEngineAccounts(sum) {
+    if (!sum || typeof sum !== 'object') return;   // older server: keep the last known labels
+    for (const k of ['claude', 'codex']) {
+      if (sum[k] && typeof sum[k] === 'object') {
+        engineAccts[k] = { name: sum[k].name || null, email: sum[k].email || '',
+                           available: !!sum[k].available, reason: sum[k].reason || '' };
+      }
+    }
+    try { renderEngineOptions(); } catch (e) {}
+  }
+  function engineAvailable(e) { const a = engineAccts[e === 'codex' ? 'codex' : 'claude']; return !!(a && a.available); }
   // [ENGINE_AUTHORITATIVE_V1] The engine the status bar is CURRENTLY showing (server-authoritative
   // via /usage or room_engine). This exact value is sent with every chat so the server can refuse
   // to dispatch under an engine the user was not shown. currentTurnEngine = engine of the live turn.
@@ -677,6 +806,36 @@
   let confStartGuard = false;         // armed from send until accept/cancel; blocks a competing fresh start
   let confAwaitingAck = false;        // sent; waiting for conf_started / conf_need_task
   function confUuid() { try { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12)); } catch { return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12); } }
+  // ── [CONF_ROWID_V1] Stable row identity ─────────────────────────────────────
+  // Every stored row carries a globally-unique id. Client-generated rows (tool/Bash,
+  // ordinary bubbles) live in the "cli:" namespace and are owned by this client; the
+  // conference projection owns "conf:<turnId>". The server authorizes by namespace, so
+  // a cli: row can never be deleted by a conference repaint - which is what used to
+  // erase the working/Bash bubbles at every turn boundary.
+  let _confSeq = 0;
+  function newMid() { return 'cli:' + confUuid(); }
+  function confRowMid(turnId) { return 'conf:' + turnId; }
+  function isConfMid(mid) { return typeof mid === 'string' && mid.indexOf('conf:') === 0; }
+  // Stamp identity + conference anchoring onto a freshly-created stored row.
+  function stampRow(rec, opts) {
+    opts = opts || {};
+    rec.mid = opts.mid || newMid();
+    rec.rev = 1;
+    // [BUBBLE_TS_V1] Creation instant. A replayed/restored row carries its ORIGINAL value
+    // or none at all; only a genuinely new row may mint one. Absence is PERMANENT, so a
+    // pre-feature row can never acquire a stamp via restore/sync/cold-rebuild.
+    if (Number.isFinite(opts.ts)) rec.ts = opts.ts;
+    else if (!opts.replay) rec.ts = Date.now();
+    if (activeConf && confStreamTurnId && !isConfMid(rec.mid)) {
+      rec.parentTurnId = confStreamTurnId;     // places the row with its turn on a cold rebuild
+      rec.seq = ++_confSeq;
+    }
+    return rec;
+  }
+  function bumpRow(rec) { if (rec) rec.rev = (Number(rec.rev) || 1) + 1; return rec; }
+  // The conference namespace is server-owned: never ship a local preview of it.
+  function saveableRows(rows) { return (rows || []).filter(function (r) { return r && !isConfMid(r.mid); }); }
+
   // [CONFERENCE_HISTORY_V1] Reconcile the live preview bubble with the authoritative
   // conf_msg by STABLE turn identity (turnId from the server's confTurnId tag), not a
   // mutable global. _suppressSave stops replay/stream output being POSTed back into
@@ -688,6 +847,12 @@
   let _suppressSave = false;
   let _pendingConfSync = null;
   function confModeKey(rid) { return 'confmode:' + (rid || currentRoomId); }
+  // [ENGINE_GLOBAL_ONLY_V1] Which engine LEADS the conference armed in this room —
+  // "Claude Lead Conference Room" vs "Codex Lead Conference Room". The reviewer is always
+  // the other engine; the server already honours leadEngine on the starting chat message.
+  function confLeadKey(rid) { return 'conflead:' + (rid || currentRoomId); }
+  function confLead(rid) { try { return localStorage.getItem(confLeadKey(rid)) === 'codex' ? 'codex' : 'claude'; } catch { return 'claude'; } }
+  function setConfLead(rid, engine) { try { localStorage.setItem(confLeadKey(rid), engine === 'codex' ? 'codex' : 'claude'); } catch {} }
   function confModeOn(rid) { try { return localStorage.getItem(confModeKey(rid)) === '1' || confAutoOn(rid); } catch { return false; } }   // [CONF_MODE_AUTHORITATIVE_V3]
   function setConfMode(rid, on) { try { if (on) localStorage.setItem(confModeKey(rid), '1'); else { localStorage.removeItem(confModeKey(rid)); localStorage.removeItem(confAutoKey(rid)); } } catch {} }   // [CONF_MODE_AUTHORITATIVE_V3]
   // [CONF_MODE_AUTHORITATIVE_V3] The SERVER owns conference state. A client that never
@@ -713,6 +878,10 @@
     try {
       if (localStorage.getItem(confModeKey(oldRid)) === '1') { localStorage.setItem(confModeKey(newRid), '1'); localStorage.removeItem(confModeKey(oldRid)); }
       if (localStorage.getItem(confAutoKey(oldRid)) === '1') { localStorage.setItem(confAutoKey(newRid), '1'); localStorage.removeItem(confAutoKey(oldRid)); }
+      // [ENGINE_GLOBAL_ONLY_V1] the chosen lead travels with the room, or a promoted draft
+      // would silently fall back to Claude-lead.
+      const _lead = localStorage.getItem(confLeadKey(oldRid));
+      if (_lead) { localStorage.setItem(confLeadKey(newRid), _lead); localStorage.removeItem(confLeadKey(oldRid)); }
     } catch {}
   }
   // [CONF_NEEDTASK_RECOVER_V1] Recovery store for a message the server refused to accept
@@ -743,7 +912,130 @@
     confDraftSet(rid || currentRoomId, t);
     showToast('Your earlier message wasn\u2019t sent \u2014 saved as a draft for this room', 'warning');
   }
-  function confStripVerdict(t) { return String(t || '').replace(/<<<CONFERENCE_VERDICT[\s\S]*$/, '').replace(/\s+$/, ''); }
+  // ── [CONF_USERROW_IDENTITY_V1] Pending-delivery ledger for conference interjections ──
+  // One entry per SEND, keyed by its client-minted id (iid). The optimistic bubble is painted
+  // under the id the server will give the authoritative row (conf:interject-<iid>), so the two
+  // are ONE row and can never duplicate. Because a conf: row is server-owned it is never POSTed
+  // to /history — so until the server acknowledges it, this ledger holds the ONLY copy of the
+  // user's words. Entries are therefore never dropped by any bound: they leave only by being
+  // acknowledged (resolve) or handed back to the composer (recover, exactly once).
+  const CONF_PEND_MS = 10000;          // first-try acknowledgement window
+  const CONF_PEND_REGRACE_MS = 8000;   // FRESH window, started when a reconnect's sync lands
+  const _confPendTimers = {};
+  const _confPendMem = {};             // fallback when localStorage refuses the write
+  function confPendKey(rid) { return 'confpend:' + (rid || currentRoomId); }
+  function confPendList(rid) {
+    const k = confPendKey(rid);
+    if (_confPendMem[k]) return _confPendMem[k].slice();
+    try { const v = JSON.parse(localStorage.getItem(k) || '[]'); return Array.isArray(v) ? v.filter(Boolean) : []; }
+    catch { return []; }
+  }
+  function confPendWrite(rid, list) {
+    const k = confPendKey(rid);
+    try {
+      if (list.length) localStorage.setItem(k, JSON.stringify(list)); else localStorage.removeItem(k);
+      delete _confPendMem[k];
+    } catch (e) {
+      // Quota / private mode: keep it in memory rather than lose the user's text.
+      _confPendMem[k] = list.slice();
+      showToast('Could not save your unsent message for this room \u2014 keep this tab open until it sends', 'warning');
+    }
+  }
+  function confPendAdd(rid, entry) { const l = confPendList(rid); l.push(entry); confPendWrite(rid, l); }
+  function confPendGet(rid, iid) { return confPendList(rid).find(e => e && e.iid === iid) || null; }
+  function confPendDrop(rid, iid) { confPendWrite(rid, confPendList(rid).filter(e => !(e && e.iid === iid))); }
+  function confPendClearTimer(rid, iid) {
+    const k = confPendKey(rid) + '|' + iid;
+    if (_confPendTimers[k]) { clearTimeout(_confPendTimers[k]); delete _confPendTimers[k]; }
+  }
+  function confPendArm(rid, iid, ms) {
+    confPendClearTimer(rid, iid);
+    const k = confPendKey(rid) + '|' + iid;
+    _confPendTimers[k] = setTimeout(function () { delete _confPendTimers[k]; confPendRecover(rid, iid); }, ms || CONF_PEND_MS);
+  }
+  // Acknowledged — by the explicit ack, OR by the authoritative row arriving in a conf_sync /
+  // canonical user_msg. Whichever lands first wins; a lost ack can no longer time a message out.
+  function confPendResolve(rid, iid) {
+    if (!iid) return false;
+    const e = confPendGet(rid, iid);
+    confPendClearTimer(rid, iid);
+    if (!e) return false;
+    confPendDrop(rid, iid);
+    return true;
+  }
+  function confPendResolveMid(rid, mid) {
+    if (typeof mid !== 'string' || mid.indexOf('conf:interject-') !== 0) return false;
+    return confPendResolve(rid, mid.slice('conf:interject-'.length));
+  }
+  // Not delivered: take the (unsaved) optimistic row off the screen and hand the words back.
+  // EXACTLY once — the entry is dropped BEFORE the composer is touched, so a reload during
+  // recovery cannot restore the same text twice.
+  function confPendRecover(rid, iid) {
+    const e = confPendGet(rid, iid); if (!e) return false;
+    confPendClearTimer(rid, iid);
+    confPendDrop(rid, iid);
+    const mid = 'conf:interject-' + iid;
+    if (rid === currentRoomId) {
+      try { const n = messagesEl.querySelector('[data-mid="' + mid + '"]'); if (n) n.remove(); } catch (_) {}
+      const i = storedMsgData.findIndex(r => r && r.mid === mid);
+      if (i >= 0) storedMsgData.splice(i, 1);
+    }
+    confRecoverRejected(e.text || '', rid);
+    showToast('That message was not delivered \u2014 it is back in the box', 'warning');
+    return true;
+  }
+  // The server's rejection frames carry no interjection id, so match on the text we sent and
+  // fall back to the oldest in-flight entry for this room.
+  function confPendRecoverByText(rid, text) {
+    const t = String(text || '');
+    const l = confPendList(rid);
+    const hit = l.find(e => e && (e.text === t || e.echo === t)) || l[0];
+    return hit ? confPendRecover(rid, hit.iid) : false;
+  }
+  function confPendSuspend() { for (const k of Object.keys(_confPendTimers)) { clearTimeout(_confPendTimers[k]); delete _confPendTimers[k]; } }
+  function confPendRearm(rid, ms) { for (const e of confPendList(rid)) if (e && e.iid) confPendArm(rid, e.iid, ms); }
+  // [CONF_USERROW_IDENTITY_V1] Servers are per-user and long-lived, and the bundle is shared,
+  // so this client can be newer than the bridge it is talking to. Use the deterministic-row
+  // path ONLY for a room whose server has advertised that it honours interjectId; against an
+  // older server we fall back to exactly today's behaviour rather than to a broken hybrid.
+  const _confUserRowIdent = {};
+  function confIdentReady(rid) { return _confUserRowIdent[rid || currentRoomId] === true; }
+  function confIdentNote(msg) { if (msg && msg.userRowIdentity) _confUserRowIdent[msg.roomId || currentRoomId] = true; }
+
+  // false = a (re)connect has happened and the first conf_sync after it has not yet landed;
+  // while false, no pending entry may be failed on age alone.
+  let _confSyncGraceArmed = true;
+
+  // [CONF_HEAL_V1] Remove ONLY a trailing, closed, JSON-parseable, schema-valid verdict
+  // block, scanning backwards from the end. The old rule cut from the first delimiter to
+  // the end of the message, so a turn that merely QUOTED the delimiter lost its tail —
+  // that is what truncated four turns of the discussion that produced this fix. Must
+  // stay identical to extractVerdict() in conf-heal.js on the server.
+  var CONF_V_OPEN = '<' + '<<CONFERENCE_VERDICT';
+  var CONF_V_CLOSE = 'CONFERENCE_VERDICT' + '>>>';
+  var CONF_V_WORDS = { approve: 1, revise: 1, blocked: 1 };
+  function confFindTrailingVerdict(s) {
+    var from = s.length;
+    for (;;) {
+      var i = s.lastIndexOf(CONF_V_OPEN, from - 1);
+      if (i === -1) return -1;
+      from = i;
+      if (i > 0 && s[i - 1] !== '\n') continue;                       // line-anchored
+      var rest = s.slice(i + CONF_V_OPEN.length);
+      var c = rest.indexOf(CONF_V_CLOSE);
+      if (c === -1) continue;                                         // closed
+      if (rest.slice(c + CONF_V_CLOSE.length).trim() !== '') continue; // trailing
+      var j; try { j = JSON.parse(rest.slice(0, c).trim()); } catch (e) { continue; }
+      if (!j || typeof j !== 'object' || Array.isArray(j)) continue;
+      if (typeof j.stage !== 'string' || !CONF_V_WORDS[j.verdict]) continue;
+      return i;
+    }
+  }
+  function confStripVerdict(t) {
+    var s = String(t || '');
+    var i = confFindTrailingVerdict(s);
+    return (i === -1 ? s : s.slice(0, i)).replace(/\s+$/, '');
+  }
   function confEngineLabel(e) { return e === 'codex' ? 'Codex' : 'Claude'; }
   function confEngineIcon(e) { return e === 'codex' ? '\uD83D\uDFE9' : '\uD83D\uDFE6'; }  // 🟩 / 🟦
 
@@ -792,11 +1084,12 @@
     b.querySelector('#conf-btn-resume').style.display = c.status === 'paused' ? '' : 'none';
     b.querySelector('#conf-btn-stop').style.display = '';
   }
-  function confDivider(engine, role, round, stageLabel) {   /* [CONFERENCE_V2] */
+  function confDivider(engine, role, round, stageLabel, ts) {   /* [CONFERENCE_V2] [BUBBLE_TS_V1] */
     const d = document.createElement('div');
     d.className = 'conf-divider';
     d.style.cssText = 'margin:14px 0 4px;font-size:12px;font-weight:600;letter-spacing:.02em;opacity:.85;display:flex;align-items:center;gap:6px';
     d.textContent = confEngineIcon(engine) + ' ' + confEngineLabel(engine) + ' \u00B7 ' + (role || '') + (stageLabel ? (' \u00B7 ' + stageLabel) : '') + (round ? (' \u00B7 round ' + round) : '');
+    applyStamp(d, ts);   // [BUBBLE_TS_V1]
     messagesEl.appendChild(d);
     scrollBottom();
   }
@@ -805,22 +1098,61 @@
     if (!Array.isArray(msg.messages)) return;
     // [CONFERENCE_HISTORY_V1] Never DROP a sync that lands mid-stream — defer it and
     // apply on the next 'done' so the authoritative log always wins eventually.
+    // [CONF_USERROW_IDENTITY_V1] Authoritative arrival IS acknowledgement. This runs BEFORE
+    // the mid-stream defer below: a sync that lands while an engine is streaming must cancel
+    // the pending timer now, not when the turn ends. The first sync after a (re)connect also
+    // opens a FRESH grace window, so a frame sent before a disconnect and processed after the
+    // sync is never failed on the age of its original send.
+    confIdentNote(msg);   // [CONF_USERROW_IDENTITY_V1]
+    try {
+      const _prid = msg.roomId || currentRoomId;
+      for (const _m of msg.messages) if (_m && _m.mid) confPendResolveMid(_prid, _m.mid);
+      if (!_confSyncGraceArmed) { _confSyncGraceArmed = true; confPendRearm(_prid, CONF_PEND_REGRACE_MS); }
+    } catch (e) {}
     if (busy) { _pendingConfSync = msg; return; }
     _pendingConfSync = null;
     // [CONFERENCE_HISTORY_V1] Suppress history POSTs while replaying (this is render
     // output, not a new turn) but STILL populate storedMsgData so search/load-older
     // have the full in-memory model.
+    // [CONF_ROWID_V1] A sync no longer WIPES the room. The payload is the server's merged
+    // DISPLAY transcript (conference rows + this client's tool/Bash rows), and rows are
+    // reconciled by stable id: update what we already have, append what is new, and NEVER
+    // remove a row that is not in the payload. Only a genuinely cold room is rebuilt.
     _suppressSave = true;
     try {
-      messagesEl.innerHTML = '';
-      confBubbleByTurn = {};
-      confDividerByTurn = {};   // the wipe removed every divider; rebuild the ledger as we redraw
-      storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
-      for (const m of msg.messages) {
-        if (m.type === 'user') { appendMsg('user', m.text || ''); continue; }   // [CONF_BRIEF_V1] original brief / user turns
-        if (m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel); if (m.turnId) confDividerByTurn[m.turnId] = true; }   /* [CONFERENCE_V2] */
-        const el = appendMsg('assistant', m.text || '');
-        if (el) { if (m.engine) el.dataset.engine = m.engine; if (m.turnId) { el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = el; } }
+      const _cold = !storedMsgData.length && !messagesEl.querySelector('[data-mid]');
+      if (_cold) {
+        messagesEl.innerHTML = '';
+        confBubbleByTurn = {};
+        confDividerByTurn = {};   // the wipe removed every divider; rebuild the ledger as we redraw
+        storedMsgData = []; lastAssistantDataIdx = -1; lastToolDataIdx = -1;
+        for (const m of msg.messages) renderOneStored(m);
+      } else {
+        const _byMid = {};
+        for (const r of storedMsgData) if (r && r.mid) _byMid[r.mid] = r;
+        for (const m of msg.messages) {
+          if (!m) continue;
+          const _mid = m.mid || (m.turnId ? confRowMid(m.turnId) : null);
+          if (_mid && _byMid[_mid]) {
+            // Known row: refresh the server-owned text in place, touch nothing else.
+            const _rec = _byMid[_mid];
+            if (Number.isFinite(m.ts) && m.ts !== _rec.ts) {   // [BUBBLE_TS_V1] authoritative instant
+              _rec.ts = m.ts;
+              try { const _tn = messagesEl.querySelector('[data-mid="' + _mid + '"]'); if (_tn) applyStamp(_tn, m.ts); } catch (e) {}
+            }
+            if (m.type !== 'tool' && typeof m.text === 'string' && m.text !== _rec.text) {
+              _rec.text = m.text;
+              let _node = null;
+              try { _node = messagesEl.querySelector('[data-mid="' + _mid + '"]'); } catch (e) { _node = null; }
+              if (_node) { if (m.type === 'assistant') renderMd(_node, m.text || ''); else _node.textContent = m.text || ''; }
+            }
+            continue;
+          }
+          // Unknown row: append it (with its divider), leaving every existing row alone.
+          renderOneStored(m);
+          const _new = storedMsgData[storedMsgData.length - 1];
+          if (_new && _mid) { _new.mid = _mid; _byMid[_mid] = _new; }
+        }
       }
     } finally { _suppressSave = false; }
     confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
@@ -847,7 +1179,7 @@
     if (!pendingConfStart || pendingConfStart.committed) return;
     if (reqId && pendingConfStart.reqId && reqId !== pendingConfStart.reqId) return;
     const p = pendingConfStart; p.committed = true;
-    appendMsg('user', p.echo);
+    appendMsg('user', p.echo, { mid: 'conf:brief' });   // [CONF_USERROW_IDENTITY_V1] the server projects the brief under this exact id
     if (inputEl.value === (p.snapText || '') && pendingAttachments.map(a => a.path).join('|') === (p.snapAtt || '')) {
       inputEl.value = ''; userResizedInput = false; autoGrowInput(); clearAttachments();
     }
@@ -917,7 +1249,9 @@
       '<div style="text-align:right"><button id="conf-t-gcancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
     p.querySelector('#conf-t-gback').onclick = function () { _ttInvalidate(); _confModalRootView(); };
     p.querySelector('#conf-t-gcancel').onclick = function () { closeConfTaskModal(true); };
-    _ttFetch({ text: srcText }).then(function (d) {
+    // [LAST3_TITLE_V1] Pass roomId so the server anchors the title on the last three input
+    // bubbles (this typed objective + the two prior USER turns), not just this one.
+    _ttFetch({ text: srcText, roomId: String(currentRoomId || '') }).then(function (d) {
       if (myGen !== _ttGen) return;        // superseded by a teardown / navigation
       if (!_confPanel()) return;           // modal is gone
       _confModalCreateView({
@@ -975,7 +1309,7 @@
     confAwaitingAck = true;
     closeConfTaskModalUI();   // hide UI but KEEP guard + pending until accept / need_task / cancel
     try {
-      ws.send(JSON.stringify({ type: 'chat', text: p.text, attachments: p.attachments, engineMode: 'conference', roomId: currentRoomId, reqId: p.reqId, taskDecision: taskDecision, task: p.task }));
+      ws.send(JSON.stringify({ type: 'chat', text: p.text, attachments: p.attachments, engineMode: 'conference', leadEngine: confLead(currentRoomId), roomId: currentRoomId, reqId: p.reqId, taskDecision: taskDecision, task: p.task }));
     } catch (e) { confAwaitingAck = false; showToast('Could not start \u2014 try again', 'warning'); openConfTaskModal(null, true); }
   }
   function openConfTaskModal(payload, reuse) {
@@ -1026,14 +1360,26 @@
         const row = document.createElement('button');
         row.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
         row.textContent = 'task-' + (t.id || '?') + ' \u00b7 ' + (t.title || '(sin t\u00edtulo)');
-        row.onclick = function () { submitConfStart('linked', { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') }); };
+        row.onclick = function () {   // [TASKROOM_TITLE_V1] existing task -> always ask
+          const _t = { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') };
+          closeConfTaskModalUI();
+          _trApply({ taskId: _t.id, taskTitle: _t.title, roomKey: currentRoomId, sessionId: currentSessionId || null, existingTask: true })
+            .catch(function () { return false; })
+            .then(function () { try { submitConfStart('linked', _t); } catch (e) {} });
+        };
         listEl.appendChild(row);
       });
     };
     searchEl.oninput = draw;
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
-      .then(function (d) { all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : []; draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0); })
+      .then(function (d) { all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : []; all.sort(function (a, b) {   // [TASKPICKER_SORT_DESC_V1] highest task number first
+        const na = parseInt(String((a && a.id) || ''), 10), nb = parseInt(String((b && b.id) || ''), 10);
+        if (isNaN(na) && isNaN(nb)) return 0;
+        if (isNaN(na)) return 1;
+        if (isNaN(nb)) return -1;
+        return nb - na;
+      }); draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0); })
       .catch(function () { const listEl = p.querySelector('#conf-t-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">Could not load the list. <button id="conf-t-retry" style="cursor:pointer;margin-left:6px;padding:2px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Retry</button></div>'; const rb = listEl.querySelector('#conf-t-retry'); if (rb) rb.onclick = _confModalFindView; } });
   }
   // ── [CONF_TASK_FIELDS_V1] Area + Project on the create-a-task step ──────────
@@ -1079,20 +1425,131 @@
       if (sel.value !== want) sel.value = '';   // prior value vanished -> blank
       inp.style.display = (sel.value === NEW) ? '' : 'none';
     }
+    // [TASK_DEFAULTS_PREFILL_V1] Once the user has touched the field it is theirs:
+    // a default that arrives late (the /tasks refresh, or a slow defaults fetch)
+    // must never overwrite a choice they have already made.
+    let touched = false;
     sel.addEventListener('change', function () {
+      touched = true;
       const on = sel.value === NEW;
       inp.style.display = on ? '' : 'none';
       if (on) { try { inp.focus(); } catch (e) {} } else { inp.value = ''; }
     });
+    inp.addEventListener('input', function () { touched = true; });
     populate([]);
     return {
       el: wrap,
       populate: populate,
+      // [TASK_DEFAULTS_PREFILL_V1] Prefill only: applies when the field is untouched
+      // and still blank. A value with no matching option assigns as '' (the same
+      // <select> semantics populate() relies on), so a remembered area or project
+      // that no longer exists just leaves the field blank.
+      setDefault: function (v) {
+        if (touched || sel.value !== '') return;
+        const want = String(v == null ? '' : v);
+        if (!want) return;
+        sel.value = want;
+        inp.style.display = 'none';
+      },
       getValue: function () {
         const v = (sel.value === NEW) ? inp.value : sel.value;
         return String(v || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
       }
     };
+  }
+  // ── [TASK_DEFAULTS_PREFILL_V1] Last Area/Project used in a create-task modal ──
+  // Read once per page load from GET /tasks/task-defaults (proxied to the Laravel
+  // bridge API). Any failure — offline, 404 on a pane still using the file-based
+  // task store — resolves to blanks, which is exactly the pre-feature behaviour.
+  let _taskDefaultsPromise = null;
+  function _fetchTaskDefaults() {
+    if (!_taskDefaultsPromise) {
+      _taskDefaultsPromise = fetch(API_BASE + '/tasks/task-defaults', { cache: 'no-store' })
+        .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+        .then(function (d) {
+          const x = (d && d.defaults) || {};
+          return { area: String(x.area || ''), project: String(x.project || '') };
+        })
+        .catch(function () { return { area: '', project: '' }; });
+    }
+    return _taskDefaultsPromise;
+  }
+  // The server records the new pair as part of the create call; mirror it locally so a
+  // second modal opened in the same page load prefills without a refetch.
+  function _noteTaskDefaults(area, project) {
+    _taskDefaultsPromise = Promise.resolve({ area: String(area || ''), project: String(project || '') });
+  }
+  // guardEl: the fields row. If it is gone the user navigated away mid-fetch.
+  function _applyTaskDefaults(areaField, projField, guardEl) {
+    return _fetchTaskDefaults().then(function (d) {
+      if (guardEl && !guardEl.isConnected) return;
+      areaField.setDefault(d.area);
+      projField.setDefault(d.project);
+    }).catch(function () {});
+  }
+  // ── [TASKROOM_TITLE_V1] Room title derived from the task just associated ────
+  // "<task id> - <task title>". The confirmed title is reused EXACTLY: the create
+  // forms already collapse whitespace before POST /tasks and an existing task's
+  // title comes from the server, so only the join and the length cap happen here.
+  const TR_MAX = 60;
+  function _trTitle(taskId, taskTitle) {
+    const id = String(taskId == null ? '' : taskId).trim();
+    const t = String(taskTitle == null ? '' : taskTitle).trim();
+    if (!id || !t) return '';
+    const s = id + ' - ' + t;
+    return s.length <= TR_MAX ? s : (s.slice(0, TR_MAX - 1) + '\u2026');
+  }
+  // Bounded, name-aware guard against the server auto-namer (bridge-server.js
+  // autoNameRoom) repainting over a name we just wrote. Only a CONFLICTING
+  // session_named for that id inside the window is ignored, so a legitimate
+  // rename from another client still lands.
+  const _trExpect = new Map();   // sessionId -> { name, until }
+  const TR_EXPECT_MS = 30000;
+  function _trExpectName(sessionId, name) {
+    if (sessionId && name) _trExpect.set(String(sessionId), { name: name, until: Date.now() + TR_EXPECT_MS });
+  }
+  function _trAcceptNamed(id, name) {
+    const e = _trExpect.get(String(id));
+    if (!e) return true;
+    if (Date.now() > e.until) { _trExpect.delete(String(id)); return true; }
+    if (name === e.name) { _trExpect.delete(String(id)); return true; }
+    return false;
+  }
+  function _trDraftName(roomKey) {
+    try { return localStorage.getItem('bridge_pending_name::' + roomKey) || ''; } catch (e) { return ''; }
+  }
+  // Apply the derived title to an EXPLICIT target — never infers the room from
+  // currentRoomId/currentSessionId, so a room switch mid-flow cannot rename the
+  // wrong room. Returns true only when applied; never throws.
+  async function _trApply(o) {
+    try {
+      o = o || {};
+      const name = _trTitle(o.taskId, o.taskTitle);
+      if (!name) return false;
+      const sid = o.sessionId ? String(o.sessionId) : '';
+      const roomKey = String(o.roomKey || '');
+      const cur = sid ? (sessionNameById[sid] || '') : _trDraftName(roomKey);
+      if (cur || o.existingTask) {
+        const q = cur
+          ? ('Rename this room from \u201C' + cur + '\u201D to \u201C' + name + '\u201D?')
+          : ('Name this room \u201C' + name + '\u201D?');
+        if (!await confirmDialog(q, 'Rename')) return false;
+      }
+      if (sid) {
+        const r = await fetch(API_BASE + '/sessions/' + encodeURIComponent(sid) + '/name', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
+        if (!r || !r.ok) return false;
+        sessionNameById[sid] = name;
+        _trExpectName(sid, name);
+        if (currentSessionId === sid) updateTitlebar();
+        if (typeof loadSessions === 'function') loadSessions();
+      } else {
+        if (!roomKey) return false;
+        try { localStorage.setItem('bridge_pending_name::' + roomKey, name); } catch (e) {}
+        if (roomKey === currentRoomId) { pendingRoomName = name; updateTitlebar(); }
+      }
+      return true;
+    } catch (e) { return false; }
   }
   function _confModalCreateView(seed) {
     const p = _confPanel(); if (!p) return;
@@ -1123,6 +1580,7 @@
     let _seed = []; try { _seed = lastTasks || []; } catch (e) { _seed = []; }
     areaField.populate(_confDistinctValues(_seed, 'area'));
     projField.populate(_confDistinctValues(_seed, 'project'));
+    _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) {
@@ -1130,6 +1588,7 @@
         const all = (d && Array.isArray(d.tasks)) ? d.tasks : [];
         areaField.populate(_confDistinctValues(all, 'area'));
         projField.populate(_confDistinctValues(all, 'project'));
+        _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1] seed may not have held it
       })
       .catch(function () {});
     p.querySelector('#conf-t-back').onclick = _confModalRootView;
@@ -1140,16 +1599,37 @@
       const errEl = p.querySelector('#conf-t-err');
       if (title.length < 3) { if (errEl) errEl.textContent = 'El t\u00edtulo debe tener al menos 3 caracteres.'; return; }
       createBtn.disabled = true; createBtn.textContent = 'Creating\u2026';
-      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: areaField.getValue(), project: projField.getValue() }) })
+      const _area = areaField.getValue(), _project = projField.getValue();   // [TASK_DEFAULTS_PREFILL_V1]
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-        .then(function (res) { if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error'); submitConfStart('linked', { id: String(res.j.id || ''), file: String(res.j.file || ''), title: String(res.j.title || title) }); })
+        .then(function (res) {
+          if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error');
+          _noteTaskDefaults(_area, _project);
+          const _t = { id: String(res.j.id || ''), file: String(res.j.file || ''), title: String(res.j.title || title) };
+          // [TASKROOM_TITLE_V1] Stage the room title BEFORE the start: submitConfStart is
+          // what starts the conference AND performs the server-side link. The confirm
+          // (z-index 200) must not sit under this modal (9999), so close the UI first —
+          // closeConfTaskModalUI keeps pendingConfStart intact. A declined or failed
+          // rename must never stop the start.
+          closeConfTaskModalUI();
+          return _trApply({ taskId: _t.id, taskTitle: _t.title, roomKey: currentRoomId, sessionId: currentSessionId || null, existingTask: false })
+            .catch(function () { return false; })
+            .then(function () { try { submitConfStart('linked', _t); } catch (e) {} });
+        })
         .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Create and start'; if (errEl) errEl.textContent = 'Could not create the task. Try again.'; });
     };
     setTimeout(function () { try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch (e) {} }, 0);
   }
 
-  function effectiveEngine(rid) { const o = roomOverride(rid); return o === 'global' ? globalEngine : o; }
-  function applyEngineMeta(d) { if (!d) return; globalEngine = (d.engine === 'codex') ? 'codex' : 'claude'; codexEnabled = !!d.codexEnabled; if (typeof updateTitlebar === 'function') updateTitlebar(); }
+  // [ENGINE_GLOBAL_ONLY_V1] Every room runs the one global engine.
+  function effectiveEngine(rid) { return globalEngine; }
+  function applyEngineMeta(d) {
+    if (!d) return;
+    globalEngine = (d.engine === 'codex') ? 'codex' : 'claude';
+    codexEnabled = !!d.codexEnabled;
+    applyEngineAccounts(d.engineAccounts);
+    if (typeof updateTitlebar === 'function') updateTitlebar();
+  }
   (async () => { try { const _d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
   if (_PRB || _RV) setVncRoom(currentRoomId);   // point the live panel at this room's own browser
   let storedMsgData        = [];
@@ -1166,7 +1646,7 @@
     // conference (activeConf), the server owns /history (served from the authoritative
     // conference log), so never POST render/stream output back — it would recreate the
     // divergent record that caused the jumbling.
-    if (_suppressSave || activeConf) return;
+    if (_suppressSave) return;   // [CONF_ROWID_V1] activeConf no longer blocks the save: conf: rows are filtered out below and the server rejects them by namespace
     // [XENGINE_STALESAVE_V1] On a bare (unpinned) load, currentSessionId is seeded
     // from the global localStorage key and can be a STALE id (e.g. a Codex thread
     // id). Persisting the first reply-less turn under it materialises an orphan
@@ -1181,7 +1661,11 @@
     clearTimeout(_saveTimer);
     _saveTimer = setTimeout(() => {
       if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'save_history', sessionId: currentSessionId, messages: storedMsgData }));
+        // [CONF_HEAL_V1] proto:2 + full:true DECLARE what this payload is (a complete
+        // client-side snapshot, every row stamped) instead of leaving the server to
+        // guess from its shape. An undeclared mid-less payload is refused, not
+        // half-written, so a save can never silently lose a message again.
+        ws.send(JSON.stringify({ type: 'save_history', proto: 2, full: true, sessionId: currentSessionId, messages: saveableRows(storedMsgData) }));   // [CONF_ROWID_V1] never ship server-owned rows
       }
     }, 400);
   }
@@ -1259,7 +1743,7 @@
   function compactCount(rid) { try { return parseInt(localStorage.getItem(compactKey(rid)) || '0', 10) || 0; } catch { return 0; } }
   let compactNudgeEl = null;
   function hideCompactNudge() { if (compactNudgeEl) { compactNudgeEl.remove(); compactNudgeEl = null; } }
-  function showCompactNudge(n) {
+  function showCompactNudge(n) { return; // [COMPACT_NUDGE_DISABLED] banner removed at user request
     if (compactNudgeEl) { const s = compactNudgeEl.querySelector('.cn-n'); if (s) s.textContent = n; return; }
     compactNudgeEl = document.createElement('div');
     compactNudgeEl.className = 'ctx-warning';
@@ -1283,7 +1767,7 @@
   }
 
   // ── DOM helpers ────────────────────────────────────────────────────────────
-  function appendMsg(role, text) {
+  function appendMsg(role, text, opts) {   // [CONF_ROWID_V1] opts.mid pins a server-owned id
     removeThinking();
     const div = document.createElement('div');
 
@@ -1310,12 +1794,18 @@
     scrollBottom();
 
     if (!_restoring) {
-      const rec = { type: role, text: text || '' };
+      const rec = stampRow({ type: role, text: text || '' }, opts);   // [CONF_ROWID_V1]
       if (role === 'assistant' && currentTurnEngine) rec.engine = currentTurnEngine;
       storedMsgData.push(rec);
       if (role === 'assistant') lastAssistantDataIdx = storedMsgData.length - 1;
       saveToStorage();
     }
+    if (div && !_restoring && storedMsgData.length) {
+      const _r = storedMsgData[storedMsgData.length - 1];
+      if (_r && _r.mid) div.dataset.mid = _r.mid;   // [CONF_ROWID_V1] DOM carries the join key
+      applyStamp(div, _r && _r.ts);                 // [BUBBLE_TS_V1]
+    }
+    if (div && _restoring) applyStamp(div, opts && opts.ts);   // [BUBBLE_TS_V1] replay keeps the original instant
 
     return div;
   }
@@ -1330,10 +1820,14 @@
       scrollBottom();
       lastToolEl = qwrap;
       if (!_restoring) {
-        storedMsgData.push({ type: 'tool', toolName: name, args, result: null, id: id || null, answered: (opts && opts.answered) || null });
+        const _qrec = stampRow({ type: 'tool', toolName: name, args, result: null, id: id || null, answered: (opts && opts.answered) || null }, opts);   // [CONF_ROWID_V1]
+        storedMsgData.push(_qrec);
         lastToolDataIdx = storedMsgData.length - 1;
+        try { qwrap.dataset.mid = _qrec.mid; } catch (e) {}
+        applyStamp(qwrap, _qrec.ts);   // [BUBBLE_TS_V1]
         saveToStorage();
       }
+      if (_restoring) applyStamp(qwrap, opts && opts.ts);   // [BUBBLE_TS_V1]
       return;
     }
 
@@ -1388,10 +1882,14 @@
     lastToolEl = wrap;
 
     if (!_restoring) {
-      storedMsgData.push({ type: 'tool', toolName: name, args, result: null, id: id || null });
+      const _trec = stampRow({ type: 'tool', toolName: name, args, result: null, id: id || null }, opts);   // [CONF_ROWID_V1]
+      storedMsgData.push(_trec);
       lastToolDataIdx = storedMsgData.length - 1;
+      try { wrap.dataset.mid = _trec.mid; } catch (e) {}
+      applyStamp(wrap, _trec.ts);   // [BUBBLE_TS_V1]
       saveToStorage();
     }
+    if (_restoring) applyStamp(wrap, opts && opts.ts);   // [BUBBLE_TS_V1]
   }
 
   function updateLastToolResult(content) {
@@ -1406,6 +1904,7 @@
     }
     if (!_restoring && lastToolDataIdx >= 0) {
       storedMsgData[lastToolDataIdx].result = String(content).slice(0, 600);
+      bumpRow(storedMsgData[lastToolDataIdx]);   // [CONF_ROWID_V1] a newer rev wins over a stale save
       saveToStorage();
     }
   }
@@ -1549,7 +2048,7 @@
         try {
           for (const r of storedMsgData) { if (r && r.type === 'tool' && r.id === msg.tool_use_id) { r.answered = map || {}; } }
           saveToStorage();
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'save_history', sessionId: currentSessionId, messages: storedMsgData }));
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'save_history', proto: 2, full: true, sessionId: currentSessionId, messages: saveableRows(storedMsgData) }));   // [CONF_HEAL_V1] declared snapshot
         } catch (e) {}
         break;
       }
@@ -1568,6 +2067,7 @@
         appendMsg('user', '\uD83E\uDD1D Conference started \u2014 lead: ' + confEngineLabel(msg.leadEngine) + ', reviewer: ' + confEngineLabel(msg.reviewEngine) + ' (up to ' + msg.maxRounds + ' rounds)');
         break;
       case 'conf_status':
+        confIdentNote(msg);   // [CONF_USERROW_IDENTITY_V1]
         confAdoptMode(msg.status, msg.roomId);   // [CONF_MODE_AUTHORITATIVE_V4] every status, INCLUDING idle, settles adopted mode first
         if (msg.status === 'idle') { resetConfUI(); break; }   // [CONFERENCE_ROOMSWITCH_V1] authoritative: no conference in this room
         confState = { status: msg.status, task: (msg.task || null), startReqId: (msg.startReqId || null), stage: msg.stage, stageLabel: msg.stageLabel, subphase: msg.subphase, restriction: msg.restriction, round: msg.round, maxRounds: msg.maxRounds, leadEngine: msg.leadEngine, reviewEngine: msg.reviewEngine, nextEngine: msg.nextEngine, reason: msg.reason }; confReconcilePending(msg.startReqId);   /* [CONFERENCE_V2] */
@@ -1577,7 +2077,7 @@
         confStreamEngine = msg.engine;
         confStreamTurnId = msg.turnId || null;   // [CONFERENCE_HISTORY_V1] identity for this turn's stream + bubble
         currentTurnEngine = msg.engine === 'codex' ? 'codex' : 'claude';   // colour the streamed bubble for the right engine
-        confDivider(msg.engine, msg.role, msg.round, msg.stageLabel);   /* [CONFERENCE_V2] */
+        confDivider(msg.engine, msg.role, msg.round, msg.stageLabel, msg.ts);   /* [CONFERENCE_V2] [BUBBLE_TS_V1] */
         if (msg.turnId) confDividerByTurn[msg.turnId] = true;   // [CONFERENCE_HISTORY_V1] this turn's divider is now on screen
         break;
       case 'conf_msg': {
@@ -1606,10 +2106,10 @@
           // preview + divider). Redraw the divider from the message's own identity fields
           // (conclusions have none) so the divider/body pairing is always preserved, then
           // append the body.
-          if (_tid && msg.role && msg.role !== 'conclusion' && !confDividerByTurn[_tid]) { confDivider(msg.engine, msg.role, msg.round, msg.stageLabel); confDividerByTurn[_tid] = true; }
-          _el = appendMsg('assistant', _clean);
+          if (_tid && msg.role && msg.role !== 'conclusion' && !confDividerByTurn[_tid]) { confDivider(msg.engine, msg.role, msg.round, msg.stageLabel, msg.ts); confDividerByTurn[_tid] = true; }
+          _el = appendMsg('assistant', _clean, { ts: msg.ts });   // [BUBBLE_TS_V1]
         }
-        if (_el) { if (msg.engine) _el.dataset.engine = msg.engine; if (_tid) { _el.dataset.turnId = _tid; confBubbleByTurn[_tid] = _el; } }
+        if (_el) { if (msg.engine) _el.dataset.engine = msg.engine; if (_tid) { _el.dataset.turnId = _tid; _el.dataset.mid = confRowMid(_tid); confBubbleByTurn[_tid] = _el; } applyStamp(_el, msg.ts); }   // [CONF_ROWID_V1] [BUBBLE_TS_V1] server instant wins over the optimistic one
         currentAssistantEl = null; currentAssistantText = '';
         break;
       }
@@ -1619,7 +2119,12 @@
           openConfTaskModal(null, true);
           showToast(msg.reason === 'task' ? 'That task no longer exists \u2014 pick another option' : 'Choose a task option to continue', 'warning');
         } else {
-          confRecoverRejected(msg.text, msg.roomId);   // [CONF_NEEDTASK_RECOVER_V1] no pending start: never drop the words
+          // [CONF_USERROW_IDENTITY_V1] If this was an interjection we optimistically painted
+          // (stale client conference state), that recovery removes the row AND hands the words
+          // back; only fall through to the generic path when there was nothing pending.
+          if (!confPendRecoverByText(msg.roomId || currentRoomId, msg.text)) {
+            confRecoverRejected(msg.text, msg.roomId);   // [CONF_NEEDTASK_RECOVER_V1] no pending start: never drop the words
+          }
         }
         break;
       case 'conf_sync':
@@ -1634,10 +2139,31 @@
         if (/auto-compacting|compacting to free space/i.test(msg.text || '')) noteCompaction();
         break;
 
-      // A message sent from another device on this shared session.
-      case 'user_msg':
-        appendMsg('user', msg.text || '');
+      // [CONF_USERROW_IDENTITY_V1] The server accepted this interjection and tells us the
+      // canonical row id it assigned — which is the id we painted, so nothing to redraw.
+      case 'conf_interject_ack':
+        if (msg.mid && Number.isFinite(msg.ts)) {   // [BUBBLE_TS_V1]
+          try { const _n = messagesEl.querySelector('[data-mid="' + msg.mid + '"]'); if (_n) applyStamp(_n, msg.ts); } catch (e) {}
+          for (const _r of storedMsgData) { if (_r && _r.mid === msg.mid) { _r.ts = msg.ts; break; } }
+        }
+        confPendResolve(msg.roomId || currentRoomId, msg.interjectId);
         break;
+
+      // A message sent from another device on this shared session.
+      case 'user_msg': {
+        const _umid = (typeof msg.mid === 'string' && msg.mid) ? msg.mid : null;   // [CONF_USERROW_IDENTITY_V1]
+        // [BUBBLE_TS_V1] The server ratified (or replaced) this row's instant. Adopt it
+        // BEFORE any early-return, so the sender's optimistic bubble is corrected too and
+        // no device can display a different time — including at a minute boundary.
+        if (_umid && Number.isFinite(msg.ts)) {
+          try { const _n = messagesEl.querySelector('[data-mid="' + _umid + '"]'); if (_n) applyStamp(_n, msg.ts); } catch (e) {}
+          for (const _r of storedMsgData) { if (_r && _r.mid === _umid) { _r.ts = msg.ts; break; } }
+        }
+        if (_umid && confPendResolveMid(currentRoomId, _umid)) break;   // our own send: already on screen under this id
+        if (_umid) { try { if (messagesEl.querySelector('[data-mid="' + _umid + '"]')) break; } catch (e) {} }
+        appendMsg('user', msg.text || '', { mid: _umid || null, ts: msg.ts });   // [BUBBLE_TS_V1]
+        break;
+      }
 
       // Full history pushed by server when a second device joins mid-session.
       case 'history_sync':
@@ -1665,14 +2191,14 @@
       case 'stream':
         lastStreamAt = Date.now();
         confStreamTurnId = ('confTurnId' in msg) ? (msg.confTurnId || null) : confStreamTurnId;   // [CONFERENCE_HISTORY_V1]
-        handleStreamEvent(msg.data);
+        handleStreamEvent(msg.data, msg.ts);   // [BUBBLE_TS_V1]
         break;
 
       case 'raw':
         // Unparseable line from claude — show as assistant text
         if (!currentAssistantEl) {
           currentAssistantText = '';
-          currentAssistantEl   = appendMsg('assistant', '');
+          currentAssistantEl   = appendMsg('assistant', '', { ts: msg.ts });   // [BUBBLE_TS_V1]
         }
         currentAssistantText += msg.text + '\n';
         renderMd(currentAssistantEl, currentAssistantText);
@@ -1694,7 +2220,7 @@
 
       case 'session_named':
         /* AUTONAME_ROOM_V1: server derived a title for a still-unnamed room */
-        if (msg.id && msg.name) {
+        if (msg.id && msg.name && _trAcceptNamed(msg.id, msg.name)) {   // [TASKROOM_TITLE_V1]
           sessionNameById[msg.id] = msg.name;
           pendingRoomName = '';
           updateTitlebar();
@@ -1704,14 +2230,14 @@
 
       case 'room_engine':
         roomEngineSync = true;
+        applyEngineAccounts(msg.engineAccounts);   // [ENGINE_GLOBAL_ONLY_V1] labels follow the authoritative frame
         if (msg.roomId !== currentRoomId) break;
-        setRoomOverride(msg.mode, msg.roomId);
-        if (msg.mode === 'global') globalEngine = msg.engine === 'codex' ? 'codex' : 'claude';
-        displayedEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        globalEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        displayedEngine = globalEngine;
         updateTitlebar();
         pollUsage();
         if (msg.error) {
-          appendMsg('error', '⚠ ' + msg.error);
+          appendMsg('error', '⚠ ' + msg.error, { ts: msg.ts });   // [BUBBLE_TS_V1]
           setBusy(!!msg.processing);
           if (!msg.processing) removeThinking();
         }
@@ -1724,9 +2250,10 @@
       case 'engine_resync':
       case 'client_upgrade_required':
         if (msg.roomId && msg.roomId !== currentRoomId) break;
+        applyEngineAccounts(msg.engineAccounts);   // [ENGINE_GLOBAL_ONLY_V1]
         if (msg.engine) {
           displayedEngine = msg.engine === 'codex' ? 'codex' : 'claude';
-          if (msg.mode === 'global') globalEngine = displayedEngine; else setRoomOverride(msg.mode, currentRoomId);
+          globalEngine = displayedEngine;
         }
         if (msg.text && !inputEl.value.trim()) { inputEl.value = msg.text; inputEl.dispatchEvent(new Event('input', { bubbles: true })); }
         removeThinking(); setBusy(false);
@@ -1770,11 +2297,13 @@
         // to that durable id so a reload rejoins THIS exact room/conversation.
         if (PINNED_ROOM && PINNED_ROOM.startsWith('draft-')) {
           roomServerConfirmed = false;   // [ROOMLINK_V1] id is changing; re-confirm after currentRoomId is final
-          try { setRoomOverride(roomOverride(currentRoomId), msg.id); localStorage.removeItem(OVR_KEY(currentRoomId)); } catch {}
+          // [ENGINE_GLOBAL_ONLY_V1] nothing engine-related to carry: the engine is global.
           try { const _bg = getRoomBg(currentRoomId); if (_bg) { setRoomBg(_bg, msg.id); setRoomBg('', currentRoomId); } applyRoomBg(msg.id); } catch {}
+          try { migrateLayout(currentRoomId, msg.id); } catch {}   // [ROOM_LAYOUT_V1]
           if (pendingRoomName) {
             const _pn = pendingRoomName;
             sessionNameById[msg.id] = _pn;
+            _trExpectName(msg.id, _pn);   // [TASKROOM_TITLE_V1]
             fetch(`${API_BASE}/sessions/${msg.id}/name`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ name: _pn })
@@ -1799,6 +2328,7 @@
           // so switching engines forked a 2nd room (Claude session id -> Codex thread
           // id). Mirror the draft-promote branch: one stable room across engines.
           confMigrateMode(currentRoomId, msg.id);   // [CONF_MODE_MIGRATE_V4]
+          try { migrateLayout(currentRoomId, msg.id); } catch {}   // [ROOM_LAYOUT_V1]
           PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
           SESSION_KEY = 'bridge_session_id::' + msg.id;
@@ -1842,7 +2372,7 @@
       case 'error':
         removeThinking();
         setBusy(false);
-        appendMsg('error', '⚠ ' + (msg.text || 'Unknown error'));
+        appendMsg('error', '⚠ ' + (msg.text || 'Unknown error'), { ts: msg.ts });   // [BUBBLE_TS_V1]
         break;
     }
   }
@@ -1999,6 +2529,8 @@
       if (!isCurrent() || !data.ok) return;
       const engine = (data.engine === 'codex') ? 'codex' : (data.engine === 'claude' ? 'claude' : guess);
       displayedEngine = engine;
+      globalEngine = engine;                       // [ENGINE_GLOBAL_ONLY_V1] one engine, server-authoritative
+      applyEngineAccounts(data.engineAccounts);    // keeps the selector's emails live on every poll
       if (btnUsageRefresh) btnUsageRefresh.style.display = engine === 'codex' ? 'none' : '';
 
       let selectedEmail = '';
@@ -2095,11 +2627,12 @@
     if (el) el.remove();
   }
 
-  async function doSwitchKeepContext(name, note) {
+  async function doSwitchKeepContext(name, note, type) {
     try {
       const r = await fetch(API_BASE + '/accounts/switch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type: 'code' })
+        // [ENGINE_GLOBAL_ONLY_V1] switch within the RUNNING engine's own account family
+        body: JSON.stringify({ name, type: (type === 'codex' ? 'codex' : 'code') })
       });
       const d = await r.json();
       if (r.ok && d.ok) {
@@ -2129,7 +2662,7 @@
     yes.style.cssText = 'background:#f59e0b;color:#111;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer';
     yes.onclick = async () => {
       yes.disabled = true;
-      const ok = await doSwitchKeepContext(cand.name, 'Switched (at ' + curPct + '%)');
+      const ok = await doSwitchKeepContext(cand.name, 'Switched (at ' + curPct + '%)', cand.type);
       if (ok) hideSwitchPrompt(); else yes.disabled = false;
     };
     const no = document.createElement('button');
@@ -2157,9 +2690,16 @@
     try {
       const d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json();
       if (!d.ok) return;
+      applyEngineAccounts(d.engineAccounts);
+      // [ENGINE_GLOBAL_ONLY_V1] Only ever offer an account of the engine that is actually
+      // running: the list now carries both engines, and switching to the other engine's
+      // account would no longer even change the engine — it would just be wrong.
+      const _eng = displayedEngine || globalEngine;
+      const _activeEmail = (engineAccts[_eng === 'codex' ? 'codex' : 'claude'] || {}).email || d.active;
       const cands = (d.accounts || [])
-        .filter(a => a.email && a.email !== d.active)
-        .map(a => ({ name: a.name, email: a.email, pct: acctUsagePct(a.usage), expired: a.expired }))
+        .filter(a => (_eng === 'codex' ? a.type === 'codex' : a.type !== 'codex'))
+        .filter(a => a.email && a.email !== _activeEmail)
+        .map(a => ({ name: a.name, type: a.type, email: a.email, pct: acctUsagePct(a.usage), expired: a.expired }))
         .filter(a => a.pct != null && a.pct < SWITCH_THRESHOLD && a.expired !== true)
         .sort((x, y) => x.pct - y.pct);
       if (!cands.length) { hideSwitchPrompt(); return; }
@@ -2168,7 +2708,7 @@
         // Only auto-switch once per window (guard against the 30s poll re-firing).
         if (resetsAt && localStorage.getItem(SNOOZE_KEY) === String(resetsAt)) return;
         if (resetsAt) localStorage.setItem(SNOOZE_KEY, String(resetsAt));
-        await doSwitchKeepContext(best.name, 'Auto-switched (at ' + pct + '%)');
+        await doSwitchKeepContext(best.name, 'Auto-switched (at ' + pct + '%)', best.type);
       } else {
         showSwitchPrompt(pct, best, resetsAt);
       }
@@ -2302,7 +2842,7 @@
   });
 
   // ── Parse Claude CLI stream-json events ────────────────────────────────────
-  function handleStreamEvent(ev) {
+  function handleStreamEvent(ev, frameTs) {   // [BUBBLE_TS_V1]
     if (!ev?.type) return;
 
     if (ev.type === 'system' && ev.subtype === 'init') {
@@ -2326,10 +2866,10 @@
       for (const block of content) {
         if (block.type === 'text') {
           if (!currentAssistantEl) {
-            currentAssistantEl = appendMsg('assistant', '');
+            currentAssistantEl = appendMsg('assistant', '', { ts: frameTs });   // [BUBBLE_TS_V1]
             // [CONFERENCE_HISTORY_V1] Key this live preview bubble to its turn so the
             // authoritative conf_msg can reconcile (replace) it by identity.
-            if (activeConf && confStreamTurnId && currentAssistantEl) { currentAssistantEl.dataset.turnId = confStreamTurnId; confBubbleByTurn[confStreamTurnId] = currentAssistantEl; }
+            if (activeConf && confStreamTurnId && currentAssistantEl) { currentAssistantEl.dataset.turnId = confStreamTurnId; currentAssistantEl.dataset.mid = confRowMid(confStreamTurnId); if (lastAssistantDataIdx >= 0 && storedMsgData[lastAssistantDataIdx]) { storedMsgData[lastAssistantDataIdx].mid = confRowMid(confStreamTurnId); storedMsgData[lastAssistantDataIdx].turnId = confStreamTurnId; } confBubbleByTurn[confStreamTurnId] = currentAssistantEl; }   // [CONF_ROWID_V1] same id the server projection mints
           }
           currentAssistantText += block.text;
           renderMd(currentAssistantEl, activeConf ? confStripVerdict(currentAssistantText) : currentAssistantText);   // [CONFERENCE_V1]
@@ -2341,7 +2881,7 @@
           saveToStorage();
           scrollBottom();
         } else if (block.type === 'tool_use') {
-          appendToolMsg(block.name, block.input, block.id);
+          appendToolMsg(block.name, block.input, block.id, { ts: frameTs });   // [BUBBLE_TS_V1]
           setActivity(toolIntent(block.name, block.input));
           currentAssistantEl   = null;
           currentAssistantText = '';
@@ -2394,7 +2934,7 @@
 
   function renderOneStored(m) {            // bottom-append, mirrors the live path
     if (m.type === 'tool') {
-      appendToolMsg(m.toolName, m.args, m.id, { answered: m.answered });
+      appendToolMsg(m.toolName, m.args, m.id, { answered: m.answered, mid: m.mid || null, ts: m.ts, replay: true });   // [CONF_ROWID_V1] [BUBBLE_TS_V1]
       if (m.result !== null && m.result !== undefined && lastToolEl) {
         const resEl = lastToolEl.querySelector('[data-role="tool-result"]');
         if (resEl) { resEl.classList.remove('pending'); resEl.className = 'tool-result'; resEl.textContent = m.result; }
@@ -2403,21 +2943,22 @@
       // [CONFERENCE_HISTORY_V1] A conference log message carries role/stage; render its
       // divider so the /history-restore path matches renderConfSync exactly (identical
       // ordered DOM). Non-conference messages have no role, so this is a no-op for them.
-      if (m.type === 'assistant' && m.role && m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel); if (m.turnId) confDividerByTurn[m.turnId] = true; }
-      const _el = appendMsg(m.type, m.text || '');
+      if (m.type === 'assistant' && m.role && m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel, m.ts); if (m.turnId) confDividerByTurn[m.turnId] = true; }
+      const _el = appendMsg(m.type, m.text || '', { mid: m.mid || null, ts: m.ts, replay: true });   // [BUBBLE_TS_V1]
+      if (_el) { if (m.mid) _el.dataset.mid = m.mid; }   // [CONF_ROWID_V1]
       if (_el && m.type === 'assistant') { if (m.engine) _el.dataset.engine = m.engine; if (m.turnId) { _el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = _el; } }
     }
   }
 
-  function buildMsgNode(role, text, engine) {
+  function buildMsgNode(role, text, engine, ts) {   // [BUBBLE_TS_V1]
     const div = document.createElement('div');
     div.className = `msg msg-${role}`;
     if (role === 'assistant') { div.style.whiteSpace = 'normal'; if (engine) div.dataset.engine = engine; renderMd(div, text || ''); }
     else div.textContent = text || '';
-    return div;
+    return applyStamp(div, ts);   // [BUBBLE_TS_V1]
   }
 
-  function buildToolNode(name, args, result) {
+  function buildToolNode(name, args, result, ts) {   // [BUBBLE_TS_V1]
     const wrap = document.createElement('div'); wrap.className = 'msg-tool';
     const header = document.createElement('div'); header.className = 'tool-header';
     const icon = document.createElement('span'); icon.className = 'tool-icon'; icon.textContent = '⚙';
@@ -2433,7 +2974,7 @@
     let expanded = false;
     header.addEventListener('click', () => { expanded = !expanded; body.style.display = expanded ? 'block' : 'none'; caret.style.transform = expanded ? 'rotate(90deg)' : ''; });
     wrap.append(header, body);
-    return wrap;
+    return applyStamp(wrap, ts);   // [BUBBLE_TS_V1]
   }
 
   // [ASK_QUESTION_V1] Interactive renderer + submission for the AskUserQuestion tool.
@@ -2583,8 +3124,8 @@
     const frag = document.createDocumentFragment();
     for (const m of batch) {
       const node = m.type === 'tool'
-        ? ((m.toolName === 'AskUserQuestion' && m.args && Array.isArray(m.args.questions)) ? buildQuestionWidget(m.args, m.id, m.answered || null) : buildToolNode(m.toolName, m.args, m.result))
-        : buildMsgNode(m.type, m.text || '', m.engine);
+        ? ((m.toolName === 'AskUserQuestion' && m.args && Array.isArray(m.args.questions)) ? applyStamp(buildQuestionWidget(m.args, m.id, m.answered || null), m.ts) : buildToolNode(m.toolName, m.args, m.result, m.ts))
+        : buildMsgNode(m.type, m.text || '', m.engine, m.ts);   // [BUBBLE_TS_V1]
       if (node) frag.appendChild(node);
     }
     const anchor = _olderBtn ? _olderBtn.nextSibling : messagesEl.firstChild;
@@ -2688,10 +3229,18 @@
         if (hasConnectedBefore) showToast('Reconnected', 'success');
       }
       hasConnectedBefore = true;
+      // [CONF_USERROW_IDENTITY_V1] Until the first conf_sync after this connect lands, no
+      // pending send may be failed on age. The fallback re-arm covers a room that never
+      // sends a sync at all (no conference), so an entry can't hang in-flight forever.
+      _confSyncGraceArmed = false;
+      setTimeout(function () {
+        if (!_confSyncGraceArmed) { _confSyncGraceArmed = true; confPendRearm(currentRoomId, CONF_PEND_REGRACE_MS); }
+      }, 20000);
     };
 
     ws.onclose = () => {
       stopKeepalive();
+      confPendSuspend();   // [CONF_USERROW_IDENTITY_V1] a dead socket is not evidence of failure — hold, don't fail
       setBusy(false);
       setWsDot('disconnected');
       if (hasConnectedBefore) showToast('Disconnected — reconnecting…', 'warning');
@@ -2847,7 +3396,7 @@
     if (ws?.readyState !== WebSocket.OPEN) return;
     // [ENGINE_AUTHORITATIVE_V1] For a global-mode room, don't send until the bar's engine is known
     // (the server fails closed otherwise). Fetch it, then the user resends.
-    if (!confModeOn(currentRoomId) && roomOverride() === 'global' && !displayedEngine) { pollUsage(); showToast('Confirming engine… please resend in a moment', 'info'); return; }
+    if (!confModeOn(currentRoomId) && !displayedEngine) { pollUsage(); showToast('Confirming engine… please resend in a moment', 'info'); return; }
 
     const attachments = pendingAttachments.map(a => ({ path: a.path, name: a.name }));
     const echo = text + (attachments.length
@@ -2859,14 +3408,30 @@
       openConfTaskModal({ text: text, echo: echo, attachments: attachments });
       return;
     }
-    appendMsg('user', echo);
+    // [CONF_USERROW_IDENTITY_V1] A live conference owns this room's chat, so this message
+    // becomes a server-logged interjection. Mint its row id HERE and paint the optimistic
+    // bubble under it, so the authoritative row reconciles onto this bubble instead of
+    // appending a second one. Reaching this line with conference mode on means the
+    // conference is live — a fresh start returned above, into the task-association modal.
+    const _confLive = confModeOn(currentRoomId) && confIdentReady(currentRoomId);
+    const _iid = _confLive ? String(confUuid()).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) : '';
+    const _useIid = !!(_iid && _iid.length >= 8);
+    appendMsg('user', echo, _useIid ? { mid: 'conf:interject-' + _iid } : null);
+    // [BUBBLE_TS_V1] One canonical creation instant per row: minted HERE, declared to the
+    // server, ratified there, then broadcast unchanged to every device (and to the stored
+    // row), so the optimistic bubble and every other view show the same number immediately.
+    const _sentRow = storedMsgData.length ? storedMsgData[storedMsgData.length - 1] : null;
+    const _rowTs   = (_sentRow && Number.isFinite(_sentRow.ts)) ? _sentRow.ts : Date.now();
+    const _rowMid  = (_sentRow && _sentRow.mid) || null;
     clearLastQuestion();
     if (confModeOn(currentRoomId)) {   // [CONFERENCE_V1] start / interject a conference
-      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'conference', roomId: currentRoomId }));
+      if (_useIid) confPendAdd(currentRoomId, { iid: _iid, text: text, echo: echo, ts: Date.now(), state: 'sending' });
+      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'conference', leadEngine: confLead(currentRoomId), roomId: currentRoomId, interjectId: _useIid ? _iid : undefined, rowTs: _rowTs, rowMid: _rowMid }));   // [BUBBLE_TS_V1]
+      if (_useIid) confPendArm(currentRoomId, _iid, CONF_PEND_MS);
     } else {
-      const _mode = roomOverride();
-      if (_mode === 'claude' || _mode === 'codex') displayedEngine = _mode;   // explicit pin == what the bar shows
-      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: _mode, displayedEngine, roomId: currentRoomId }));
+      // [ENGINE_GLOBAL_ONLY_V1] One global engine: the mode is always 'global' and
+      // displayedEngine is what the selector/bar is showing, which the server verifies.
+      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'global', displayedEngine, roomId: currentRoomId, rowTs: _rowTs, rowMid: _rowMid }));   // [BUBBLE_TS_V1]
     }
     setCurrentTask(text.replace(/\s+/g, ' ').trim().slice(0, 140));
     if (text && inputHistory[inputHistory.length - 1] !== text) {
@@ -2914,6 +3479,35 @@
   }
 
   // ── Session management ────────────────────────────────────────────────────
+  // ── [BUBBLE_TS_V1] Per-row creation stamp, always Buenos Aires ──────────────
+  // Rendered as a data attribute consumed by a CSS ::after, so the text is NOT a DOM
+  // text node: chat-search, textContent extraction and copy/paste never see it.
+  const BA_TZ = 'America/Argentina/Buenos_Aires';
+  let _baFmt = null;
+  try {
+    _baFmt = new Intl.DateTimeFormat('en-GB', { timeZone: BA_TZ, day: '2-digit', month: '2-digit',
+                                                hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  } catch (e) { _baFmt = null; }
+  function fmtBaStamp(ms) {
+    if (!Number.isFinite(ms)) return '';
+    if (_baFmt) {
+      try {
+        const p = {};
+        for (const part of _baFmt.formatToParts(ms)) p[part.type] = part.value;
+        if (p.day && p.month && p.hour && p.minute) return p.day + '/' + p.month + ' ' + p.hour + ':' + p.minute;
+      } catch (e) {}
+    }
+    // Fallback: Buenos Aires is UTC-3 all year (no DST), so this is exact.
+    const d = new Date(ms - 3 * 3600000);
+    const z = n => String(n).padStart(2, '0');
+    return z(d.getUTCDate()) + '/' + z(d.getUTCMonth() + 1) + ' ' + z(d.getUTCHours()) + ':' + z(d.getUTCMinutes());
+  }
+  function applyStamp(el, ms) {
+    if (!el || !el.dataset || !Number.isFinite(ms)) return el;
+    try { el.dataset.ts = fmtBaStamp(ms); } catch (e) {}
+    return el;
+  }
+
   function fmtSessionDate(ts) {
     const d   = new Date(ts);
     const now = new Date();
@@ -3008,41 +3602,80 @@
     }
     const editEl = $('st-edit');
     if (editEl && !editEl._wired) { editEl._wired = true; editEl.onclick = startTitlebarRename; }
+    renderEngineOptions();
+  }
+
+  // [ENGINE_GLOBAL_ONLY_V1] The LLM selector: exactly four entries \u2014 the two engines, each
+  // labelled with the email of ITS OWN active account, and the two conference rooms named by
+  // which engine leads. An engine whose credentials cannot start a turn right now is shown
+  // greyed with the reason (re-auth lives in Settings \u25B8 Accounts, never here), and both
+  // conference entries need BOTH engines usable.
+  function engineOptionLabel(e) {
+    const a = engineAccts[e] || {};
+    const name = e === 'codex' ? 'Codex' : 'Claude';
+    if (!a.available) return name + ' (' + (a.email ? a.email + ' \u00B7 re-auth needed' : (a.reason || 'not signed in')) + ')';
+    return name + (a.email ? ' (' + a.email + ')' : '');
+  }
+  function renderEngineOptions() {
     const engSel = $('st-engine');
-    if (engSel) {
-      engSel.style.display = codexEnabled ? '' : 'none';
-      if (!engSel.querySelector('option[value="conference"]')) { const o = document.createElement('option'); o.value = 'conference'; o.textContent = '\uD83E\uDD1D Conference'; engSel.appendChild(o); }   // [CONFERENCE_V1]
-      engSel.value = confModeOn(currentRoomId) ? 'conference' : roomOverride(currentRoomId);
-      const gopt = engSel.querySelector('option[value="global"]');
-      if (gopt) gopt.textContent = 'Global (' + (globalEngine === 'codex' ? 'Codex' : 'Claude') + ')';
-      const eff = effectiveEngine(currentRoomId);
-      engSel.classList.toggle('eng-codex', eff === 'codex');
-      engSel.title = 'Engine for this room \u2014 effective: ' + (eff === 'codex' ? 'Codex' : 'Claude');
-      if (!engSel._wired) {
-        engSel._wired = true;
-        engSel.addEventListener('change', () => {
-          if (engSel.value === 'conference') {   // [CONFERENCE_V1]
-            setConfMode(currentRoomId, true);
-            if (typeof showToast === 'function') showToast('Conference mode \u2014 your next message starts a Claude+Codex collaboration', 'info');
-            updateTitlebar();
-            return;
-          }
-          const mode = engSel.value;
-          if (!roomEngineSync) {
-            setConfMode(currentRoomId, false);
-            setRoomOverride(mode, currentRoomId);
-            updateTitlebar(); pollUsage();
-            return;
-          }
-          updateTitlebar(); // Keep the acknowledged value until the server accepts.
-          if (!ws || ws.readyState !== WebSocket.OPEN) {
-            showToast('Not connected. Reconnect before changing the room engine.', 'error');
-            return;
-          }
-          setConfMode(currentRoomId, false);
-          ws.send(JSON.stringify({ type: 'set_engine', roomId: currentRoomId, mode }));
-        });
+    if (!engSel) return;
+    engSel.style.display = codexEnabled ? '' : 'none';
+    const bothOk = engineAvailable('claude') && engineAvailable('codex');
+    const opts = [
+      { v: 'claude',      label: engineOptionLabel('claude'), ok: engineAvailable('claude') },
+      { v: 'codex',       label: engineOptionLabel('codex'),  ok: engineAvailable('codex') },
+      { v: 'conf-claude', label: '\uD83E\uDD1D Claude Lead Conference Room', ok: bothOk },
+      { v: 'conf-codex',  label: '\uD83E\uDD1D Codex Lead Conference Room',  ok: bothOk },
+    ];
+    const inConf = confModeOn(currentRoomId);
+    const want = inConf ? ('conf-' + confLead(currentRoomId)) : (displayedEngine || globalEngine);
+    const sig = opts.map(o => o.v + '|' + o.label + '|' + (o.ok ? 1 : 0)).join('~');
+    if (engSel._sig !== sig) {
+      engSel._sig = sig;
+      engSel.innerHTML = '';
+      for (const o of opts) {
+        const el = document.createElement('option');
+        el.value = o.v; el.textContent = o.label;
+        // The engine we are actually on stays selectable-as-shown even if it just went
+        // unusable, so the control never lies about what the room will run.
+        el.disabled = !o.ok && o.v !== want;
+        engSel.appendChild(el);
       }
+    }
+    engSel.value = want;
+    const eff = inConf ? confLead(currentRoomId) : (displayedEngine || globalEngine);
+    engSel.classList.toggle('eng-codex', eff === 'codex');
+    const a = engineAccts[eff === 'codex' ? 'codex' : 'claude'] || {};
+    engSel.title = inConf
+      ? ('Conference \u2014 ' + (eff === 'codex' ? 'Codex' : 'Claude') + ' leads, ' + (eff === 'codex' ? 'Claude' : 'Codex') + ' reviews')
+      : ('LLM for every room \u2014 ' + (eff === 'codex' ? 'Codex' : 'Claude') + (a.email ? ' (' + a.email + ')' : '')
+         + (a.available ? '' : ' \u2014 ' + (a.reason || 'unavailable') + '; re-authenticate in Settings \u25B8 Accounts'));
+    if (!engSel._wired) {
+      engSel._wired = true;
+      engSel.addEventListener('change', () => {
+        const v = engSel.value;
+        if (v === 'conf-claude' || v === 'conf-codex') {   // [CONFERENCE_V1]
+          const lead = v === 'conf-codex' ? 'codex' : 'claude';
+          setConfLead(currentRoomId, lead);
+          setConfMode(currentRoomId, true);
+          if (typeof showToast === 'function') showToast('Conference mode \u2014 your next message starts a collaboration led by ' + (lead === 'codex' ? 'Codex' : 'Claude'), 'info');
+          updateTitlebar();
+          return;
+        }
+        const mode = v === 'codex' ? 'codex' : 'claude';
+        setConfMode(currentRoomId, false);
+        if (!roomEngineSync) {   // older server: nothing authoritative to talk to
+          updateTitlebar(); pollUsage();
+          return;
+        }
+        updateTitlebar();   // keep the acknowledged value until the server accepts
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          showToast('Not connected. Reconnect before changing the LLM.', 'error');
+          return;
+        }
+        // scope:'global' is explicit for new servers; older ones treat it as a room pin.
+        ws.send(JSON.stringify({ type: 'set_engine', roomId: currentRoomId, mode, scope: 'global' }));
+      });
     }
   }
 
@@ -3056,7 +3689,7 @@
     const cur = (id && sessionNameById[id]) || pendingRoomName || (nameEl.textContent === 'New room' ? '' : nameEl.textContent);
     const inp = document.createElement('input');
     inp.className = 'st-rename-input';
-    inp.value = cur; inp.maxLength = 40;
+    inp.value = cur; inp.maxLength = 60;   // [TASKROOM_TITLE_V1] task-derived names are up to 60
     nameEl.dataset.editing = '1';
     nameEl.style.display = 'none';
     nameEl.after(inp);
@@ -3111,6 +3744,7 @@
     PINNED_ROOM   = roomKey;
     currentRoomId = roomKey;
     applyRoomBg(roomKey);
+    applyLayout(roomKey);   // [ROOM_LAYOUT_V1] restore this room's panes (sets OR clears every slot)
     SESSION_KEY   = 'bridge_session_id::' + roomKey;
     setRoomUrl(roomKey);   // [ROOMLINK_V1] reflect into ?room= AND #room=
     if (_PRB || _RV) setVncRoom(roomKey);   // switch the live panel to this room's browser
@@ -3236,8 +3870,8 @@
     _copyLinkBtn.id = 'btn-copy-room-link';
     _copyLinkBtn.type = 'button';
     _copyLinkBtn.className = 'st-copy-link';
-    _copyLinkBtn.textContent = '🔗';
-    _copyLinkBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;font-size:13px;padding:0 4px;opacity:.85';
+    _copyLinkBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" style="display:block"><path d="M10 14a3.5 3.5 0 0 0 5 0l3-3a3.5 3.5 0 0 0-5-5l-1.5 1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 10a3.5 3.5 0 0 0-5 0l-3 3a3.5 3.5 0 0 0 5 5l1.5-1.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    _copyLinkBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;line-height:0';
     _copyLinkBtn.addEventListener('click', async () => {
       if (_copyLinkBtn.disabled || !currentRoomId) return;
       const url = buildShareUrl(currentRoomId);
@@ -3326,7 +3960,14 @@
     const linked = _rtTasks.filter(t => t && Array.isArray(t.rooms) && t.rooms.some(rm => String(rm.room_key) === rid));
     const q = (filter || '').toLowerCase().trim();
     const pool = _rtTasks.filter(t => t && t.status !== 'done')
-      .filter(t => !q || String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0);
+      .filter(t => !q || String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0)
+      .sort(function (a, b) {   // [ROOMTASK_SORT_DESC_V1] highest task number first
+        const na = parseInt(String((a && a.id) || ''), 10), nb = parseInt(String((b && b.id) || ''), 10);
+        if (isNaN(na) && isNaN(nb)) return 0;
+        if (isNaN(na)) return 1;
+        if (isNaN(nb)) return -1;
+        return nb - na;
+      });
     p.innerHTML =
       '<div style="font-size:15px;font-weight:600;margin-bottom:4px">🗂 Link this room to a task</div>' +
       '<div style="font-size:12px;opacity:.7;margin-bottom:12px">Saved to task_rooms and shown in the task detail. A room can link to several tasks.</div>' +
@@ -3357,7 +3998,11 @@
     else rows.slice(0, 200).forEach(t => {
       const b = document.createElement('button'); b.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
       b.textContent = 'task-' + (t.id || '?') + ' · ' + (t.title || '(sin título)');
-      b.onclick = () => { b.disabled = true; _rtPost(t.file, rid).then(ok => { if (ok) { showToast('Room linked to task-' + (t.id || ''), 'success'); _rtReload(); } else { b.disabled = false; showToast('Could not link (invalid key)', 'error'); } }); };
+      b.onclick = () => { b.disabled = true; _rtPost(t.file, rid).then(async ok => { if (ok) { showToast('Room linked to task-' + (t.id || ''), 'success');
+        // [TASKROOM_TITLE_V1] existing task -> always ask; close first (confirm z-index 200 < modal 9999)
+        _rtClose();
+        try { await _trApply({ taskId: String(t.id || ''), taskTitle: String(t.title || ''), roomKey: rid, sessionId: rid, existingTask: true }); } catch (e) {}
+        _rtReload(); } else { b.disabled = false; showToast('Could not link (invalid key)', 'error'); } }); };
       listEl.appendChild(b);
     });
     const s = p.querySelector('#rt-search'); s.value = filter || ''; s.oninput = () => _rtPaint(s.value);
@@ -3394,6 +4039,7 @@
     let _rtSeedTasks = []; try { _rtSeedTasks = lastTasks || []; } catch (e) { _rtSeedTasks = []; }
     areaField.populate(_confDistinctValues(_rtSeedTasks, 'area'));
     projField.populate(_confDistinctValues(_rtSeedTasks, 'project'));
+    _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) {
@@ -3401,6 +4047,7 @@
         const all = (d && Array.isArray(d.tasks)) ? d.tasks : [];
         areaField.populate(_confDistinctValues(all, 'area'));
         projField.populate(_confDistinctValues(all, 'project'));
+        _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1] seed may not have held it
       })
       .catch(function () {});
     // [ROOMTASK_HAIKU_V3] Never leave the user staring at two blank boxes with no reason.
@@ -3413,9 +4060,13 @@
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
       if (title.length < 3) { errEl.textContent = 'El título debe tener al menos 3 caracteres.'; return; }
       cb.disabled = true; cb.textContent = 'Creating…';
-      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: areaField.getValue(), project: projField.getValue() }) })
+      const _area = areaField.getValue(), _project = projField.getValue();   // [TASK_DEFAULTS_PREFILL_V1]
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
         .then(r => r.json().then(j => ({ ok: r.ok, j })))
-        .then(res => { if (!res.ok || !res.j || !res.j.file) throw new Error('create'); return _rtPost(res.j.file, rid).then(ok => { if (!ok) throw new Error('link'); showToast('Task created and room linked', 'success'); _rtClose(); _rtSyncChip(); }); })
+        .then(res => { if (!res.ok || !res.j || !res.j.file) throw new Error('create'); _noteTaskDefaults(_area, _project); return _rtPost(res.j.file, rid).then(async ok => { if (!ok) throw new Error('link'); showToast('Task created and room linked', 'success'); _rtClose();
+          // [TASKROOM_TITLE_V1] after the link, and after the modal is gone so the confirm is not buried under it
+          try { await _trApply({ taskId: String(res.j.id || ''), taskTitle: String(res.j.title || title), roomKey: rid, sessionId: rid, existingTask: false }); } catch (e) {}
+          _rtSyncChip(); }); })
         .catch(() => { cb.disabled = false; cb.textContent = 'Create & link'; errEl.textContent = 'Could not create/link. Try again.'; });
     };
     setTimeout(() => { try { titleEl.focus(); } catch (e) {} }, 0);
@@ -3423,8 +4074,8 @@
   (function wireLinkTaskBtn() {
     _linkTaskBtn = document.createElement('button');
     _linkTaskBtn.id = 'btn-link-task'; _linkTaskBtn.type = 'button'; _linkTaskBtn.className = 'st-link-task';
-    _linkTaskBtn.textContent = '🗂';
-    _linkTaskBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;font-size:13px;padding:0 4px;opacity:.85';
+    _linkTaskBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" style="display:block"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+    _linkTaskBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;line-height:0';
     _linkTaskBtn.addEventListener('click', () => { if (!_linkTaskBtn.disabled) openRoomTaskModal(); });
     _roomTaskChip = document.createElement('span');
     _roomTaskChip.id = 'roomtask-chip';
@@ -3488,12 +4139,52 @@
       const localHit  = !q || terms.every(t => label.includes(t));       // partial/reordered recall
       const remoteHit = !!q && _remoteHitIds.has(r.dataset.id);          // /search body/brief match reveals this listed row
       const hit = localHit || remoteHit;
+      const titleHit = !!q && terms.every(t => (r.dataset.title || '').includes(t));   // [ROOMSEARCH_TITLEFIRST_V1] pure title match
+      r.dataset.titleHit = (hit && titleHit) ? '1' : '';
       r.style.display = hit ? '' : 'none';
       if (hit && r.dataset.task === '1') taskHits++;
       if (hit && r.dataset.archived === '1') archHits++;
     }
     if (box) box.style.display = q ? (taskHits ? 'block' : 'none') : (taskRoomsExpanded ? 'block' : 'none');
     if (abox) abox.style.display = q ? (archHits ? 'block' : 'none') : (archivedRoomsExpanded ? 'block' : 'none');
+    _reorderRoomSections(!!q);   // [ROOMSEARCH_TITLEFIRST_V1] title-first within each section
+  }
+  // [ROOMSEARCH_TITLEFIRST_V1] Float title-matched rows above conversation-only matches
+  // within each room section (Main / Task / Archived), preserving recency order within
+  // each group and all non-room siblings (e.g. "+ New room"). Empty query restores
+  // canonical recency order. Sections reorder independently — rows never cross sections.
+  function _reorderRoomSections(active) {   // [ROOMSEARCH_TITLEFIRST_V2]
+    const byParent = new Map();
+    for (const r of _sessRows) {
+      if (!r || !r.parentNode) continue;
+      let g = byParent.get(r.parentNode);
+      if (!g) { g = []; byParent.set(r.parentNode, g); }
+      g.push(r);   // canonical recency order (source order only)
+    }
+    for (const [parent, rows] of byParent) {
+      const set = new Set(rows);
+      // CURRENT DOM order of this group's rows (diverges from canonical after a reorder).
+      const domRows = Array.from(parent.children).filter(el => set.has(el));
+      if (domRows.length !== rows.length) continue;   // some rows moved/detached — skip
+      // Contiguity guard evaluated against CURRENT DOM order.
+      let contiguous = true;
+      for (let i = 1; i < domRows.length; i++) {
+        if (domRows[i - 1].nextElementSibling !== domRows[i]) { contiguous = false; break; }
+      }
+      if (!contiguous) continue;
+      // Desired order from canonical recency: title-first when searching, else recency.
+      const ordered = active
+        ? rows.filter(r => r.dataset.titleHit === '1').concat(rows.filter(r => r.dataset.titleHit !== '1'))
+        : rows.slice();
+      // Skip only if CURRENT DOM already matches the desired order.
+      let same = true;
+      for (let i = 0; i < ordered.length; i++) { if (domRows[i] !== ordered[i]) { same = false; break; } }
+      if (same) continue;
+      const beforeNode = domRows[domRows.length - 1].nextSibling;   // trailing anchor from CURRENT DOM
+      const frag = document.createDocumentFragment();
+      for (const r of ordered) frag.appendChild(r);                 // detaches from parent
+      parent.insertBefore(frag, beforeNode);
+    }
   }
   // [ROOMSEARCH_CONTENT_V1] The filter above only sees sparse row metadata for the
   // recency-capped rooms in the /sessions payload. To make a room findable by anything
@@ -3710,6 +4401,7 @@
         btn.onclick = () => enterRoom(s.id, s.id);
         row.dataset.label = ((s.name || '') + ' ' + _taskLabel + ' ' + (s.preview || '') + ' ' + (s.lastMessage || '')).toLowerCase();
         row.dataset.id = s.id || '';   // [ROOMSEARCH_CONTENT_V1] identity for remote-hit reveal
+        row.dataset.title = (s.name || _taskLabel || s.preview || '').toLowerCase();   // [ROOMSEARCH_TITLEFIRST_V1] title-only key
         row.dataset.task = s.taskRoom ? '1' : '';
         row.dataset.archived = s.archived ? '1' : '';
         _sessRows.push(row);
@@ -3946,6 +4638,10 @@
     dragging = false;
     divider.classList.remove('dragging');
     vncFrame.style.pointerEvents = '';       // restore
+    // [ROOM_LAYOUT_V1] Persist the unclamped preference for THIS room. Restoring it must also
+    // reapply maxWidth:'none' (see applyPaneWidths) or #chat-panel's 470px cap re-clips it.
+    const n = parseInt(chatPanel.style.width, 10);
+    if (Number.isFinite(n)) writeLayout({ cw: n });
   });
 
   // ── Tasks panel toggle ────────────────────────────────────────────────────
@@ -3953,31 +4649,10 @@
   const tasksPanel   = $('tasks-panel');
   const tasksDivider = $('tasks-divider');
 
-  // Drag-to-resize the Tasks panel (mirrors #divider, but sizes #tasks-panel on
-  // its chat-facing edge). The unclamped preference persists in localStorage; the
-  // rendered width is always re-clamped to the current viewport, and inline sizing
-  // is dropped below the mobile breakpoint so the stacked full-width layout wins.
-  // TASKS_CLAMP_V1
-  const TASKS_MOBILE_BP = 820;
-  const clampTasksW = px => Math.max(300, Math.min(px, Math.round(window.innerWidth * 0.7)));
-  function readSavedTasksW() {
-    try { const n = parseInt(localStorage.getItem('ccb-tasks-w'), 10);
-          return (Number.isFinite(n) && n > 0) ? n : null; } catch { return null; }
-  }
-  function applyTasksWidthForViewport() {
-    if (!tasksPanel) return;
-    if (window.innerWidth <= TASKS_MOBILE_BP) {   // mobile: let CSS own full-width/stacked
-      tasksPanel.style.width = '';
-      tasksPanel.style.maxWidth = '';
-      return;
-    }
-    const n = readSavedTasksW();                  // desktop: reapply validated + re-clamped
-    if (n == null) return;
-    tasksPanel.style.maxWidth = 'none';
-    tasksPanel.style.width = clampTasksW(n) + 'px';
-  }
-  window.addEventListener('resize', applyTasksWidthForViewport);
-
+  // Drag-to-resize the Tasks panel (mirrors #divider, but sizes #tasks-panel on its
+  // chat-facing edge). [ROOM_LAYOUT_V1] The unclamped preference is now stored PER ROOM
+  // (ccb-layout::<room>.tw); clamping, viewport re-application and the mobile drop are all
+  // owned by applyPaneWidths()/applyLayout() in the layout module above.
   if (tasksDivider && tasksPanel) {
     let tDragging = false, tPrevPE = '';
     tasksDivider.addEventListener('mousedown', e => {
@@ -3999,21 +4674,20 @@
       tasksDivider.classList.remove('dragging');
       vncFrame.style.pointerEvents = tPrevPE;   // restore prior value (not assumed empty)
       const n = parseInt(tasksPanel.style.width, 10);
-      if (Number.isFinite(n)) { try { localStorage.setItem('ccb-tasks-w', String(n)); } catch {} }
+      if (Number.isFinite(n)) writeLayout({ tw: n });   // [ROOM_LAYOUT_V1] per-room
     });
   }
 
   if (btnTasks && tasksPanel) {
     btnTasks.addEventListener('click', () => {
-      const isHidden = tasksPanel.classList.contains('tasks-panel-hidden');
-      tasksPanel.classList.toggle('tasks-panel-hidden', !isHidden);
-      tasksPanel.classList.toggle('tasks-panel-visible', isHidden);
-      btnTasks.classList.toggle('active', isHidden);
-      if (isHidden) { applyTasksWidthForViewport(); loadTasks(); }
+      const open = tasksPanel.classList.contains('tasks-panel-hidden');
+      tasksPanel.classList.toggle('tasks-panel-hidden', !open);
+      tasksPanel.classList.toggle('tasks-panel-visible', open);
+      btnTasks.classList.toggle('active', open);
+      writeLayout({ t: open ? 1 : 0 });   // [ROOM_LAYOUT_V1]
+      if (open) { applyPaneWidths(currentRoomId); _tasksLoadedForRoom = currentRoomId; loadTasks(); }
     });
   }
-  // Apply a saved width if the panel is already visible at load. TASKS_CLAMP_V1
-  if (tasksPanel && tasksPanel.classList.contains('tasks-panel-visible')) applyTasksWidthForViewport();
 
   // ── Settings dropdown (Connectors / Settings) ─────────────────────────────
   const btnSettings      = $('btn-settings');
@@ -4691,7 +5365,18 @@
       const wrap = document.createElement('span');
       wrap.className = 'acct-usage acct-usage-bars';
       const addRow = (label, pct, expired, resetsAt, includeDay) => {
-        if (pct == null && !expired) return;
+        if (pct == null && !expired) {
+          /* acct-ubar-nowindow */ // An absent window is information, not a blank. Only the
+          // 5h row gets the note; the 7d row keeps its original silent suppression.
+          if (label !== '5h') return;
+          const row0 = document.createElement('span'); row0.className = 'acct-ubar-row';
+          const lab0 = document.createElement('span'); lab0.className = 'acct-ubar-label'; lab0.textContent = label;
+          const note = document.createElement('span'); note.textContent = 'No 5-hour window';
+          note.style.opacity = '.6'; note.style.fontStyle = 'italic';
+          note.title = 'The last usage probe returned no 5-hour limit window for this account.';
+          row0.appendChild(lab0); row0.appendChild(note); wrap.appendChild(row0);
+          return;
+        }
         const p = Math.min(100, Math.max(0, pct || 0));
         const row = document.createElement('span'); row.className = 'acct-ubar-row';
         const lab = document.createElement('span'); lab.className = 'acct-ubar-label'; lab.textContent = label;
@@ -4736,8 +5421,9 @@
         if (_hasCodex) { const _hc = document.createElement('div'); _hc.className = 'acct-group-label'; _hc.textContent = 'Code accounts'; listEl.appendChild(_hc); }
         d.accounts.forEach(a => {
           const isCodex = a.type === 'codex';
-          const _eng = effectiveEngine();
-          const isActive = isCodex ? (_eng === 'codex' && !!a.active) : (_eng !== 'codex' && !!(a.email && d.active && a.email === d.active));
+          // [ENGINE_GLOBAL_ONLY_V1] Each engine keeps its OWN active account, whichever
+          // engine happens to be running: mark the active row per family, not per engine.
+          const isActive = isCodex ? !!a.active : !!(a.email && d.active && a.email === d.active);
           if (isCodex && !listEl._codexHeaderDone) { listEl._codexHeaderDone = true; if (!claudeAddDone) { claudeAddDone = true; addClaudeAddRow(); } const _h = document.createElement('div'); _h.className = 'acct-group-label'; _h.textContent = 'Codex accounts'; listEl.appendChild(_h); }
           const b = document.createElement('button');
           b.className = 'acct-item' + (isActive ? ' acct-active' : '') + (isCodex ? ' acct-codex' : '');
@@ -4828,7 +5514,9 @@
         const r = await fetch(`${API_BASE}/accounts/switch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
         const d = await r.json();
         if (r.ok && d.ok) {
-          if (d.engine) globalEngine = (d.engine === 'codex') ? 'codex' : 'claude';
+          // [ENGINE_GLOBAL_ONLY_V1] Switching an account changes only THAT engine's account —
+          // never which engine runs. Refresh the labels from the authoritative summary.
+          try { const _a = await (await fetch(`${API_BASE}/accounts`, { cache: 'no-store' })).json(); if (_a && _a.ok) applyEngineMeta(_a); } catch (e) {}
           setMsg('✓ ' + (d.message || 'Switched.'), 'ok');
           setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage();
             if (typeof updateTitlebar === 'function') updateTitlebar();
@@ -5137,6 +5825,48 @@
   // Priority levels in the picker (0 = highest, above P1). Keep in sync with the
   // DB CHECK constraint and the Organiser selector.
   const PRIORITY_LEVELS = [0, 1, 2, 3];
+  // [AREA_PICKER_ANCHOR_V1] Position an already-appended fixed menu next to the
+  // element that was clicked, instead of dumping it in the middle of the screen.
+  // Generalises the pattern used by pickPriority / openTaskMenu / scheduleTaskDate.
+  // The menu MUST already be in the DOM so offsetWidth/offsetHeight are real.
+  function anchorMenuTo(menu, anchor) {
+    const GAP = 2, PAD = 8;
+    menu.style.position = 'fixed';
+    if (!anchor || typeof anchor.getBoundingClientRect !== 'function') {
+      // No usable anchor (programmatic open): keep the old centred placement.
+      menu.style.left = '50%'; menu.style.top = '22%';
+      menu.style.transform = 'translateX(-50%)';
+      menu.style.maxHeight = '64vh'; menu.style.overflowY = 'auto';
+      return;
+    }
+    menu.style.transform = 'none';
+    const r = anchor.getBoundingClientRect();
+    const vh = window.innerHeight, vw = window.innerWidth;
+    menu.style.maxHeight = '';                  // measure the natural height first
+    const h0 = menu.offsetHeight;
+    const below = vh - r.bottom - GAP - PAD;
+    const above = r.top - GAP - PAD;
+    let placeBelow;
+    if (h0 <= below)      placeBelow = true;    // prefer below when it fits
+    else if (h0 <= above) placeBelow = false;   // else above when it fits
+    else                  placeBelow = below >= above;   // else the roomier side
+    const avail = Math.max(0, placeBelow ? below : above);
+    let top;
+    menu.style.overflowY = 'auto';
+    if (avail < 80) {
+      // Degenerate: neither side has usable room (very short viewport). Overlay the
+      // anchor rather than render a 0-height, invisible menu.
+      menu.style.maxHeight = (vh - 2 * PAD) + 'px';
+      top = PAD;
+    } else {
+      menu.style.maxHeight = avail + 'px';      // box-sizing:border-box caps total height
+      const h = menu.offsetHeight;              // re-measure after the cap
+      top = placeBelow ? (r.bottom + GAP) : (r.top - GAP - h);
+      top = Math.max(PAD, Math.min(top, vh - h - PAD));
+    }
+    menu.style.top = top + 'px';
+    menu.style.left = Math.max(PAD, Math.min(r.left, vw - menu.offsetWidth - PAD)) + 'px';
+  }
   function pickPriority(t, anchor) {
     document.querySelectorAll('.task-menu, .area-picker, .pri-picker').forEach(m => m.remove());
     const menu = document.createElement('div');
@@ -5163,13 +5893,13 @@
     menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - menu.offsetWidth - 8)) + 'px';
     setTimeout(() => document.addEventListener('click', onDoc, true), 0);
   }
-  function editArea(t) {
+  function editArea(t, anchor) {
     document.querySelectorAll('.task-menu, .area-picker').forEach(m => m.remove());
     const areas = Array.from(new Set((lastTasks || []).map(x => x.area).filter(Boolean)))
       .sort((a, b) => String(a).localeCompare(String(b)));
     const menu = document.createElement('div');
     menu.className = 'task-menu area-picker';
-    menu.style.cssText = 'position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:10000;max-height:64vh;overflow-y:auto';
+    menu.style.cssText = 'position:fixed;z-index:10000;overflow-y:auto';   // placement is set by anchorMenuTo()
     const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
     const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
     const item = (label, fn, cls) => {
@@ -5194,6 +5924,7 @@
     });
     if (t.area) item('\u2717 Clear area', () => updateTaskFields(t.file, { area: '' }), 'danger');
     document.body.appendChild(menu);
+    anchorMenuTo(menu, anchor);   // [AREA_PICKER_ANCHOR_V1] next to the clicked chip, not centred
     setTimeout(() => document.addEventListener('click', onDoc, true), 0);
   }
   function editProject(t) {
@@ -5320,7 +6051,7 @@
     if (t.status === 'planned') item('✓ Approve plan', () => setTaskStatus(t, 'approved'));
     if (t.status === 'blocked') item('↻ Resume',       () => setTaskStatus(t, 'approved'));
     item('✎ Rename…',       () => renameTask(t));
-    item('⊞ Set area…',    () => editArea(t));
+    item('⊞ Set area…',    () => editArea(t, anchor));
     item('🗂 Set project…', () => editProject(t));
     item('🚩 Flag for meeting…', () => editFlags(t));
     item('⚑ Set priority…', () => editPriority(t));
@@ -5773,14 +6504,14 @@
   }
 
   // ── Confirm dialog (returns a Promise<boolean>) ──
-  function confirmDialog(message) {
+  function confirmDialog(message, okLabel) {
     return new Promise((resolve) => {
       const ov = document.createElement('div'); ov.className = 'task-confirm-overlay';
       const box = document.createElement('div'); box.className = 'task-confirm';
       const msg = document.createElement('div'); msg.className = 'task-confirm-msg'; msg.textContent = message;
       const btns = document.createElement('div'); btns.className = 'task-confirm-btns';
       const cancel = document.createElement('button'); cancel.className = 'tc-cancel'; cancel.textContent = 'Cancel';
-      const ok = document.createElement('button'); ok.className = 'tc-ok'; ok.textContent = 'Delete';
+      const ok = document.createElement('button'); ok.className = 'tc-ok'; ok.textContent = okLabel || 'Delete';
       const done = v => { ov.remove(); resolve(v); };
       cancel.addEventListener('click', () => done(false));
       ok.addEventListener('click', () => done(true));
@@ -5823,7 +6554,7 @@
     area.className = 'task-area';
     area.textContent = t.area || '—';
     area.title = 'Area (click to edit)';
-    area.addEventListener('click', (e) => { e.stopPropagation(); editArea(t); });
+    area.addEventListener('click', (e) => { e.stopPropagation(); editArea(t, area); });
 
     const title = document.createElement('span');
     title.className = 'task-title-cell';
@@ -6328,6 +7059,11 @@
   refreshStatusAlert();
 
   // ── Init ──────────────────────────────────────────────────────────────────
+  // [ROOM_LAYOUT_V1] Reconcile the pre-paint seed against the authoritative store. This runs
+  // here, not where the module is defined, because applyLayout() may call loadTasks(), which
+  // touches consts declared much further down — calling it earlier hits their dead zone.
+  migrateLegacyTasksWidth();
+  applyLayout(currentRoomId);
   loadSessions();
   loadRoomBgs();
   // [ROOMBG_SYNC_V1] Converge on colour changes made in another browser when this tab regains
@@ -6352,7 +7088,152 @@
         get pendingConfSync() { return _pendingConfSync; },
         get busy() { return busy; },
         get activeConf() { return activeConf; },
+        set activeConf(v) { activeConf = v; },
+        get confStreamTurnId() { return confStreamTurnId; },
+        set confStreamTurnId(v) { confStreamTurnId = v; },
+        newMid, confRowMid, isConfMid, saveableRows, stampRow,
+        fmtBaStamp, applyStamp, confDivider, renderOneStored,   // [BUBBLE_TS_V1]
+        confPendAdd, confPendList, confPendGet, confPendResolve, confPendResolveMid,   // [CONF_USERROW_IDENTITY_V1]
+        confPendRecover, confPendRecoverByText, confPendArm, confPendRearm, confPendSuspend,
+        confIdentReady,
+        get confSyncGraceArmed() { return _confSyncGraceArmed; },
+        set confSyncGraceArmed(v) { _confSyncGraceArmed = v; },
+        renderConfSync,
+        appendMsg, appendToolMsg,
       };
     }
   } catch (e) {}
+})();
+
+/* [ORCH_UI_V1] Master-room orchestration panel.
+   Self-contained: appended to app.js, owns its DOM, and stays invisible unless the
+   current room is a master. Reads the room id from the same localStorage keys app.js
+   uses, so it needs no access to app.js internals. */
+(function orchUI() {
+  'use strict';
+  if (window.__ORCH_UI) return;
+  window.__ORCH_UI = true;
+
+  const POLL_MS = 4000;
+  let graphRev = null, masterId = null, busy = false;
+
+  function roomId() {
+    const pinned = new URLSearchParams(location.search).get('room');
+    return pinned || localStorage.getItem('bridge_session_id::' + (pinned || '')) ||
+           localStorage.getItem('bridge_session_id') || localStorage.getItem('bridge_room_id');
+  }
+
+  const el = document.createElement('div');
+  el.id = 'orch-panel';
+  el.style.cssText = 'display:none;position:fixed;right:12px;bottom:12px;width:360px;max-height:70vh;' +
+    'overflow:auto;background:#12161c;color:#dfe6ee;border:1px solid #2a3340;border-radius:10px;' +
+    'font:12px/1.45 ui-monospace,Menlo,monospace;padding:10px;z-index:9998;box-shadow:0 8px 28px rgba(0,0,0,.45)';
+  document.addEventListener('DOMContentLoaded', () => document.body.appendChild(el));
+  if (document.body) document.body.appendChild(el);
+
+  const CHIP = {
+    queued: '#6b7280', spawning: '#6b7280', running: '#2563eb', 'awaiting-instructions': '#d97706',
+    reporting: '#7c3aed', integrating: '#7c3aed', done: '#16a34a', failed: '#dc2626',
+    cancelled: '#6b7280', 'timed-out': '#dc2626', parked: '#475569', closed: '#475569',
+  };
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  async function api(method, url, body) {
+    const opt = { method, headers: {} };
+    if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+    if (graphRev != null) opt.headers['If-Match'] = String(graphRev);
+    const r = await fetch(url, opt);
+    let j = {}; try { j = await r.json(); } catch (e) {}
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    return j;
+  }
+
+  function render(g) {
+    graphRev = g.graphRev;
+    const rows = [];
+    rows.push('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">' +
+      '<b>Orchestration</b><span style="opacity:.6">' + esc(g.targetRef || '') +
+      ' · slots ' + g.slots.used + '/' + g.slots.max + ' · seats ' + g.seats + '</span></div>');
+
+    // Plan awaiting approval — the FULL brief is editable before anything spawns.
+    if (g.plan && !g.plan.approvedAt) {
+      rows.push('<div style="border:1px solid #2a3340;border-radius:8px;padding:8px;margin-bottom:8px">' +
+        '<div style="margin-bottom:6px"><b>Proposed plan</b> <span style="opacity:.6">rev ' + g.plan.planRev + '</span></div>' +
+        '<textarea id="orch-plan-edit" style="width:100%;height:170px;background:#0b0e13;color:#dfe6ee;' +
+        'border:1px solid #2a3340;border-radius:6px;padding:6px;font:11px/1.4 ui-monospace,monospace">' +
+        esc(JSON.stringify(g.plan.subtasks, null, 2)) + '</textarea>' +
+        '<div style="margin-top:6px;display:flex;gap:6px">' +
+        '<button data-orch="save">Save edits</button>' +
+        '<button data-orch="approve" style="background:#16a34a;color:#fff;border:0;border-radius:5px;padding:4px 10px">Approve &amp; spawn</button>' +
+        '</div><div id="orch-err" style="color:#f87171;margin-top:4px"></div></div>');
+    }
+
+    if (!g.children.length) rows.push('<div style="opacity:.6">No children yet.</div>');
+    for (const c of g.children) {
+      const colour = CHIP[c.state] || '#6b7280';
+      rows.push('<div style="border-top:1px solid #222a35;padding:6px 0">' +
+        '<div><span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:' + colour + ';margin-right:6px"></span>' +
+        '<b>' + esc(c.title) + '</b> <span style="opacity:.55">' + esc(c.cid) + ' · ' + esc(c.mode) + '</span></div>' +
+        '<div style="opacity:.7">' + esc(c.state) + (c.queueReason ? ' — ' + esc(c.queueReason) : '') +
+        (c.conflict && c.conflict.length ? ' — conflict: ' + esc(c.conflict.join(', ')) : '') + '</div>' +
+        (c.report ? '<div style="opacity:.7">“' + esc((c.report.summary || '').slice(0, 140)) + '”</div>' : '') +
+        '<div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">' +
+        '<button data-orch="open" data-cid="' + esc(c.cid) + '">open room</button>' +
+        (['done', 'failed', 'cancelled', 'timed-out', 'closed'].includes(c.state)
+          ? '<button data-orch="reject" data-cid="' + esc(c.cid) + '">reject</button>'
+          : '<button data-orch="cancel" data-cid="' + esc(c.cid) + '">cancel</button>' +
+            '<button data-orch="park" data-cid="' + esc(c.cid) + '">park</button>') +
+        (['parked', 'timed-out'].includes(c.state) ? '<button data-orch="resume" data-cid="' + esc(c.cid) + '">resume</button>' : '') +
+        '</div></div>');
+    }
+    el.innerHTML = rows.join('');
+    el.style.display = 'block';
+  }
+
+  el.addEventListener('click', async (ev) => {
+    const b = ev.target.closest('[data-orch]');
+    if (!b || busy) return;
+    const act = b.getAttribute('data-orch');
+    const cid = b.getAttribute('data-cid');
+    const err = el.querySelector('#orch-err');
+    busy = true;
+    try {
+      if (act === 'open') { location.search = '?room=' + encodeURIComponent(cid ? (await currentGraph()).children.find(c => c.cid === cid).roomKey : ''); return; }
+      if (act === 'save') {
+        const subtasks = JSON.parse(el.querySelector('#orch-plan-edit').value);
+        const g = await currentGraph();
+        await api('PATCH', '/orch/v1/plans/' + masterId + '/' + g.plan.planId, { subtasks });
+      } else if (act === 'approve') {
+        const g = await currentGraph();
+        await api('POST', '/orch/v1/plans/' + masterId + '/' + g.plan.planId + '/approve', { planRev: g.plan.planRev });
+      } else {
+        const text = act === 'reject' ? (prompt('Why is this report rejected?') || '') : '';
+        if (act === 'reject' && !text) { busy = false; return; }
+        await api('POST', '/orch/v1/children/' + masterId + '/' + cid + '/' + act, { text });
+      }
+      await poll();
+    } catch (e) {
+      if (err) err.textContent = e.message;
+      else console.warn('[ORCH_UI_V1]', e.message);
+    } finally { busy = false; }
+  });
+
+  let lastGraph = null;
+  async function currentGraph() { return lastGraph || (lastGraph = (await api('GET', '/orch/v1/graph/' + masterId))); }
+
+  async function poll() {
+    const id = roomId();
+    if (!id) { el.style.display = 'none'; return; }
+    try {
+      const r = await fetch('/orch/v1/room/' + encodeURIComponent(id));
+      if (!r.ok) { el.style.display = 'none'; return; }      // route absent: stay invisible
+      const j = await r.json();
+      if (!j.masterId) { masterId = null; el.style.display = 'none'; return; }
+      masterId = j.masterId; lastGraph = j.graph;
+      render(j.graph);
+    } catch (e) { el.style.display = 'none'; }
+  }
+
+  setInterval(poll, POLL_MS);
+  setTimeout(poll, 800);
 })();

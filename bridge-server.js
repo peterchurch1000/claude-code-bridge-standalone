@@ -78,6 +78,36 @@ const fs = require('fs');
   const CREDENTIAL_STEWARD_ENABLED = process.env.CREDENTIAL_STEWARD_ENABLED !== '0';
   const CREDENTIAL_STEWARD = path.join(process.env.HOME || os.homedir(), 'credential-steward.js');
   const CREDENTIAL_STATE_DIR = path.join(process.env.HOME || os.homedir(), '.credential-steward');
+  // [CLAUDE_CRED_REVOKED_V2] how long a room waits for the owner's push after a 401
+  // before giving up (distributor cron is */2, serial scp adds ~30s).
+  const CRED_REVOKED_WAIT_MS = Number(process.env.CRED_REVOKED_WAIT_MS || 180000);
+  // [CRED_401_HEAL_V3] Rollback switch for the whole 401 self-heal: CRED_401_HEAL=0 in the
+  // environment, or '0' in ~/.claude/cred-401-heal. Default ON (this is a bug fix).
+  let CRED_401_HEAL = process.env.CRED_401_HEAL !== '0';
+  if (CRED_401_HEAL) { try { if (fs.readFileSync(path.join(process.env.HOME || os.homedir(), '.claude', 'cred-401-heal'), 'utf8').trim() === '0') CRED_401_HEAL = false; } catch {} }
+  // [CRED_401_HEAL_V3] THE single freshness primitive. Ordinary rooms and conference
+  // rooms both recover through this: poll the account snapshot until its access token
+  // differs from the one that just 401'd, then hand back to the caller's own scheduler.
+  // Reissuing before the owner's push lands would just re-copy the revoked token and
+  // burn the retry. Bounded - on timeout the caller fails closed, never replays blind.
+  function credWaitForFreshToken(S, deadTok, onFresh, onTimeout) {
+    const snapFile = path.join(process.env.HOME || os.homedir(), '.claude', 'accounts',
+                               String(S.credentialClaudeAccount || '') + '.credentials.json');
+    const snapToken = () => { try { const c = JSON.parse(fs.readFileSync(snapFile, 'utf8')); return (c.claudeAiOauth || c).accessToken || null; } catch (e) { return null; } };
+    const deadline = Date.now() + CRED_REVOKED_WAIT_MS;
+    let announced = false;
+    const tick = () => {
+      const t = snapToken();
+      if (!deadTok || (t && t !== deadTok)) return onFresh();
+      if (Date.now() >= deadline) {
+        console.log('[Bridge] [CRED_401_HEAL_V3] no fresh credential for', S.credentialClaudeAccount, 'after', Math.round(CRED_REVOKED_WAIT_MS / 1000) + 's - failing closed');
+        return onTimeout();
+      }
+      if (!announced) { announced = true; S.send({ type: 'status', text: 'Credentials rotating \u2014 reconnecting\u2026' }); }
+      setTimeout(tick, 2000);
+    };
+    setTimeout(tick, 250);
+  }
   // [CONF_CRED_RETRY_V1] Conference credential-issuance retry policy.
   const CONF_CRED_MAX_ATTEMPTS = 3;            // total attempts (1 initial + 2 retries)
   const CONF_CRED_BACKOFF_MS = [2000, 8000];   // before retry #1, #2
@@ -114,7 +144,7 @@ app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 // buildId is a constant baked into THIS code. A conference records the build it is
 // waiting for before it self-restarts; on respawn the boot resume only proceeds when
 // this constant matches — proving the new code is actually loaded (behaviour, not mtime).
-const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1';
+const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1+CRED_401_HEAL_V3+CONF_USERROW_IDENTITY_V1+BUBBLE_TS_V1';
 function _confLoopbackOnly(req, res) {
   const ip = (req.socket && req.socket.remoteAddress) || '';
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
@@ -761,6 +791,14 @@ function stripPlumbing(t) {
 // continuation summary (isCompactSummary) and auto-compact status lines are
 // hidden, but no real turn is ever lost. The .jsonl is append-only, so this is
 // the complete record even after the live client trims its own in-memory view.
+// [CONF_HEAL_V1] Shared, unit-tested helpers. Loaded defensively: if either module is
+// missing or broken the bridge boots exactly as before, with healing disabled.
+let CONF_HEAL = null, CONF_TX = null;
+try {
+  CONF_HEAL = require('./conf-heal.js');
+  CONF_TX = require('./tx-read.js');
+} catch (e) { console.log('[Bridge] [CONF_HEAL_V1] disabled — ' + (e && e.message)); }
+
 function transcriptToMessages(id) {
   const file = path.join(transcriptsDir(), `${id}.jsonl`);
   const msgs = [];
@@ -852,6 +890,45 @@ function healEmptyUserText(id, messages) {
   return messages;
 }
 
+// [CONF_HEAL_V1] H1. The defect: a conference room was served from the conference LOG
+// and that projection was then persisted as the room's whole history, so every client
+// row outside the log was dropped and the transcript backstop below became unreachable.
+// The log is a record of one episode; the .jsonl is the record of the room. This puts
+// back what the room showed but the store never kept.
+//
+// Insert-only, anchored to surviving rows, never reordering or deleting. Gated on the
+// transcript mtime so a big .jsonl is not re-parsed on every read (the same lesson as
+// the session-list freeze). Any failure is logged and the read proceeds unhealed.
+const _confHealMtime = new Map();
+function confHealReconcile(key) {
+  if (!CONF_HEAL || !CONF_TX) return;
+  try {
+    const rec = chatData[key];
+    if (!rec || !Array.isArray(rec.messages) || !rec.messages.length) return;
+    if (!rec.conf) return;                       // conference rooms only
+    const file = path.join(transcriptsDir(), key + '.jsonl');
+    let st; try { st = fs.statSync(file); } catch (e) { return; }
+    if (!CONF_HEAL.shouldReconcile(_confHealMtime, key, st.mtimeMs)) return;
+    CONF_HEAL.noteReconciled(_confHealMtime, key, st.mtimeMs);
+    // The cut is taken BEFORE writing: restore only what was said after the last save
+    // that succeeded. Self-maintaining — any future flattening heals its own tail.
+    const sinceMs = Number(rec.updated_at) || null;
+    const tx = CONF_TX.readTranscript(transcriptsDir(), key);
+    if (!tx || tx.missing || !tx.rows.length) return;
+    const built = CONF_HEAL.buildRecoveryRows(tx.rows, rec.messages, key, { sinceMs });
+    if (!built.rows.length) return;
+    ensureRowIds(key);                           // surviving rows keep stable ids/owners
+    const stat = CONF_HEAL.applyRecovery(rec, built.rows);
+    if (!stat.inserted) return;
+    rec.updated_at = Date.now();
+    saveChatData();
+    console.log('[Bridge] [CONF_HEAL_V1] ' + key + ': restored ' + stat.inserted + ' row(s)' +
+      (built.scope && built.scope.dropped ? ' (' + built.scope.dropped + ' older left out by scope)' : '') +
+      (stat.unresolvedAnchors ? ' — ' + stat.unresolvedAnchors + ' appended, anchor gone' : '') +
+      (built.warnings.length ? ' — ' + built.warnings.length + ' warning(s)' : ''));
+  } catch (e) { console.log('[Bridge] [CONF_HEAL_V1] reconcile failed for ' + key + ': ' + (e && e.message)); }
+}
+
 app.get('/history/:sessionId', (req, res) => {
   const id = req.params.sessionId;
   // [CONFERENCE_HISTORY_V1] A conference room is served from its authoritative,
@@ -863,6 +940,7 @@ app.get('/history/:sessionId', (req, res) => {
   try {
     // [CONF_CONTAINED_V1] Serve a conference room from its OWN store (chatData) so the
     // room is self-contained. Backfill from the operational side-file on first read.
+    confHealReconcile(id);   // [CONF_HEAL_V1] put back the tail this room lost
     const _cd = chatData[id];
     if (_cd && _cd.conf && Array.isArray(_cd.messages) && _cd.messages.length) {
       return res.json({ messages: _cd.messages });
@@ -871,7 +949,11 @@ app.get('/history/:sessionId', (req, res) => {
     if (_conf && _conf.status !== 'superseded' && Array.isArray(_conf.log) && _conf.log.length) {
       const _msgs = confLogToMessages(_conf);
       try { chatData[id] = { messages: _msgs, updated_at: Date.now(), conf: true }; saveChatData(); } catch (_) {}
-      return res.json({ messages: _msgs });
+      // [CONF_HEAL_V1] The log projection is a FLOOR, not the room's history. Heal it
+      // immediately so the first read after a cold backfill is already complete.
+      confHealReconcile(id);
+      const _healed = chatData[id];
+      return res.json({ messages: (_healed && Array.isArray(_healed.messages) && _healed.messages.length) ? _healed.messages : _msgs });
     }
   } catch (e) { /* fall through to the normal record on any error */ }
   const data = chatData[id];
@@ -899,6 +981,27 @@ app.post('/history/:sessionId', (req, res) => {
     // A blind replace here is what wiped 525 stored turns down to 4. Never let a
     // shorter payload overwrite a longer stored history — only grow or match. The
     // transcript backstops GET regardless, but this keeps the index intact too.
+    // [CONF_ROWID_V1] A conference room merges under the CLIENT writer instead of the
+    // old append-only prefix check: the merge is strictly safer (it cannot delete or
+    // reorder, and cannot write the conf: namespace at all), so no 409 is needed.
+    if (rowStoreIsConf(req.params.sessionId)) {
+      // [CONF_HEAL_V1] H2. upsertRows drops any row without a mid, and this handler
+      // answered ok:true regardless — a pre-update tab's messages vanished silently.
+      // Give mid-less rows a deterministic content-addressed id (repeat saves of the
+      // same array converge, two identical messages stay distinct) and report honestly.
+      let _rows = msgs;
+      if (CONF_HEAL) {
+        const _c = CONF_HEAL.classifySave(req.body || {});
+        if (_c.mode === 'reject') return res.status(409).json({ ok: false, error: _c.error });
+        if (_c.mode === 'legacy-snapshot') _rows = CONF_HEAL.assignLegacyMids(msgs);
+      }
+      const _before = (chatData[req.params.sessionId] && chatData[req.params.sessionId].messages || []).length;
+      upsertRows(req.params.sessionId, _rows, 'client');
+      const _after = (chatData[req.params.sessionId] && chatData[req.params.sessionId].messages || []).length;
+      const _dropped = _rows.filter(m => m && typeof m === 'object' && !m.mid).length;
+      if (_dropped) console.log('[Bridge] [CONF_HEAL_V1] ' + req.params.sessionId + ': ' + _dropped + ' unidentified row(s) not persisted');
+      return res.json({ ok: true, merged: true, added: _after - _before, dropped: _dropped });
+    }
     const existing = chatData[req.params.sessionId];
     const prevLen = (existing && Array.isArray(existing.messages)) ? existing.messages.length : 0;
     if (prevLen > msgs.length) {
@@ -1089,6 +1192,16 @@ const TT_RECENT_TURNS  = 3;     // the latest comment + the two before it
 const TT_TURN_CHARS    = 700;   // per-turn cap inside the prompt
 const TT_SOURCE_CHARS  = 2000;  // whole rendered prompt block cap
 const TT_SUMMARY_CHARS = 400;   // description cap
+// Turns that are machine-injected rather than typed by the user. A transcript
+// records these as ordinary "user" records, so without this a conference or
+// autonomy room summarises its own scaffolding instead of the person's request.
+const TT_INJECTED = [
+  /^You are collaborating with (Codex|Claude) in a shared, STAGED/i,
+  /^You are running ONE turn/i,
+  /CONFERENCE_VERDICT/,
+  /^<<<CONFERENCE/i,
+];
+function _ttIsInjected(t) { return TT_INJECTED.some(function (re) { return re.test(t); }); }
 function _ttClip(s, n) {
   let t = String(s || '').replace(/\s+/g, ' ').trim();
   if (t.length > n) { const cut = t.slice(0, n); t = cut.slice(0, cut.lastIndexOf(' ') + 1).trim() || cut; }
@@ -1107,6 +1220,7 @@ function _recentUserTurns(msgs, n) {
     if (!isUser) continue;
     const t = _ttClip(m.text != null ? m.text : extractText(m.content), TT_TURN_CHARS);
     if (!t) continue;
+    if (_ttIsInjected(t)) continue;   // scaffolding, not something the user said
     out.push(t);
   }
   return out.reverse();
@@ -1130,9 +1244,15 @@ function _roomSourceText(roomId) {
   let sid = '';
   try { const S = clientSessions.get(rid); if (S && S.sessionId) sid = S.sessionId; } catch {}
   if (!sid) { try { if (sessionFileExists(rid)) sid = rid; } catch {} }
+  // chatData is what the UI actually rendered as the user's own bubbles, so it is
+  // preferred over the transcript: roomHistoryMessages() takes whichever source is
+  // LONGER, and a transcript padded with injected prompts would win and drown the
+  // real request. Transcript is still the fallback when the client saved nothing.
   let msgs = [];
-  try { msgs = roomHistoryMessages(rid, sid) || []; } catch { msgs = []; }
-  if (!msgs.length && sid && sid !== rid) { try { msgs = roomHistoryMessages(sid, sid) || []; } catch {} }
+  try { const c = chatData[rid] || (sid ? chatData[sid] : null); if (c && Array.isArray(c.messages)) msgs = c.messages; } catch { msgs = []; }
+  if (!_recentUserTurns(msgs, 1).length) {
+    try { msgs = roomHistoryMessages(rid, sid) || []; } catch { msgs = []; }
+  }
   const recent = _recentUserTurns(msgs, TT_RECENT_TURNS);
   if (!recent.length) return empty;
   return {
@@ -1184,7 +1304,18 @@ function handleTaskTitle(req, res, deps) {
   // latestInstruction -> the single most recent user comment; the only description fallback
   let source = '', promptSource = '', latestInstruction = '';
   if (typed) {
-    source = typed; latestInstruction = typed; promptSource = _taskTitlePromptSource(typed);
+    // [LAST3_TITLE_V1] The typed objective is the MOST RECENT request; fold in up to the two
+    // prior USER turns already in the room as background so the title reflects the last three
+    // input bubbles, not just the freshly typed one. Reuses the same user-only selection +
+    // rendering as the room -> task path. Title only: source/latestInstruction stay the typed
+    // objective, so the create form's description seed and the POST /tasks payload are unchanged.
+    source = typed; latestInstruction = typed;
+    const _clippedTyped = _ttClip(typed, TT_TURN_CHARS);
+    const _priorRs = _roomSourceText(String(body.roomId || ''));
+    let _prior = (_priorRs && Array.isArray(_priorRs.recent)) ? _priorRs.recent.slice() : [];
+    if (_prior.length && _prior[_prior.length - 1] === _clippedTyped) _prior.pop();   // avoid double-count if already in history
+    _prior = _prior.slice(-(TT_RECENT_TURNS - 1));
+    promptSource = _renderRecentTurns(_prior.concat([_clippedTyped]));
   } else {
     const rs = _roomSourceText(String(body.roomId || ''));   // [ROOMTASK_HAIKU_V3] latest + 2 prior USER turns
     if (rs.hasContent) {
@@ -1359,6 +1490,7 @@ app.delete('/sessions/:id', (req, res) => {
       return res.status(409).json({ error: 'Session is running — stop it before deleting.' });
     }
     if (room) { try { room.killCurrentProc('session deleted'); } catch {} clientSessions.delete(id); clearRoom(id); }   // [CODEX_DURABLE_V2]
+    try { if (global.__ORCH) { const _mid = global.__ORCH.masterIdForRoom(id); if (_mid) global.__ORCH.parkAll(_mid, 'master room deleted'); } } catch (e) { console.log('[Bridge] [ORCH_V1] park on delete failed:', e.message); }
     try {
       const f = path.join(transcriptsDir(), `${id}.jsonl`);
       if (fs.existsSync(f)) fs.unlinkSync(f);
@@ -1608,14 +1740,54 @@ function resolveRoomEngineByKey(key) {
   const g = globalEngineNow();
   return { engine: override || g.engine, mode: override ? override : 'global', rev: g.rev };
 }
-// Push a fresh room_engine to every room that FOLLOWS the global marker, so an out-of-band
-// change (another tab/account switch, a cron) updates their bars without a reload.
+// Push a fresh room_engine to EVERY room, so an out-of-band change (another tab, an
+// account switch, a cron) updates their bars without a reload.
+// [ENGINE_GLOBAL_ONLY_V1] No room is skipped any more: the engine is one global choice
+// that every room follows, so there is no such thing as a room that ignores the marker.
 function broadcastGlobalEngineChange() {
   for (const S of clientSessions.values()) {
-    if (!S || S.engineOverride) continue;
+    if (!S) continue;
     try { S.send(S.engineState()); } catch {}
   }
 }
+// [ENGINE_GLOBAL_ONLY_V1] Per-room engine pins are retired. This drops any that survive
+// (live sessions + the durable room map) so `engineOverride` is uniformly null and
+// resolveRoomEngine() can only ever answer with the global marker.
+function clearAllEngineOverrides() {
+  for (const S of clientSessions.values()) {
+    if (S && S.engineOverride) { S.engineOverride = null; try { persistRoom(S); } catch {} }
+  }
+  try {
+    const m = _loadRoomMap(); let dirty = false;
+    for (const k of Object.keys(m)) { if (m[k] && m[k].engineOverride) { m[k].engineOverride = null; dirty = true; } }
+    if (dirty) _writeRoomMap(m);
+  } catch (e) { console.log('[Bridge] [ENGINE_GLOBAL_ONLY_V1] override sweep failed:', e.message); }
+}
+// [ENGINE_GLOBAL_ONLY_V1] The ONE place the engine is chosen. Writes the shared marker,
+// retires stale pins and tells every connected room. Throws if the marker cannot be written
+// (the caller reports it rather than pretending the switch happened).
+function setGlobalEngine(engine) {
+  const want = engine === 'codex' ? 'codex' : 'claude';
+  fs.writeFileSync(ENGINE_FILE, want);
+  clearAllEngineOverrides();
+  globalEngineNow();   // bump the rev before anyone reads it
+  broadcastGlobalEngineChange();
+  console.log('[Bridge] [ENGINE_GLOBAL_ONLY_V1] global engine set to', want);
+  return want;
+}
+// One-shot migration: rooms pinned by the old per-room selector must not keep running a
+// different engine from the one the selector now shows. Backs the map up first, then clears.
+// Deferred one tick so ROOM_MAP_FILE / clientSessions (declared further down) are initialised.
+setTimeout(function migrateEngineOverrides() {
+  const guard = path.join(os.homedir(), '.claude', '.engine-global-only');
+  try {
+    if (fs.existsSync(guard)) return;
+    if (fs.existsSync(ROOM_MAP_FILE)) fs.copyFileSync(ROOM_MAP_FILE, ROOM_MAP_FILE + '.bak-engine-global-only');
+    clearAllEngineOverrides();
+    fs.writeFileSync(guard, new Date().toISOString());
+    console.log('[Bridge] [ENGINE_GLOBAL_ONLY_V1] migrated: per-room engine pins cleared');
+  } catch (e) { console.log('[Bridge] [ENGINE_GLOBAL_ONLY_V1] migration skipped:', e.message); }
+}, 0);
 // Convergence poll (NOT the correctness guarantee): detect a marker value change and broadcast.
 function pollEngineMarker() {
   const before = _globalEngineSeen;
@@ -1773,9 +1945,51 @@ function listAccounts() {
   try {
     const al = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'account-refresh-alert.json'), 'utf8'));
     const bad = {}; (al.failing || []).forEach(x => { if (x && x.name) bad[x.name] = x.reason || 'refresh failing'; });
-    for (const a of accounts) { if (bad[a.name]) { a.health = 'fail'; a.healthReason = bad[a.name]; } }
+    const _SD = path.join(os.homedir(), ".credential-steward");
+    for (const a of accounts) {
+      if (!bad[a.name]) continue;
+      // [ALERT_STEWARD_RECONCILE_V1] hourly alert can lag a re-auth; steward status is fresher.
+      let _sh = false;
+      try { _sh = JSON.parse(fs.readFileSync(path.join(_SD, "claude-" + a.name + ".json"), "utf8")).status === "healthy"; } catch (e) {}
+      if (_sh) continue;
+      a.health = 'fail'; a.healthReason = bad[a.name];
+    }
   } catch (e) {}
   return { active, accounts, enabled: fs.existsSync(SWITCH_SH) };
+}
+// [ENGINE_GLOBAL_ONLY_V1] The ACTIVE account of each engine, for the room selector's
+// "Claude (email)" / "Codex (email)" labels. `available` means a turn can be started right
+// now on CREDENTIAL grounds alone: a registered active login whose refresh path is healthy.
+// Access-token expiry (accounts[].expired) is refreshed in place by the credential steward
+// on every spawn, so it is deliberately NOT an availability input — and neither is usage
+// quota: an exhausted account is still signed in.
+function engineAccounts() {
+  const base = listAccounts();
+  const codex = listCodexAccounts();
+  let uuid = '';
+  try { uuid = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount || {}).accountUuid || ''; } catch (e) {}
+  let cname = '';
+  if (uuid) {
+    try {
+      for (const f of fs.readdirSync(ACCT_DIR)) {
+        const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
+        let u = ''; try { u = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).accountUuid || ''; } catch (e) {}
+        if (u && u === uuid) { cname = m[1]; break; }
+      }
+    } catch (e) {}
+  }
+  const crec = base.accounts.find(a => a.name === cname) || null;
+  const cOk  = !!crec && crec.health !== 'fail';
+  const xrec = codex.accounts.find(a => a.active) || null;
+  const xOk  = !!xrec && codex.enabled;
+  return {
+    claude: { name: cname || null, email: (crec && crec.email) || base.active || '',
+              available: cOk,
+              reason: cOk ? '' : (crec ? (crec.healthReason || 'token refresh failing') : 'no registered active account') },
+    codex:  { name: xrec ? xrec.name : null, email: xrec ? xrec.email : '',
+              available: xOk,
+              reason: xOk ? '' : (xrec ? 'switcher not installed' : 'not signed in') },
+  };
 }
 app.get('/accounts', (req, res) => {
   const base = listAccounts();
@@ -1787,7 +2001,8 @@ app.get('/accounts', (req, res) => {
     if (codexUsageStale(u)) queueCodexProbe(a.name);
     return { ...a, usage: normalizeUsage(u) };
   }));
-  res.json({ ok: true, active: base.active, accounts, enabled: base.enabled, codexEnabled: codex.enabled, engine: currentEngine() });
+  res.json({ ok: true, active: base.active, accounts, enabled: base.enabled, codexEnabled: codex.enabled, engine: currentEngine(),
+             engineAccounts: engineAccounts() });   // [ENGINE_GLOBAL_ONLY_V1]
 });
 app.post('/accounts/switch', (req, res) => {
   const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
@@ -1803,7 +2018,9 @@ app.post('/accounts/switch', (req, res) => {
     return execFile(CODEX_SWITCH_SH, [name], { timeout: 20000, env: { ...process.env, HOME: os.homedir() } }, (err, stdout, stderr) => {
       const out = ((stdout || '') + (stderr || '')).trim();
       if (err) return res.status(500).json({ ok: false, error: out || err.message });
-      try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+      // [ENGINE_GLOBAL_ONLY_V1] Choosing an account NEVER changes which engine runs: each
+      // engine keeps its own selected account and the room selector alone picks the engine.
+      // The broadcast still fires so every room's label picks up the new email.
       try { broadcastGlobalEngineChange(); } catch {}
       const codex = listCodexAccounts();
       res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'codex', ...listAccounts(), codexAccounts: codex.accounts });
@@ -1813,7 +2030,8 @@ app.post('/accounts/switch', (req, res) => {
   execFile(SWITCH_SH, [name], { timeout: 20000 }, (err, stdout, stderr) => {
     const out = ((stdout || '') + (stderr || '')).trim();
     if (err) return res.status(500).json({ ok: false, error: out || err.message });
-    try { fs.writeFileSync(ENGINE_FILE, 'claude'); } catch {}
+    // [ENGINE_GLOBAL_ONLY_V1] Account choice is independent of engine choice (see the Codex
+    // branch above); only the labels are refreshed here.
     try { broadcastGlobalEngineChange(); } catch {}
     // [CONF_ACCT_SWITCH_V1] The Claude account is global, but a live session pins the
     // account it was first spawned under (S.credentialClaudeAccount, set-once) and a
@@ -1939,7 +2157,7 @@ function finalizeCodexAuth() {
   try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
   if (ok) {
     try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
-    try { fs.writeFileSync(ENGINE_FILE, 'codex'); } catch {}
+    // [ENGINE_GLOBAL_ONLY_V1] Re-auth restores a Codex login; it does not hijack the engine.
     cxResult = { ok: true, message: 'Re-authenticated' + (email ? ' as ' + email : '') + ' — saved as “' + cxName + '”.' };
   } else {
     const clean = stripAnsiSeq(cxBuf).replace(/\r/g, '\n').split('\n').map(x => x.trim()).filter(Boolean);
@@ -2147,8 +2365,8 @@ app.get('/sessions', (req, res) => {
     // Keep autonomy task rooms from crowding normal rooms out of the top list:
     // cap the two groups independently (the client tucks task rooms into a sub-menu).
     const _arch   = _all.filter(x => x.archived);
-    const _normal = _all.filter(x => !x.taskRoom && !x.archived).slice(0, 150);
-    const _task   = _all.filter(x => x.taskRoom && !x.archived).slice(0, 100);
+    const _normal = _all.filter(x => !x.taskRoom && !x.archived);
+    const _task   = _all.filter(x => x.taskRoom && !x.archived);
     res.json({ sessions: [..._normal, ..._task, ..._arch] });
   } catch (e) { res.json({ sessions: [] }); }
 });
@@ -2237,9 +2455,9 @@ function currentAccountIdentity() {
 }
 // Snapshot a completed rate-limit capture against the account it belongs to, so
 // the switcher can show each account's last-known 5h/7d usage + reset times.
-function persistAccountUsage(rl) {
+function persistAccountUsage(rl, acctIdent) {
   try {
-    const { uuid, email } = currentAccountIdentity();
+    const { uuid, email } = acctIdent || currentAccountIdentity();
     if (!uuid || !fs.existsSync(ACCT_DIR)) return;
     for (const f of fs.readdirSync(ACCT_DIR)) {
       const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
@@ -2275,24 +2493,38 @@ function readAccountUsageByEmail(email) {
 
 // Scan one stdout line for the rate-limit headers (present only in debug output).
 // Accumulates the 5h/7d util+reset across lines, then persists once complete.
+function accountIdentityByName(name) {
+  try {
+    const d = JSON.parse(fs.readFileSync(path.join(ACCT_DIR, name + ".account.json"), "utf8")) || {};
+    return { email: d.emailAddress || "", uuid: d.accountUuid || "" };
+  } catch { return { email: "", uuid: "" }; }
+}
 let _rlPending = {};
-function scrapeRateLimits(line) {
-  if (line.indexOf('unified-') === -1) return;
+// [USAGE_ATTRIB_V1] Attribute usage to the account THIS worker runs on
+// (S.credentialClaudeAccount), not the globally-active account; per-session
+// accumulator. Stops a background room on another account from poisoning the
+// active account's usage snapshot + headroom banner.
+function scrapeRateLimits(line, S) {
+  if (line.indexOf("unified-") === -1) return;
+  const acc = (S && (S._rlPending || (S._rlPending = {}))) || _rlPending;
   let m, hit = false;
-  if ((m = line.match(/unified-5h-utilization"?\s*:\s*"?([0-9.]+)/))) { _rlPending.five_hour_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
-  if ((m = line.match(/unified-7d-utilization"?\s*:\s*"?([0-9.]+)/))) { _rlPending.seven_day_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
-  if ((m = line.match(/unified-5h-reset"?\s*:\s*"?([0-9]+)/)))        { _rlPending.five_hour_resets_at = parseInt(m[1], 10); hit = true; }
-  if ((m = line.match(/unified-7d-reset"?\s*:\s*"?([0-9]+)/)))        { _rlPending.seven_day_resets_at = parseInt(m[1], 10); hit = true; }
+  if ((m = line.match(/unified-5h-utilization"?\s*:\s*"?([0-9.]+)/))) { acc.five_hour_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
+  if ((m = line.match(/unified-7d-utilization"?\s*:\s*"?([0-9.]+)/))) { acc.seven_day_pct = Math.round(parseFloat(m[1]) * 100); hit = true; }
+  if ((m = line.match(/unified-5h-reset"?\s*:\s*"?([0-9]+)/)))        { acc.five_hour_resets_at = parseInt(m[1], 10); hit = true; }
+  if ((m = line.match(/unified-7d-reset"?\s*:\s*"?([0-9]+)/)))        { acc.seven_day_resets_at = parseInt(m[1], 10); hit = true; }
   if (!hit) return;
-  if (_rlPending.five_hour_pct != null && _rlPending.seven_day_pct != null) {
-    _rlPending.updated_at = new Date().toISOString();
-    const id = currentAccountIdentity();
-    _rlPending.account_email = id.email;
-    _rlPending.account_uuid = id.uuid;
+  if (acc.five_hour_pct != null && acc.seven_day_pct != null) {
+    acc.updated_at = new Date().toISOString();
+    const ident = (S && S.credentialClaudeAccount)
+      ? accountIdentityByName(S.credentialClaudeAccount)
+      : currentAccountIdentity();
+    acc.account_email = ident.email;
+    acc.account_uuid = ident.uuid;
     lastRateCaptureAt = Date.now();
-    persistRateLimits(_rlPending);
-    persistAccountUsage(_rlPending);
-    _rlPending = {};
+    const activeEmail = currentAccountIdentity().email;
+    if (!ident.email || ident.email === activeEmail) persistRateLimits(acc);
+    persistAccountUsage(acc, ident);
+    if (S) S._rlPending = {}; else _rlPending = {};
   }
 }
 
@@ -2369,7 +2601,7 @@ app.get('/usage', (req, res) => {
   if (_engine === 'codex') {
     return readCodexMetrics((err, raw) => err
       ? res.status(502).json({ ok: false, engine: 'codex', error: err.message })
-      : res.json(codexUsageResponse(raw, _rid)));
+      : res.json({ ...codexUsageResponse(raw, _rid), engineAccounts: engineAccounts() }));   // [ENGINE_GLOBAL_ONLY_V1]
   }
   let blockResult = null, weekResult = null, done = 0;
   const rateLimits = readRateLimits() || {};
@@ -2408,7 +2640,8 @@ app.get('/usage', (req, res) => {
 
   function finish() {
     if (++done < 2) return;
-    res.json({ ok: true, engine: 'claude', block: blockResult, week: weekResult, rateLimits });
+    res.json({ ok: true, engine: 'claude', block: blockResult, week: weekResult, rateLimits,
+               engineAccounts: engineAccounts() });   // [ENGINE_GLOBAL_ONLY_V1] keeps the selector's emails live on the 30s poll
   }
 
   // 5-hour block data
@@ -3045,17 +3278,144 @@ function confReconcileRegistrations() {
   }
 }
 
+// ── [CONF_ROWID_V1] Stable row identity + writer-authorized, non-destructive merge ──
+// A room's display transcript has TWO writers: the conference projection (server) and
+// the client (streamed tool/Bash rows). Historically the projection did a whole-object
+// overwrite at every turn boundary, deleting every client row — the "disappearing
+// bubbles" defect. These helpers replace both overwrites with an upsert whose single
+// invariant is: NO WRITER MAY DELETE A ROW IT DOES NOT OWN.
+//
+// Authority comes from the CALL SITE (the `writer` argument, bound by the caller),
+// never from any field in the payload: a client cannot claim ownership of a conf: row
+// by sending owner:'conf' or an inflated rev.
+const ROW_NS_CONF = 'conf:';
+function _rowUuid() {
+  try { return require('crypto').randomUUID(); }
+  catch (e) { return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12); }
+}
+function rowIsConf(mid) { return typeof mid === 'string' && mid.indexOf(ROW_NS_CONF) === 0; }
+// 'conf' owns conf:*; 'client' owns everything else (cli:* and the migrated legacy:*).
+// [CONF_HEAL_V1] tx:* is the transcript-recovery namespace, owned by the 'recover'
+// writer and INSERT-ONLY. Authority comes from the call site's writer argument, never
+// from the payload, so a client POST can neither forge a recovered row nor delete one.
+const ROW_NS_TX = 'tx:';
+function rowIsTx(mid) { return typeof mid === 'string' && mid.indexOf(ROW_NS_TX) === 0; }
+function rowAllowed(writer, mid) {
+  if (typeof mid !== 'string' || !mid) return false;
+  if (writer === 'conf') return rowIsConf(mid);
+  if (writer === 'recover') return rowIsTx(mid);
+  return !rowIsConf(mid) && !rowIsTx(mid);
+}
+// One-shot, PERSISTED legacy migration. Pre-existing rows have no id; they are given a
+// real, stable one exactly once (never derived per-read from index/text, which would
+// drift with ordering) and are classified client-owned so the projection can never
+// rewrite or delete them.
+function ensureRowIds(key) {
+  const rec = chatData[key];
+  if (!rec || !Array.isArray(rec.messages)) return;
+  if (rec.midVersion === 1) return;
+  for (const m of rec.messages) {
+    if (m && typeof m === 'object' && !m.mid) {
+      m.mid = 'legacy:' + _rowUuid();
+      m.owner = 'client';
+      if (!Number.isFinite(m.rev)) m.rev = 0;
+    }
+  }
+  rec.midVersion = 1;
+}
+// Non-destructive, writer-authorized upsert.
+//   - row absent            -> insert (client rows anchor before their turn's answer)
+//   - row present, same ns  -> update only when the incoming rev is strictly newer
+//   - row present, other ns -> ignored
+//   - row never deleted, except opts.retractMids (conf: only, conference writer only)
+function upsertRows(key, incoming, writer, opts) {
+  opts = opts || {};
+  let rec = chatData[key];
+  if (!rec || !Array.isArray(rec.messages)) rec = chatData[key] = { messages: [], updated_at: 0 };
+  ensureRowIds(key);
+  let byMid = new Map();
+  const reindex = () => { byMid = new Map(); rec.messages.forEach((m, i) => { if (m && m.mid) byMid.set(m.mid, i); }); };
+  reindex();
+  let changed = false;
+  for (const raw of (Array.isArray(incoming) ? incoming : [])) {
+    if (!raw || typeof raw !== 'object') continue;
+    const mid = raw.mid;
+    if (!rowAllowed(writer, mid)) continue;                 // wrong namespace -> dropped
+    const row = Object.assign({}, raw);
+    row.owner = (writer === 'conf') ? 'conf' : 'client';    // derived, never trusted
+    const rev = Number.isFinite(raw.rev) ? raw.rev : 0;
+    row.rev = rev;
+    if (byMid.has(mid)) {
+      const at = byMid.get(mid);
+      const cur = rec.messages[at] || {};
+      if (cur.owner && cur.owner !== row.owner) continue;   // never cross namespaces
+      if (rev <= (Number.isFinite(cur.rev) ? cur.rev : 0)) continue;   // stale -> ignore
+      rec.messages[at] = row;
+      changed = true;
+    } else {
+      // A client row that names its parent conference turn belongs BEFORE that turn's
+      // answer bubble, so a late-arriving tool row cannot land after the answer.
+      let at = rec.messages.length;
+      if (writer !== 'conf' && raw.parentTurnId && byMid.has(ROW_NS_CONF + raw.parentTurnId)) {
+        at = byMid.get(ROW_NS_CONF + raw.parentTurnId);
+      }
+      rec.messages.splice(at, 0, row);
+      reindex();
+      changed = true;
+    }
+  }
+  const retract = Array.isArray(opts.retractMids) ? opts.retractMids.filter(rowIsConf) : [];
+  if (writer === 'conf' && retract.length) {
+    const kill = new Set(retract);
+    const before = rec.messages.length;
+    rec.messages = rec.messages.filter(m => !(m && m.owner === 'conf' && kill.has(m.mid)));
+    if (rec.messages.length !== before) changed = true;
+  }
+  if (changed) { rec.updated_at = Date.now(); saveChatData(); }
+  return rec;
+}
+// True when this room's stored transcript is a conference record (so the merge path
+// applies). Ordinary rooms keep their existing whole-array save semantics untouched.
+function rowStoreIsConf(key) {
+  const rec = chatData[key];
+  if (rec && rec.conf) return true;
+  // [CONF_HEAL_V1] H3. Only a LIVE conference claims a room from its side-file. A
+  // stopped/concluded one used to own the room forever, which is how ordinary chat in
+  // a finished conference room kept being shadowed by the old episode's log.
+  try { const c = confLoad(key); return !!(c && (c.status === 'running' || c.status === 'paused') && Array.isArray(c.log) && c.log.length); }
+  catch (e) { return false; }
+}
+
 // [CONF_CONTAINED_V1] Mirror a conference's user-visible content (brief + both-engine log)
 // into the room's OWN store so the room is self-contained and survives deletion of the
 // operational side-file. The server is the sole writer of a conference record.
-function confMirrorToChat(key, c) {
+function confMirrorToChat(key, c, opts) {
   try {
     if (!key || !c || !Array.isArray(c.log) || c.status === 'superseded') return;
     const messages = confLogToMessages(c);
     if (!messages.length) return;
-    chatData[key] = { messages, updated_at: Date.now(), conf: true };
-    saveChatData();
+    const rec = chatData[key];
+    // [CONF_ROWID_V1] Cold room: the projection IS the whole transcript. Otherwise merge
+    // — never replace, or every client-owned tool/Bash row is destroyed (the defect).
+    if (!rec || !Array.isArray(rec.messages) || !rec.messages.length) {
+      chatData[key] = { messages, updated_at: Date.now(), conf: true, midVersion: 1 };
+      saveChatData();
+      return;
+    }
+    rec.conf = true;
+    upsertRows(key, messages, 'conf', { retractMids: (opts && opts.retractMids) || [] });
   } catch (e) { console.log('[Bridge] [CONF_CONTAINED_V1] mirror failed:', e.message); }
+}
+// [CONF_ROWID_V1] The room's authoritative DISPLAY transcript: the merged store (which
+// keeps client-owned rows) rather than the bare, lossy log projection. Used by every
+// conf_sync emit site so obeying a sync can never cost the client its tool rows.
+function confDisplayMessages(key, c) {
+  try {
+    confMirrorToChat(key, c);
+    const rec = chatData[key];
+    if (rec && Array.isArray(rec.messages) && rec.messages.length) return rec.messages;
+  } catch (e) {}
+  return confLogToMessages(c);
 }
 function confClearFile(key) { try { fs.unlinkSync(confFile(key)); } catch {} }
 function confExistsRunning(key) { const c = confLoad(key); return !!(c && c.status === 'running'); }
@@ -3078,11 +3438,11 @@ function confRequestActivation(S, opts) {
   };
   // Visible, ordered breadcrumb in the authoritative log.
   c.log = c.log || [];
-  c.log.push({ turnId: 'activation-req-' + Date.now().toString(36), engine: c.leadEngine, role: 'system',
+  c.log.push({ turnId: 'activation-req-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7), engine: c.leadEngine, role: 'system',
                stage: c.stage, subphase: c.subphase, round: c.round,
                text: '⏻ Activation requested — restarting host to load build `' + c.activation.expectBuildId +
                      '`. Verification will auto-resume against the live code on respawn.',
-               verdict: null, verdictStage: null, ts: Date.now() });
+               verdict: null, verdictStage: null, ts: Date.now(), rowCreatedAt: Date.now() });   // [BUBBLE_TS_V1]
   // Pause so nothing dispatches during the exit window; boot resume re-opens it.
   c.status = 'paused'; c.pausedReason = 'awaiting activation restart'; c.activeTurnId = null;
   try { confSave(S); } catch (e) { console.log('[Bridge] [CONF_ACTIVATION_V1] checkpoint save failed:', e.message); }
@@ -3126,11 +3486,11 @@ function confResumeActivations() {
       a.restartedAt = Date.now();
       a.resumeDone = a.resumeGeneration;   // exactly-once marker
       c.log = c.log || [];
-      c.log.push({ turnId: 'activation-live-' + Date.now().toString(36), engine: c.leadEngine, role: 'system',
+      c.log.push({ turnId: 'activation-live-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7), engine: c.leadEngine, role: 'system',
                    stage: c.stage, subphase: c.subphase, round: c.round,
                    text: '✅ Host restarted (pid ' + a.oldPid + '→' + process.pid + '); build `' + CONF_BUILD_ID +
                          '` is live. Re-opening verification — the engines will now record the verdict against the live code.',
-                   verdict: null, verdictStage: null, ts: Date.now() });
+                   verdict: null, verdictStage: null, ts: Date.now(), rowCreatedAt: Date.now() });   // [BUBBLE_TS_V1]
       // Re-open verification: fresh turn (drop any truncated activeTurnId), back to running.
       c.status = 'running'; c.pausedReason = null; c.activeTurnId = null; c._afterTurn = null;
       S._confRecovered = true;   // we drive the dispatch ourselves; don't double-fire on attach
@@ -3157,7 +3517,7 @@ function _confNewTurnId() { return 'ct-' + Date.now().toString(36) + '-' + Math.
 function confSendStatus(S) {
   if (!S || !S.conf) return;
   const c = S.conf;
-  S.send({ type: 'conf_status', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
+  S.send({ type: 'conf_status', userRowIdentity: 1, roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
            round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
            leadEngine: c.leadEngine, reviewEngine: c.reviewEngine, nextEngine: c.nextEngine, reason: c.pausedReason || null });
 }
@@ -3182,13 +3542,37 @@ function confLogToMessages(c) {
   // reopened / synced conference view shows the original message. The brief lives in
   // c.brief (never in c.log); test emptiness on a trimmed copy but render it verbatim.
   const _brief = (c && typeof c.brief === 'string') ? c.brief : '';
-  if (_brief.trim()) out.push({ type: 'user', text: _brief });
+  // [CONF_ROWID_V1] Every projected row carries a DETERMINISTIC id the client mints
+  // identically (conf:<turnId>), so a live preview bubble and the later authoritative
+  // row collapse onto one row instead of duplicating. Every c.log entry already has a
+  // unique turnId (engine turns, conclusions, interjections, activation breadcrumbs),
+  // so array position is never used as identity. rev = the entry's own timestamp.
+  // [CONF_USERROW_IDENTITY_V1] Render the human display string when we have one; the raw
+  // engine prompt (with its [The user attached …] block) is never what the user typed.
+  const _briefDisp = (c && typeof c.briefDisplay === 'string' && c.briefDisplay) ? c.briefDisplay : _brief;
+  if (_brief.trim()) {
+    const _b = { type: 'user', text: _briefDisp, mid: 'conf:brief', owner: 'conf', rev: (c && c.createdAt) || 1 };
+    if (Number.isFinite(c && c.briefCreatedAt)) _b.ts = c.briefCreatedAt;   // [BUBBLE_TS_V1]
+    out.push(_b);
+  }
   for (const e of ((c && c.log) || [])) {
+    const _mid = 'conf:' + (e && e.turnId ? e.turnId : 'anon');
+    const _rev = (e && Number.isFinite(e.ts)) ? e.ts : 1;
+    // [BUBBLE_TS_V1] Displayed creation instant comes ONLY from rowCreatedAt. e.ts is
+    // revision metadata: using it would retro-stamp every pre-deploy row.
+    const _cts = (e && Number.isFinite(e.rowCreatedAt)) ? e.rowCreatedAt : null;
     // [CONF_INTERJECT_LOG_V1] A user interjection is a first-class log entry.
-    if (e && e.role === 'user') { out.push({ type: 'user', text: e.text || '' }); continue; }
-    out.push({ type: 'assistant', engine: e.engine || null, role: e.role || null,
+    // [CONF_ROWID_V1] ...and must keep its turnId, or it has no stable identity.
+    if (e && e.role === 'user') {
+      const _u = { type: 'user', text: ((typeof e.displayText === 'string' && e.displayText) ? e.displayText : (e.text || '')), turnId: e.turnId || null, mid: _mid, owner: 'conf', rev: _rev };
+      if (_cts !== null) _u.ts = _cts;   // [BUBBLE_TS_V1]
+      out.push(_u); continue;
+    }
+    const _a = { type: 'assistant', engine: e.engine || null, role: e.role || null,
                stage: e.stage || null, stageLabel: confStageLabel(e.stage, c.taskType), round: e.round || null,
-               turnId: e.turnId || null, text: e.text || '' });
+               turnId: e.turnId || null, text: e.text || '', mid: _mid, owner: 'conf', rev: _rev };
+    if (_cts !== null) _a.ts = _cts;   // [BUBBLE_TS_V1]
+    out.push(_a);
   }
   return out;
 }
@@ -3302,6 +3686,11 @@ function confRolePreamble(S, engine) {
 // Parse + strip the hidden verdict block. Missing/malformed OR wrong-stage => 'revise'
 // (never crash, never terminate). 'blocked' always halts regardless of stage tag.
 function confExtractVerdict(text, expectedStage) {
+  // [CONF_HEAL_V1] H4. The regex below is greedy from the FIRST marker, so any turn
+  // that quotes the delimiter in prose was cut off at the quote — it truncated four
+  // turns of this fix's own design discussion. The helper takes only a trailing,
+  // closed, JSON-parseable, schema-valid block, scanning backwards.
+  if (CONF_HEAL) { try { return CONF_HEAL.extractVerdict(text, expectedStage); } catch (e) {} }
   const re = /<<<CONFERENCE_VERDICT\s*([\s\S]*?)\s*CONFERENCE_VERDICT>>>/;
   const m = String(text || '').match(re);
   let verdict = { verdict: 'revise', stage: null, remainingIssues: [] };
@@ -3366,6 +3755,7 @@ function confDispatch(S, reuseTurnId, opts) {
   }
   const turnId = reuseTurnId || _confNewTurnId();
   c.activeTurnId = turnId;
+  c.activeTurnStartedAt = Date.now();   // [BUBBLE_TS_V1] the ONE instant for this turn's divider AND its bubble, live and after reload
   S._confTurnId = turnId;
   c._acc = ''; c._accParts = '';
   const prompt = confBuildPrompt(S, engine);
@@ -3374,7 +3764,7 @@ function confDispatch(S, reuseTurnId, opts) {
   confSave(S);
   S.send({ type: 'conf_turn', engine, role: (engine === c.leadEngine ? 'lead' : 'reviewer'),
            stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase, round: c.round,
-           turnId, restriction: confRestrictionMode(c) });
+           turnId, ts: c.activeTurnStartedAt, restriction: confRestrictionMode(c) });   // [BUBBLE_TS_V1]
   confSendStatus(S);
   try { S.sendToEngine(engine, prompt); }
   catch (e) { console.log('[Bridge] [CONFERENCE_V2] dispatch failed:', e.message); c.status = 'paused'; c.pausedReason = 'dispatch-error'; confSave(S); confSendStatus(S); }
@@ -3401,6 +3791,9 @@ function confCredMessage(cat, ctx) {
   if (cat === 'retry') return 'Temporarily could not obtain ' + eng + ' credentials — retrying (attempt ' + ctx.attempt + ' of ' + (CONF_CRED_MAX_ATTEMPTS - 1) + ')…';
   if (cat === 'exhausted') return 'Could not obtain ' + eng + ' credentials after ' + CONF_CRED_MAX_ATTEMPTS + ' attempts. Resume to try again.';
   if (cat === 'runtime') return 'The ' + eng + ' engine exited before completing its turn. Resume to retry.';
+  // [CRED_401_HEAL_V3] A rotation collision is NOT a re-authentication problem; saying so
+  // would send the user chasing a login they do not need.
+  if (cat === 'rotating_exhausted') return 'Credentials are still rotating \u2014 resend shortly.';
   return eng + ' credential setup failed. Resume to try again.';
 }
 // Write/increment the durable credential-attempt lease BEFORE an issuance attempt.
@@ -3447,7 +3840,7 @@ function confSpawnFailed(S, err) {
     setTimeout(function () { try { confRetryFire(S, myTurn, myGen); } catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] retry fire failed:', e.message); } }, backoff);
     return;
   }
-  const finalCat = (cat === 'reauth') ? 'reauth' : (cat === 'transient' ? 'exhausted' : (cat === 'runtime' ? 'runtime' : 'unknown'));
+  const finalCat = (cat === 'reauth') ? 'reauth' : (cat === 'rotating_exhausted') ? 'rotating_exhausted' : (cat === 'transient' ? 'exhausted' : (cat === 'runtime' ? 'runtime' : 'unknown'));   // [CRED_401_HEAL_V3]
   c.status = 'paused';
   c.pausedReason = confCredMessage(finalCat, { engineLabel: engineLabel });
   c.pendingRetry = null;   // keep activeTurnId so a manual Resume redispatches this turn
@@ -3529,6 +3922,14 @@ function confClassifyTaskType(brief) {
   return { type, confidence, auto: true };
 }
 
+// [BUBBLE_TS_V1] A row's creation instant is minted by the ORIGINATING client so its own
+// optimistic bubble and every other device show the same number immediately. Never trusted
+// blindly: it must be an integer within 5 minutes of server time, else the server
+// substitutes its own (and the caller echoes the correction back to the sender).
+const ROW_TS_SKEW_MS = 5 * 60 * 1000;
+function confValidRowTs(v) {
+  return (Number.isInteger(v) && Math.abs(v - Date.now()) <= ROW_TS_SKEW_MS) ? v : Date.now();
+}
 function confStart(S, brief, opts) {
   opts = opts || {};
   const lead = (opts.leadEngine === 'codex') ? 'codex'
@@ -3545,11 +3946,13 @@ function confStart(S, brief, opts) {
     stage: 'diagnosis', subphase: 'lead', round: 1, maxRounds,
     leadEngine: lead, reviewEngine: review, nextEngine: lead,
     brief: String(brief || '').slice(0, 20000),
+    briefDisplay: (typeof opts.displayText === 'string' && opts.displayText) ? opts.displayText.slice(0, 20000) : null,   // [CONF_USERROW_IDENTITY_V1]
     taskType: _tt.type, taskTypeConfidence: _tt.confidence, taskTypeAuto: _tt.auto,   // [CONF_TASKTYPE_V1]
     task: (opts.task || null), startReqId: (typeof opts.reqId === 'string' ? opts.reqId : null),
     activeTurnId: null, log: [], stageVerdicts: {}, lastByEngine: {}, pendingInterject: [],
     spawnRetries: 0, pendingRetry: null, retryGen: 0,   // [CONF_CRED_RETRY_V1]
     createdAt: Date.now(),
+    briefCreatedAt: confValidRowTs(opts.rowTs),   // [BUBBLE_TS_V1] absent on pre-deploy conferences => brief stays unstamped
   };
   S._confRecovered = true;
   confClearDenials(S.key);
@@ -3611,13 +4014,13 @@ async function confCanonicalTask(decision, task) {
 // interjection fork, so a retried first message never becomes a double interjection;
 // (2) active conference -> interjection (unchanged); (3) fresh start requires a valid
 // reqId AND a valid taskDecision, else fail closed with conf_need_task.
-async function confTryStart(S, brief, msg) {
+async function confTryStart(S, brief, msg, opts) {   // [CONF_USERROW_IDENTITY_V1] opts.displayText is SERVER-derived
   const c = S.conf;
   const reqId = msg && msg.reqId;
   if (c && c.startReqId && confValidReqId(reqId) && reqId === c.startReqId) {
     confSendStatus(S);
     if (Array.isArray(c.log) && c.log.length) {
-      S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c),
+      S.send({ type: 'conf_sync', userRowIdentity: 1, roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confDisplayMessages(S.key, c),
                status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase,
                round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
@@ -3629,8 +4032,9 @@ async function confTryStart(S, brief, msg) {
     return;
   }
   if (c && (c.status === 'running' || c.status === 'paused')) {
-    confInterject(S, brief); if (c.status === 'paused') confResume(S);
-    return;
+    const _tid = confInterject(S, brief, { interjectId: msg && msg.interjectId, displayText: (opts && opts.displayText) || null, rowTs: (opts && opts.rowTs) });   // [CONF_USERROW_IDENTITY_V1] [BUBBLE_TS_V1]
+    if (c.status === 'paused') confResume(S);
+    return _tid;
   }
   // [CONF_NEEDTASK_RECOVER_V1] A rejected start still contains the user's words. Echo the room and
   // the text so the client can hold it as THAT room's draft instead of silently losing it.
@@ -3638,26 +4042,62 @@ async function confTryStart(S, brief, msg) {
   if (!confValidReqId(reqId)) { S.send({ type: 'conf_need_task', reason: 'reqid', reqId: (typeof reqId === 'string' ? reqId : null), roomId: S.key, text: _ndText }); return; }
   const dec = await confCanonicalTask(msg && msg.taskDecision, msg && msg.task);
   if (dec.status === 'invalid') { S.send({ type: 'conf_need_task', reason: 'task', reqId: reqId, roomId: S.key, text: _ndText }); return; }
-  confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId, taskType: msg && msg.taskType });   // [CONF_TASKTYPE_V1]
+  confStart(S, brief, { leadEngine: msg && msg.leadEngine, maxRounds: msg && msg.maxRounds, task: dec.task, reqId: reqId, taskType: msg && msg.taskType, displayText: (opts && opts.displayText) || null, rowTs: (opts && opts.rowTs) });   // [CONF_TASKTYPE_V1] [BUBBLE_TS_V1]
 }
 
-function confInterject(S, text) {
-  const c = S.conf; if (!c) return;
+// [CONF_USERROW_IDENTITY_V1] Broadcast one user row to a room's OTHER sockets. A conference
+// interjection carries the canonical mid so every device renders the SAME row the server
+// logged, instead of each minting a private client-owned copy.
+function _confBcastUser(S, fromWs, text, mid, ts, toSenderToo) {
+  // [BUBBLE_TS_V1] ts is the ratified creation instant; when the server had to REPLACE a
+  // skewed client value, toSenderToo echoes it back so the sender's optimistic bubble is
+  // corrected and no device is left showing a different time.
+  const frame = { type: 'user_msg', text: text };
+  if (mid) frame.mid = mid;
+  if (Number.isFinite(ts)) frame.ts = ts;
+  const json = JSON.stringify(frame);
+  for (const sock of S.sockets) {
+    if ((toSenderToo || sock !== fromWs) && sock.readyState === WebSocket.OPEN) sock.send(json);
+  }
+}
+// The id is minted by the client and ends up inside a querySelector('[data-mid="..."]'),
+// so the charset is a strict whitelist; anything else falls back to a server-random id.
+function confValidInterjectId(v) { return typeof v === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(v); }
+function confInterject(S, text, opts) {
+  const c = S.conf; if (!c) return null;
+  opts = opts || {};
   c.pendingInterject = c.pendingInterject || [];
   const _itext = String(text || '').slice(0, 8000);
+  // [CONF_USERROW_IDENTITY_V1] Display text is derived by the CALLER from the server's own
+  // inputs — never a client-supplied string, and never used to build the engine prompt.
+  const _disp = (typeof opts.displayText === 'string' && opts.displayText) ? opts.displayText.slice(0, 8000) : null;
+  c.log = c.log || [];
+  // [CONF_USERROW_IDENTITY_V1] Deterministic identity: the projected row's mid becomes
+  // conf:interject-<iid>, which is exactly what the client already painted — one row, not two.
+  const turnId = confValidInterjectId(opts.interjectId)
+    ? ('interject-' + opts.interjectId)
+    : ('interject-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6));
+  // Idempotent replay: the same id must never queue a second delivery to the engines nor
+  // append a second row. It still returns the canonical id so the caller can ack/broadcast.
+  for (const _e of c.log) {
+    if (_e && _e.turnId === turnId) {
+      console.log('[Bridge] [CONF_USERROW_IDENTITY_V1] duplicate interjection ignored', turnId, 'room', S.key);
+      return turnId;
+    }
+  }
   c.pendingInterject.push({ text: _itext, ttl: 2 });
   // [CONF_INTERJECT_LOG_V2] Record it in the authoritative log so it survives conf_sync /
   // confMirrorToChat repaints. Insert BEFORE a trailing auto-conclusion so the existing
   // "pop the conclusion on resume" checks still see the conclusion last.
-  c.log = c.log || [];
   const _at = (c.log.length && c.log[c.log.length - 1].role === 'conclusion') ? c.log.length - 1 : c.log.length;
-  c.log.splice(_at, 0, { turnId: 'interject-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6),
+  c.log.splice(_at, 0, { turnId: turnId,
                          engine: null, role: 'user', stage: c.stage, subphase: c.subphase, round: c.round,
-                         text: _itext, verdict: null, verdictStage: null, ts: Date.now() });
+                         text: _itext, displayText: _disp, verdict: null, verdictStage: null, ts: Date.now(), rowCreatedAt: confValidRowTs(opts.rowTs) });   // [BUBBLE_TS_V1]
   confSave(S);
   try { confMirrorToChat(S.key, c); } catch (e) {}
   if (c.status === 'paused') { S.send({ type: 'status', text: 'Interjection saved — resume the conference to deliver it.' }); }
   else S.send({ type: 'status', text: 'Interjection queued — it will reach both engines on the next turn.' });
+  return turnId;   // [CONF_USERROW_IDENTITY_V1] canonical identity for the ack + cross-device broadcast
 }
 
 function confPause(S) {
@@ -3673,8 +4113,9 @@ function confResume(S) {
   if (c.activeTurnId && (c.pendingRetry || (c.spawnRetries || 0) > 0)) {
     c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;
     c.status = 'running'; c.pausedReason = null; c._afterTurn = null;
-    if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') { c.log.pop(); c.concluded = false; }
-    confSave(S); confMirrorToChat(S.key, c); confSendStatus(S);
+    let _retract = [];   // [CONF_ROWID_V1] the ONE legal delete: an explicitly retracted conclusion
+    if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') { const _p = c.log.pop(); c.concluded = false; if (_p && _p.turnId) _retract = ['conf:' + _p.turnId]; }
+    confSave(S); confMirrorToChat(S.key, c, { retractMids: _retract }); confSendStatus(S);
     confDispatch(S, c.activeTurnId, { isRetry: true });
     return;
   }
@@ -3682,13 +4123,14 @@ function confResume(S) {
   // the pause, so a continued conference doesn't leave a stale summary mid-transcript.
   // A fresh conclusion is produced at the next terminal state (c.concluded reset).
   if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') {
-    c.log.pop();
+    const _popped = c.log.pop();
+    const _retractMids = (_popped && _popped.turnId) ? ['conf:' + _popped.turnId] : [];   // [CONF_ROWID_V1]
     c.concluded = false;
     c.status = 'running'; c.pausedReason = null; c._afterTurn = null; confSave(S);
-    confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
+    confMirrorToChat(S.key, c, { retractMids: _retractMids });   // [CONF_CONTAINED_V1]
     // Repaint the authoritative log so the retracted conclusion disappears everywhere.
     if (Array.isArray(c.log) && c.log.length) {
-      S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
+      S.send({ type: 'conf_sync', userRowIdentity: 1, roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confDisplayMessages(S.key, c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
                subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
                leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
     }
@@ -3741,13 +4183,14 @@ function confPushConclusion(S, reason) {
   c.concluded = true;
   c.log = c.log || [];
   const text = confComposeConclusion(c, reason);
-  const turnId = 'conclusion-' + Date.now().toString(36);
+  const turnId = 'conclusion-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);   // [CONF_ROWID_V1] ids are identities now
+  const _concludedAt = Date.now();   // [BUBBLE_TS_V1]
   c.log.push({ turnId, engine: c.leadEngine, role: 'conclusion', stage: c.stage, subphase: c.subphase,
-               round: c.round, text, verdict: null, verdictStage: null, ts: Date.now() });
+               round: c.round, text, verdict: null, verdictStage: null, ts: _concludedAt, rowCreatedAt: _concludedAt });
   confSave(S);
   S.send({ type: 'conf_msg', turnId, engine: c.leadEngine, role: 'conclusion', stage: c.stage,
            stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase, round: c.round, text,
-           verdict: null, remainingIssues: [] });
+           verdict: null, remainingIssues: [], ts: _concludedAt });   // [BUBBLE_TS_V1]
 }
 
 function confComplete(S, finalStatus) {
@@ -3871,8 +4314,9 @@ function confFinishTurn(S, engine) {
   const turnId = c.activeTurnId;
   const role = (engine === c.leadEngine) ? 'lead' : 'reviewer';
   c.log = c.log || [];
+  const _rowCreatedAt = Number.isFinite(c.activeTurnStartedAt) ? c.activeTurnStartedAt : Date.now();   // [BUBBLE_TS_V1]
   c.log.push({ turnId, engine, role, stage: c.stage, subphase: c.subphase, round: c.round,
-               text: parsed.visible, verdict: parsed.verdict.verdict, verdictStage: parsed.verdict.stage || null, ts: Date.now() });
+               text: parsed.visible, verdict: parsed.verdict.verdict, verdictStage: parsed.verdict.stage || null, ts: Date.now(), rowCreatedAt: _rowCreatedAt });
   c.lastByEngine = c.lastByEngine || {}; c.lastByEngine[engine] = parsed.visible;
   c.stageVerdicts = c.stageVerdicts || {}; c.stageVerdicts[engine] = parsed.verdict.verdict;
   c.activeTurnId = null; S._confTurnId = null; c._acc = ''; c._accParts = '';
@@ -3880,7 +4324,7 @@ function confFinishTurn(S, engine) {
   confSave(S);   // persist response + cleared active turn BEFORE advancing
   confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   S.send({ type: 'conf_msg', turnId, engine, role, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
-           subphase: c.subphase, round: c.round, text: parsed.visible, verdict: parsed.verdict.verdict, remainingIssues: parsed.verdict.remainingIssues });
+           subphase: c.subphase, round: c.round, text: parsed.visible, verdict: parsed.verdict.verdict, remainingIssues: parsed.verdict.remainingIssues, ts: _rowCreatedAt });   // [BUBBLE_TS_V1]
   // [CONFERENCE_V2] If the shim blocked a disallowed mutation during this turn, pause (fail-closed, visible).
   const denials = confReadDenials(S.key);
   if (denials.length) { const d = denials[denials.length - 1]; confPolicyPause(S, (d && d.tool) ? d.tool : null); return true; }
@@ -3902,7 +4346,7 @@ function confRecover(S) {
   try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
   confSendStatus(S);
   if (Array.isArray(c.log) && c.log.length) {
-    S.send({ type: 'conf_sync', roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confLogToMessages(c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
+    S.send({ type: 'conf_sync', userRowIdentity: 1, roomId: S.key, task: c.task || null, startReqId: c.startReqId || null, messages: confDisplayMessages(S.key, c), status: c.status, stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType),
              subphase: c.subphase, round: c.round, maxRounds: c.maxRounds, restriction: confRestrictionMode(c),
              leadEngine: c.leadEngine, reviewEngine: c.reviewEngine });
   }
@@ -3990,17 +4434,24 @@ function makeSession(key) {
     conf: null,             // [CONFERENCE_V1] live conference orchestration state (mirrored to disk)
     credentialClaudeAccount: null, credentialCodexAccount: null,
     credentialRuntimeDir: null, credentialTimer: null,
+    credRetried: false, credResend: null, credDeadToken: null,   // [CLAUDE_CRED_REVOKED_V1] one-shot reissue+replay after a 401
     pendingCredentialRefresh: false,   // [CONF_ACCT_SWITCH_V1] a live BUSY Claude worker awaits retirement so its next turn re-issues under the newly-selected account
   };
 
   S.engineState = (error = '') => { const _r = resolveRoomEngine(S); return { type: 'room_engine', roomId: S.key,
     mode: _r.mode, engine: _r.engine, rev: _r.rev,
+    engineAccounts: engineAccounts(),   // [ENGINE_GLOBAL_ONLY_V1] selector labels ride along with the authoritative engine
     processing: !!S.processing, error }; };
 
   // Broadcast to all connected sockets. Buffer when nobody is connected so a
   // reconnecting client still receives in-flight output.
   S.send = (data) => {
     S.lastActiveAt = Date.now();
+    // [BUBBLE_TS_V1] Single clock. Every outbound frame carries its EMIT instant, so any
+    // row a client creates from it uses the SAME number on every device. Frames that
+    // already carry a ts (pong, conf_turn/conf_msg) keep theirs. Stamped BEFORE buffering,
+    // so a frame flushed later to a reattached client still reports when it happened.
+    if (data && typeof data === 'object' && !Number.isFinite(data.ts)) { try { data.ts = Date.now(); } catch (e) {} }
     const json = JSON.stringify(data);
     let sent = false;
     for (const sock of S.sockets) {
@@ -4089,7 +4540,7 @@ function makeSession(key) {
     if (_roomMcpPort) {
       const roomUrl = `http://localhost:${_roomMcpPort}/mcp`;
       const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
-      try {
+      /* [ORCH_V1 no-browser] children get no browser MCP */ if (!S.orchNoBrowser) try {
         fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
         args.push('--mcp-config', mcpFile, '--strict-mcp-config');
       } catch (e) { console.log('[Bridge] room mcp-config write failed:', e.message); }
@@ -4097,7 +4548,7 @@ function makeSession(key) {
       const roomUrl = `http://localhost:${SHIM_PORT}/mcp/${encodeURIComponent(S.key)}`;
       S.shimMountKey = S.key;   // /mcp/<key> is baked into this claude process; alias target = this key
       const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
-      try {
+      /* [ORCH_V1 no-browser] children get no browser MCP */ if (!S.orchNoBrowser) try {
         fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
         args.push('--mcp-config', mcpFile, '--strict-mcp-config');
       } catch (e) { console.log('[Bridge] shim mcp-config write failed:', e.message); }
@@ -4170,7 +4621,7 @@ function makeSession(key) {
 
       for (const line of lines) {
         if (!line.trim()) continue;
-        scrapeRateLimits(line);                  // pull rate-limit headers (debug mode); cheap no-op otherwise
+        scrapeRateLimits(line, S);               // pull rate-limit headers (debug mode); cheap no-op otherwise
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }   // drop non-JSON debug noise
         if (!ev || typeof ev !== 'object' || !ev.type) continue;   // ignore stray fragments
@@ -4237,6 +4688,11 @@ function makeSession(key) {
           try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
         }
 
+        if (S.orch) {   // [ORCH_V1] accumulate claude turn text for block parsing
+          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+            for (const b of ev.message.content) { if (b && b.type === 'text' && b.text) S._orchAcc = (S._orchAcc || '') + b.text + '\n'; }
+          } else if (ev.type === 'result' && typeof ev.result === 'string' && ev.result) { S._orchAcc = ev.result; }
+        }
         if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) {   // [CONFERENCE_V1] capture this turn's text server-side
           if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
             for (const b of ev.message.content) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; }
@@ -4255,14 +4711,82 @@ function makeSession(key) {
         }
         // [CONFERENCE_HISTORY_V1] Tag conference stream chunks with the active turn id
         // so the client can reconcile the live preview bubble by stable identity.
+        // [CLAUDE_CRED_REVOKED_V1] A revoked token surfaces as a SYNTHETIC assistant
+        // message (model "<synthetic>", is_api_error_message) followed by a result with
+        // api_error_status 401 - stderr stays empty and the result carries subtype
+        // "success", so the turn otherwise looks clean. Swallow that bubble while we
+        // still hold a retry; the user gets a status line and a real answer instead.
+        // [CRED_401_HEAL_V3] Replay safety: record whether this turn produced any REAL
+        // assistant output - text OR a tool_use. Auto-replay is only safe before that
+        // point; afterwards a replay duplicates visible output or re-runs a tool.
+        if (ev.type === 'assistant' && !ev.is_api_error_message && ev.message && Array.isArray(ev.message.content)) {
+          for (const _ob of ev.message.content) {
+            if (_ob && ((_ob.type === 'text' && String(_ob.text || '').trim()) || _ob.type === 'tool_use')) { S._turnSawOutput = true; break; }
+          }
+        }
+        // [CRED_401_HEAL_V3] Swallow the synthetic auth-error bubble in conference rooms too
+        // (it used to reach the transcript and be parsed as the turn's answer).
+        // [CRED_401_HEAL_V3b] Both halves of a revoked-token turn are swallowed while the
+        // one-shot heal is still armed: the synthetic assistant bubble AND the error-shaped
+        // result that carries the same text. Once the heal is spent, nothing is hidden.
+        const _cred401Ev = CREDENTIAL_STEWARD_ENABLED && CRED_401_HEAL && !S.credRetried &&
+          ((ev.type === 'assistant' && ev.is_api_error_message && ev.error === 'authentication_failed') ||
+           (ev.type === 'result' && ev.is_error && Number(ev.api_error_status) === 401));
+        if (!_cred401Ev)
         S.send({ type: 'stream', data: ev, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null });
 
         if (ev.type === 'result') {
+          // [CLAUDE_CRED_REVOKED_V1] The owner host rotates this account's family on its
+          // own schedule; Anthropic invalidates the PREVIOUS access token the instant it
+          // does. A persistent worker reads its credential once at spawn, so it can be
+          // holding a dead token while the on-disk snapshot is already valid - and the
+          // retirement timer can't see it, being derived from the nominal expiresAt.
+          // Reissue by respawning (spawnProc re-runs issue-claude) and replay the turn.
+          // One shot only: if the snapshot itself is stale, the steward raises its own
+          // re-auth error rather than looping.
+          if (CREDENTIAL_STEWARD_ENABLED && CRED_401_HEAL && !S.credRetried && ev.is_error
+              && Number(ev.api_error_status) === 401) {
+            const _confTurnLive = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);
+            S.credRetried = true;
+            // [CLAUDE_CRED_REVOKED_V2] remember the dead token so recovery can wait
+            // for a genuinely different one rather than reissuing the same corpse.
+            try {
+              const _dc = JSON.parse(fs.readFileSync(path.join(S.credentialRuntimeDir, '.credentials.json'), 'utf8'));
+              S.credDeadToken = (_dc.claudeAiOauth || _dc).accessToken || null;
+            } catch (e) { S.credDeadToken = null; }
+            S.clearWatch();
+            if (_confTurnLive) {
+              // [CRED_401_HEAL_V3] A 401 result carries subtype "success", so before this
+              // the FSM recorded a verdict parsed from the synthetic auth-error bubble and
+              // ADVANCED A STAGE on a turn that never ran. proc._ok must stay unset.
+              S.conf._acc = ''; S.conf._accParts = '';
+              S._cred401Conf = !S._turnSawOutput;   // partial output => pause, never retry
+              console.log('[Bridge] [CRED_401_HEAL_V3] 401 on CONFERENCE room', S.key,
+                          S._cred401Conf ? '- awaiting fresh credential, then FSM retry' : '- partial output, pausing');
+              try { proc.kill('SIGKILL'); } catch (e) {}
+              continue;
+            }
+            if (S._turnSawOutput) {
+              // [CRED_401_HEAL_V3] Fail closed: real work already happened this turn.
+              console.log('[Bridge] [CRED_401_HEAL_V3] 401 on room', S.key, '- partial output, no auto-replay');
+              S.send({ type: 'error', text: 'The turn was interrupted after partial work \u2014 resend if you want it retried.' });
+              try { proc.kill('SIGKILL'); } catch (e) {}
+              continue;
+            }
+            console.log('[Bridge] [CRED_401_HEAL_V3] 401 on room', S.key, '- reissuing credential and replaying the turn');
+            S.credResend = S.inFlight.slice();
+            S.inFlight = []; S.pendingTurns = 0;
+            S.send({ type: 'status', text: 'Credentials rotating \u2014 reconnecting\u2026' });
+            try { proc.kill('SIGKILL'); } catch (e) {}
+            continue;   // the close handler performs the respawn + replay
+          }
           proc._ok = true;   // [CONF_CRED_RETRY_V1] terminal success reached — close is a clean exit
           // One turn finished. More turns follow if the user queued messages.
           const ctx = updateCtxFromResult(ev);
           if (ctx != null) { S.ctxPct = ctx.pct; S.ctxTokens = ctx.tokens; }
           S.retried = false;
+          S.credRetried = false;   // [CLAUDE_CRED_REVOKED_V1] a good turn re-arms the one-shot
+          S._turnSawOutput = false;   // [CRED_401_HEAL_V3] next turn starts with a clean replay gate
           if (S.inFlight.length) S.inFlight.shift();
           S.pendingTurns = Math.max(0, S.pendingTurns - 1);
           journalPending(S);   // record remaining queued turns, or clear when none left
@@ -4273,6 +4797,7 @@ function makeSession(key) {
             S.clearWatch();
             S.send({ type: 'done', code: 0 });
             if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { try { confFinishTurn(S, 'claude'); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] finish(claude) failed:', e.message); } }
+            if (S.orch && global.__ORCH) { const _t = S._orchAcc || ''; S._orchAcc = ''; try { global.__ORCH.onTurnEnd(S, 'claude', _t); } catch (e) { console.log('[Bridge] [ORCH_V1] claude turn end failed:', e.message); } }
             try { autoNameRoom(S); } catch (e) {}
             S.maybeAutoCompact();
             S.evictIfReady();
@@ -4298,6 +4823,20 @@ function makeSession(key) {
       const wasProcessing = S.processing;
       S.processing = false;
 
+      // [CRED_401_HEAL_V3] Conference turn killed by a revoked token. Wait on the SAME
+      // freshness primitive ordinary rooms use, then hand back to the conference FSM's own
+      // retry machinery - its attempt ceiling wraps the primitive rather than replacing it.
+      // Timeout fails closed with rotation wording, never a re-auth prompt.
+      if (S._cred401Conf) {
+        S._cred401Conf = false;
+        S.pendingTurns = 0; S.inFlight = []; clearPending(S.key);
+        const _dead = S.credDeadToken; S.credDeadToken = null;
+        credWaitForFreshToken(S, _dead,
+          () => { try { confSpawnFailed(S, { engine: 'claude', cat: 'transient' }); } catch (e) { console.log('[Bridge] [CRED_401_HEAL_V3] conf retry route failed:', e.message); } },
+          () => { try { confSpawnFailed(S, { engine: 'claude', cat: 'rotating_exhausted' }); } catch (e) { console.log('[Bridge] [CRED_401_HEAL_V3] conf fail route failed:', e.message); } });
+        return;
+      }
+
       // [CONF_CRED_RETRY_V1] Pre-success exit during a live conference turn → shared FSM
       // failure path; never strand running+activeTurnId with no proc, never advance on
       // partial output. An open attempt lease ⇒ transient (credential/startup, retry);
@@ -4311,6 +4850,24 @@ function makeSession(key) {
         // confSpawnFailed is the sole messaging site (emits its own done/status).
         try { confSpawnFailed(S, { engine: 'claude', cat: 'runtime' }); }
         catch (e) { console.log('[Bridge] [CONF_CRED_RETRY_V1] claude conf-fail route failed:', e.message); }
+        return;
+      }
+
+      // [CLAUDE_CRED_REVOKED_V2] Dead-token worker has exited. Respawning reissues from
+      // the account snapshot - but that snapshot is only refreshed when the owner rotates
+      // (or, on a consumer host, when the owner's push lands, trailing by ~30s-2min).
+      // Reissuing immediately just re-copies the same revoked token and burns the single
+      // retry, so wait for the snapshot's access token to actually CHANGE, then replay.
+      if (S.credResend && S.credResend.length) {
+        const credResend = S.credResend; S.credResend = null;
+        const deadTok = S.credDeadToken; S.credDeadToken = null;
+        S.pendingTurns = 0; S.inFlight = [];
+        credWaitForFreshToken(S, deadTok,
+          () => credResend.forEach(t => S.sendToClaude(t)),
+          () => {   // [CRED_401_HEAL_V3] fail closed - never replay onto a credential we know is dead
+            S.send({ type: 'error', text: 'Credentials are still rotating \u2014 resend shortly.' });
+            S.send({ type: 'done', code: -1 });
+          });
         return;
       }
 
@@ -4435,7 +4992,7 @@ function makeSession(key) {
     if (!env.HOME) env.HOME = os.homedir();
     // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
     // codex exec on gpt-5.6-sol). CLI proxies to this room's Playwright shim.
-    if (_mcpUrl) { env.CODEX_BROWSER_MCP_URL = _mcpUrl; env.PATH = '/usr/local/bin:' + (env.PATH || ''); }
+    if (_mcpUrl && !S.orchNoBrowser) { env.CODEX_BROWSER_MCP_URL = _mcpUrl; env.PATH = '/usr/local/bin:' + (env.PATH || ''); }   // [ORCH_V1] codex no-browser: capability withheld at spawn
     let proc, codexAccount = null;
     touchBrowserWanted();
     const _cxConfTurn = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);   // [CONF_CRED_RETRY_V1]
@@ -4493,7 +5050,8 @@ function makeSession(key) {
         }
         for (const m of parseCodexEvent(ev)) {
           if (m.kind === 'session') { if (S.conf) { try { promoteRoomKey(S, m.id); } catch (e) {} } S.threadId = m.id; persistRoom(S); confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null); S.send({ type: 'session_id', id: m.id }); try { confRegisterRoom(S); } catch (e) {} }  // [CODEX_DURABLE_V2] [CONF_ROOM_ASSOC_V1]
-          else if (m.kind === 'stream') { if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null }); }
+          else if (m.kind === 'stream') { if (S.orch && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S._orchAcc = (S._orchAcc || '') + b.text + '\n'; } }   /* [ORCH_V1] accumulate codex */
+            if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId && m.data && m.data.type === 'assistant' && m.data.message) { for (const b of (m.data.message.content || [])) { if (b && b.type === 'text' && b.text) S.conf._accParts = (S.conf._accParts || '') + b.text + '\n'; } } S.send({ type: 'stream', data: m.data, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null }); }
           else if (m.kind === 'result' && m.usage) {
             // cached_input_tokens is a subset of input_tokens in Codex usage.
             S.codexCtxTokens = Number(m.usage.input_tokens || 0);
@@ -4562,6 +5120,7 @@ function makeSession(key) {
         clearPending(S.key);                        // [CODEX_DURABLE_V4] queue drained — clear recovery state
         try { autoNameRoom(S); } catch (e) {}       /* AUTONAME_CODEX_V1 */
         if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { try { confFinishTurn(S, 'codex'); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] finish(codex) failed:', e.message); } }
+        if (S.orch && global.__ORCH) { const _t = S._orchAcc || ''; S._orchAcc = ''; try { global.__ORCH.onTurnEnd(S, 'codex', _t); } catch (e) { console.log('[Bridge] [ORCH_V1] codex turn end failed:', e.message); } }
         if (S.evictIfReady) S.evictIfReady();
       }
     });
@@ -4752,8 +5311,17 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify(S.engineState('Engine unchanged: a turn or conference is still active. Wait for it to finish, or press Stop, then select the engine again.')));
         return;
       }
-      S.engineOverride = msg.mode === 'global' ? null : msg.mode;
-      persistRoom(S);
+      // [ENGINE_GLOBAL_ONLY_V1] 'claude'/'codex' switch the ONE global engine — every room
+      // follows it. An older tab that still means "pin this room" is normalized into the
+      // same global switch (never a pin), so no client can reintroduce per-room engines.
+      // 'global' from an older tab is a no-op re-assert: there is nothing left to unpin.
+      if (msg.mode === 'claude' || msg.mode === 'codex') {
+        try { setGlobalEngine(msg.mode); }
+        catch (e) { ws.send(JSON.stringify(S.engineState('Engine unchanged: ' + e.message))); return; }
+      } else {
+        S.engineOverride = null;
+        persistRoom(S);
+      }
       S.send(S.engineState());
     } else if (msg.type === 'chat') {
       // Guard against socket drift: reconnect races can leave this socket bound to
@@ -4781,15 +5349,35 @@ wss.on('connection', (ws) => {
       if (!prompt.trim()) return;
       // Broadcast the user's text to all OTHER sockets so every device shows the prompt.
       const displayText = (msg.text || '').trim();
+      // [CONF_USERROW_IDENTITY_V1] ONE display rule, three consumers (the sender's optimistic
+      // bubble, user_msg on other devices, and the stored conference row). Derived here from
+      // the server's OWN inputs (validated attachment names) — never from a client-supplied
+      // display field, and never the engine prompt, which carries the attachment block.
+      const _dispFull = displayText + (atts.length ? ((displayText ? '\n' : '') + atts.map(a => '\uD83D\uDCCE ' + a.name).join('\n')) : '');
+      // [BUBBLE_TS_V1] Ratify the instant the originating client minted for this row.
+      const _rowTsRaw      = msg.rowTs;
+      const _rowTs         = confValidRowTs(_rowTsRaw);
+      const _rowTsReplaced = !(Number.isInteger(_rowTsRaw) && _rowTsRaw === _rowTs);
+      const _rowMid        = (typeof msg.rowMid === 'string' && /^[A-Za-z0-9:_-]{1,80}$/.test(msg.rowMid)) ? msg.rowMid : null;
       const _confFreshStart = (msg.engineMode === 'conference' && typeof msg.reqId === 'string' && !!msg.reqId);   // [CONF_TASK_ASSOC_V1]
-      if (!_confFreshStart) for (const sock of S.sockets) {
-        if (sock !== ws && sock.readyState === WebSocket.OPEN) {
-          sock.send(JSON.stringify({ type: 'user_msg', text: displayText }));
-        }
-      }
       // [CONFERENCE_V1] Conference is its own orchestration flow — handle first, before the guard.
-      if (msg.engineMode === 'conference' || confActive(S) || confLive(S)) {   // [CONF_ROUTE_PAUSED_V1]
-        confTryStart(S, prompt, msg).catch(e => console.error('[CONF_TASK_ASSOC_V1] start failed', e && e.message));   // idempotency + task-association gate
+      const _confRoute = (msg.engineMode === 'conference' || confActive(S) || confLive(S));   // [CONF_ROUTE_PAUSED_V1]
+      // An interjection defers its broadcast until confInterject has minted/returned the
+      // canonical row id, so every device renders that ONE row instead of a private copy.
+      const _confInterject = _confRoute && confLive(S) && !_confFreshStart;
+      if (!_confFreshStart && !_confInterject) _confBcastUser(S, ws, _dispFull, _rowMid, _rowTs, _rowTsReplaced);   // [BUBBLE_TS_V1]
+      if (_confRoute) {
+        const _S = S, _ws = ws, _iid = (typeof msg.interjectId === 'string') ? msg.interjectId : null;
+        confTryStart(S, prompt, msg, { displayText: _dispFull, rowTs: _rowTs })   // [BUBBLE_TS_V1]
+          .then(function (tid) {
+            if (!_confInterject) return;
+            const _mid = tid ? ('conf:' + tid) : null;
+            _confBcastUser(_S, _ws, _dispFull, _mid, _rowTs, _rowTsReplaced);   // [BUBBLE_TS_V1]
+            if (_mid && _iid) {
+              try { if (_ws.readyState === WebSocket.OPEN) _ws.send(JSON.stringify({ type: 'conf_interject_ack', roomId: _S.key, interjectId: _iid, mid: _mid, ts: _rowTs })); } catch (e) {}   // [BUBBLE_TS_V1]
+            }
+          })
+          .catch(e => console.error('[CONF_TASK_ASSOC_V1] start failed', e && e.message));   // idempotency + task-association gate
         return;
       }
       // [CODEX_DURABLE_V6] Never switch engines mid-turn — it would interleave the two
@@ -4803,10 +5391,11 @@ wss.on('connection', (ws) => {
           return;
         }
       }
-      // Per-room override rides on the chat msg: 'claude'/'codex' pins THIS room;
-      // 'global' (or absent) clears the pin so the room follows the pane engine.
-      if (msg.engineMode === 'claude' || msg.engineMode === 'codex') S.engineOverride = msg.engineMode;
-      else if (msg.engineMode === 'global') S.engineOverride = null;
+      // [ENGINE_GLOBAL_ONLY_V1] msg.engineMode is ADVISORY only — a chat message can no longer
+      // pin a room. An older tab asking for the engine the marker isn't on falls through to the
+      // capture-once guard below and gets an "engine changed — resend" frame, which is honest,
+      // instead of silently resurrecting a per-room pin.
+      S.engineOverride = null;
       persistRoom(S);   // [CODEX_DURABLE_V2]
       // [ENGINE_AUTHORITATIVE_V1] Capture-once dispatch guard. Resolve the engine ONCE,
       // synchronously (before any await/callback), and never run under an engine the user
@@ -4875,10 +5464,34 @@ wss.on('connection', (ws) => {
         console.log('[Bridge] Socket switched to room:', target);
       }
     } else if (msg.type === 'save_history') {
-      if (msg.sessionId && Array.isArray(msg.messages)) {
+      if (Array.isArray(msg.messages)) {
         try {
-          chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now() };
-          saveChatData();
+          // [CONF_ROWID_V1] Resolve to the room's CANONICAL key (never a client-claimed
+          // id) and, for a conference room, merge under the CLIENT writer: it may only
+          // create/update cli:*/legacy:* rows and can never touch a conf: row, whatever
+          // owner/rev the payload claims. Ordinary rooms keep the previous semantics.
+          const _hk = (S && S.key) ? S.key : msg.sessionId;
+          if (_hk && rowStoreIsConf(_hk)) {
+            // [CONF_HEAL_V1] H2. A row with no mid is dropped by upsertRows. Stamp a
+            // deterministic content-addressed id on legacy/snapshot payloads so the
+            // message survives; refuse (rather than half-write) an ambiguous one.
+            let _rows = msg.messages;
+            let _skip = false;
+            if (CONF_HEAL) {
+              const _c = CONF_HEAL.classifySave(msg);
+              if (_c.mode === 'reject') {
+                _skip = true;
+                console.log('[Bridge] [CONF_HEAL_V1] save refused for ' + _hk + ': ' + _c.error);
+                try { S.send({ type: 'save_rejected', error: _c.error }); } catch (e2) {}
+              } else if (_c.mode === 'legacy-snapshot') {
+                _rows = CONF_HEAL.assignLegacyMids(msg.messages);
+              }
+            }
+            if (!_skip) upsertRows(_hk, _rows, 'client');
+          } else if (msg.sessionId) {
+            chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now() };
+            saveChatData();
+          }
         } catch (e) {
           console.error('[Bridge] History save error:', e.message);
         }
@@ -4933,8 +5546,14 @@ try {
       const _key = _f.replace(/\.json$/, '');
       const _msgs = confLogToMessages(_c);
       const _have = chatData[_key];
-      if (_have && _have.conf && Array.isArray(_have.messages) && _have.messages.length >= _msgs.length) continue;
-      chatData[_key] = { messages: _msgs, updated_at: Date.now(), conf: true };
+      // [CONF_ROWID_V1] Never replace a populated store (it holds client-owned tool rows).
+      // Backfill only a genuinely empty room; otherwise merge under the conference writer.
+      if (_have && Array.isArray(_have.messages) && _have.messages.length) {
+        _have.conf = true;
+        upsertRows(_key, _msgs, 'conf');
+        continue;
+      }
+      chatData[_key] = { messages: _msgs, updated_at: Date.now(), conf: true, midVersion: 1 };
       _bn++;
     } catch (_) {}
   }
@@ -4958,3 +5577,36 @@ server.listen(BRIDGE_PORT, '0.0.0.0', () => {
   setTimeout(() => { try { confReconcileRegistrations(); } catch (e) { console.log('[Bridge] [CONF_ROOM_ASSOC_V1] reconcile sweep failed:', e.message); } }, 1700);
   setInterval(() => { try { confReconcileRegistrations(); } catch (e) {} }, 600000);
 });
+
+// ── [ORCH_V1] Master-room orchestration ───────────────────────────────────────
+// Children run in isolated git worktrees, report through a validated block, and are
+// integrated under a serialized lock. Requires a clean git workspace (hard stop).
+try {
+  const _orchRT = require('./orch-runtime');
+  const _execFileSync = require('child_process').execFileSync;
+  const _taskCall = (method, urlPath, body) => {
+    const jwt = bridgeTaskJwt();
+    if (!jwt) throw new Error('no bridge task jwt');
+    const args = ['-s', '-X', method, BRIDGE_TASK_API + urlPath, '-H', 'Authorization: Bearer ' + jwt];
+    if (body) args.push('-H', 'Content-Type: application/json', '-d', JSON.stringify(body));
+    const out = _execFileSync('curl', args, { encoding: 'utf8', timeout: 15000 });
+    try { return JSON.parse(out); } catch (e) { return {}; }
+  };
+  global.__ORCH = _orchRT.attach({
+    app, clientSessions, makeSession, restoreRoom, confStart,
+    sendToEngine: (S, text) => S.sendToClaude(text),
+    killRoom: (S, reason) => { try { S.killCurrentProc(reason); } catch (e) {} },
+    taskApi: {
+      create: (t) => _taskCall('POST', '', { title: t.title, description: t.description }),
+      setStatus: (file, status) => _taskCall('POST', '/' + file + '/status', { status }),
+      addProgress: (file, text) => _taskCall('POST', '/' + file + '/progress', { text }),
+      addQuestion: (file, question) => _taskCall('POST', '/' + file + '/questions', { question }),
+      linkRoom: (file, roomKey, label) => _taskCall('POST', '/' + file + '/rooms', { room_key: roomKey, label }),
+    },
+    log: (m) => console.log('[Bridge] ' + m),
+  });
+  setTimeout(() => { try { global.__ORCH.recoverAll(); } catch (e) { console.log('[Bridge] [ORCH_V1] recovery failed:', e.message); } }, 1800);
+  console.log('[Bridge] [ORCH_V1] orchestration attached');
+} catch (e) {
+  console.log('[Bridge] [ORCH_V1] attach failed (orchestration disabled):', e.message);
+}

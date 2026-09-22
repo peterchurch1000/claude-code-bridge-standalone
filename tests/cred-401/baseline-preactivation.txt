@@ -1,0 +1,22 @@
+# [CRED_401_HEAL_V3] Pre-activation baseline, captured 2026-09-18T01:29:33Z
+#
+# Activation is STAGE-GATED in the shipped code (bridge-server.js:170):
+#   if (c.stage !== 'verification') return 409 'conference is at stage <x>, not verification'
+# so /__conf/activate cannot be driven from the implementation stage. It is by design
+# the first act of the verification stage.
+#
+# Castle pane running this conference (bridge-peter, :3467):
+#   pid 2505738, started Thu Sep 17 21:09:06 2026
+{"ok":true,"buildId":"CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1","pid":2505738}
+#   ^ note the ABSENCE of +CRED_401_HEAL_V3 - this is the "before" value the
+#     post-activation check must no longer see.
+#
+# Other Castle panes (bridge-roy :3468, bridge-john :3470, bridge-luciano :3471) are
+# older still: they 404 on /__conf/build, i.e. they predate CONF_ACTIVATION_V1.
+# Started Aug 30, uptime 17d.
+#
+# Respawn pre-flight (so exit(0) cannot strand the pane):
+#   node bridge-server.js  <- su  <- bash start.sh (pid 1009) <- bash start.sh (pid 187)
+#   start.sh:105-111 is a 'while true' watchdog that re-execs the bridge with sleep 3.
+#   Evidence it works: this pane's node started 21:09 on Sep 17 while sibling panes
+#   have 17d uptime, i.e. start.sh has already respawned it at least once.

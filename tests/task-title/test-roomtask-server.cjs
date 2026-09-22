@@ -32,6 +32,7 @@ const env = {
   clientSessions: new Map(),
   sessionFileExists: (id) => fs.existsSync(path.join(TRANSCRIPTS, id + '.jsonl')),
   roomHistoryMessages: (key) => HIST[key] || [],
+  chatData: {},   // [ROOMTASK_HAIKU_V3] client-saved history, preferred over the transcript
   AUTONAME_SCRATCH: TMP,
   purgeAutonameScratch: () => {},
 };
@@ -202,6 +203,45 @@ console.log('\n[6] handleTaskTitle — conference path is untouched');
   eq('title', t.res.body.title, 'Fix Conference Task Popup Duplication');
   eq('source still echoes the typed text', t.res.body.source, 'Make the conference popup stop running twice');
   eq('no description on the legacy path', t.res.body.description, '');
+}
+
+/* ── 7. injected scaffolding must never be mistaken for a user comment ─────── */
+console.log('\n[7] machine-injected turns are not user comments');
+{
+  // A conference room: the TRANSCRIPT is longer and its newest "user" record is the
+  // scaffolding prompt, while chatData holds what Peter actually typed.
+  env.chatData['conf-room'] = { messages: [
+    { type: 'user', text: 'link this room to a task and generate the title' },
+    { type: 'assistant', text: 'ASSISTANT_NEVER' },
+    { type: 'user', text: 'it only works on my first comment' },
+  ] };
+  HIST['conf-room'] = [
+    { type: 'user', text: 'link this room to a task and generate the title' },
+    { type: 'assistant', text: 'ASSISTANT_NEVER' },
+    { type: 'user', text: 'it only works on my first comment' },
+    { type: 'user', text: 'You are collaborating with Codex in a shared, STAGED "conference" to solve ONE objective. Round 4 of 16.' },
+    { type: 'user', text: '<<<CONFERENCE_VERDICT {"stage":"implementation"} CONFERENCE_VERDICT>>>' },
+  ];
+  const r = api._roomSourceText('conf-room');
+  eq('anchors on what the user typed', r.latestInstruction, 'it only works on my first comment');
+  ok('scaffolding is not the anchor', r.latestInstruction.indexOf('collaborating with Codex') === -1);
+  ok('scaffolding is not in the prompt', r.source.indexOf('STAGED') === -1);
+  ok('verdict blocks are not in the prompt', r.source.indexOf('CONFERENCE_VERDICT') === -1);
+}
+{
+  // No client-saved history (older room): the transcript is still used, minus the noise.
+  HIST['transcript-only'] = [
+    { type: 'user', text: 'the real request from the transcript' },
+    { type: 'user', text: 'You are running ONE turn of the autonomy loop' },
+  ];
+  const r = api._roomSourceText('transcript-only');
+  eq('falls back to the transcript', r.latestInstruction, 'the real request from the transcript');
+}
+{
+  // chatData present but containing only scaffolding -> fall through to the transcript
+  env.chatData['noise-only'] = { messages: [{ type: 'user', text: 'You are running ONE turn of the autonomy loop' }] };
+  HIST['noise-only'] = [{ type: 'user', text: 'genuine transcript request' }];
+  eq('all-noise chatData falls through', api._roomSourceText('noise-only').latestInstruction, 'genuine transcript request');
 }
 
 console.log('\n' + (fail ? '  FAILED ' + fail + ' / ' + (pass + fail) : '  ALL ' + pass + ' PASSED'));

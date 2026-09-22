@@ -1,0 +1,11 @@
+# Retained evidence: the genuine 401 event shape, from PRODUCTION
+#
+# The detector keys ONLY on the structured field api_error_status===401 on an
+# is_error result (stderr is empty; the result carries subtype "success").
+# These live hits therefore prove the real CLI emits that shape - no test
+# credential was provisioned and no shared Procyss snapshot was touched.
+# Captured 2026-09-18T01:27:30Z from logs/*/bridge.log on adlux-nls.
+
+[Bridge] [CLAUDE_CRED_REVOKED_V1] 401 on room 54acaefc-0f2a-46f2-9bad-289c85c7d16f - reissuing credential and replaying the turn
+[Bridge] [CLAUDE_CRED_REVOKED_V1] 401 on room 596c9f07-b6db-46e3-b9df-42afb0168e5e - reissuing credential and replaying the turn
+[Bridge] [CLAUDE_CRED_REVOKED_V1] 401 on room f76a0938-b2c2-4eab-953d-12e58223fb5d - reissuing credential and replaying the turn

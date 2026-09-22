@@ -19,7 +19,7 @@ cp "$WORK/bridge-server.js" "$WORK/s.js"; node --check "$WORK/s.js" && echo "  O
 cp "$WORK/public/app.js"    "$WORK/c.js"; node --check "$WORK/c.js" && echo "  OK app.js"
 
 rc=0
-for t in test-server test-client test-mixed-version test-roomtask-server test-roomtask-form; do
+for t in test-server test-client test-mixed-version test-roomtask-server test-roomtask-form test-task-defaults; do
   [ -f "$HERE/$t.cjs" ] || continue
   sed "s#/tmp/ttlive#$WORK#g" "$HERE/$t.cjs" > "$WORK/$t.cjs"
   echo; echo "=== $t ==="
