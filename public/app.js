@@ -704,6 +704,16 @@
       localStorage.removeItem(LAYOUT_KEY(oldId));
     } catch {}
   }
+  // [ROOM_LAYOUT_INHERIT_V1] A newly spawned room copies the CURRENT room's colour + pane
+  // layout so it opens looking identical to the room it was spawned from; thereafter each room
+  // is fully independent (all writes are per-room). A source room with no saved record is at
+  // defaults, and the new (also recordless) room renders those same defaults, so there is
+  // nothing to copy in that case. Writing re-stamps ts so the fresh room isn't pruned early.
+  function seedAppearanceFrom(srcId, newId) {
+    if (!srcId || !newId || srcId === newId) return;
+    try { const L = readLayout(srcId); if (L && Object.keys(L).length) writeLayout(L, newId); } catch (e) {}
+    try { const bg = getRoomBg(srcId); if (bg) setRoomBg(bg, newId); } catch (e) {}
+  }
   // One-time adoption of the pre-V1 GLOBAL tasks width as this room's preference, so the
   // width already in use isn't silently lost on upgrade.
   function migrateLegacyTasksWidth() {
@@ -772,14 +782,16 @@
   // login with a healthy refresh path) — never usage/quota, so an exhausted account still
   // reads as signed in. applyEngineAccounts is the ONE consumer: /accounts on load, the 30s
   // usage poll, every room_engine frame and an account switch all funnel through it.
-  let engineAccts = { claude: { email: '', available: true, reason: '' },
-                      codex:  { email: '', available: false, reason: 'not signed in' } };
+  let engineAccts = { claude: { email: '', available: true, reason: '', count: 0, selected: 0 },
+                      codex:  { email: '', available: false, reason: 'not signed in', count: 0, selected: 0 } };
   function applyEngineAccounts(sum) {
     if (!sum || typeof sum !== 'object') return;   // older server: keep the last known labels
     for (const k of ['claude', 'codex']) {
       if (sum[k] && typeof sum[k] === 'object') {
         engineAccts[k] = { name: sum[k].name || null, email: sum[k].email || '',
-                           available: !!sum[k].available, reason: sum[k].reason || '' };
+                           available: !!sum[k].available, reason: sum[k].reason || '',
+                           count: (typeof sum[k].count === 'number' ? sum[k].count : 0),
+                           selected: (typeof sum[k].selected === 'number' ? sum[k].selected : 0) };
       }
     }
     try { renderEngineOptions(); } catch (e) {}
@@ -3613,8 +3625,12 @@
   function engineOptionLabel(e) {
     const a = engineAccts[e] || {};
     const name = e === 'codex' ? 'Codex' : 'Claude';
-    if (!a.available) return name + ' (' + (a.email ? a.email + ' \u00B7 re-auth needed' : (a.reason || 'not signed in')) + ')';
-    return name + (a.email ? ' (' + a.email + ')' : '');
+    // [ENGINE_ACCT_COUNT_V1] "N of M" \u2014 accounts selected of accounts registered for this LLM.
+    const count = (typeof a.count === 'number' && a.count > 0)
+      ? ' \u00B7 ' + (a.selected || 0) + ' of ' + a.count : '';
+    if (!a.available) return name + ' (' + (a.email ? a.email + ' \u00B7 re-auth needed' : (a.reason || 'not signed in')) + count + ')';
+    if (a.email) return name + ' (' + a.email + count + ')';
+    return name + (count ? ' (' + count.replace(/^ \u00B7 /, '') + ')' : '');
   }
   function renderEngineOptions() {
     const engSel = $('st-engine');
@@ -3777,7 +3793,10 @@
   // Start a brand-new room from zero and enter it. It rides a temporary draft key
   // until the first reply assigns a real session id (see the 'session_id' handler).
   function newRoom() {
-    enterRoom(newDraftRoomId(), null);
+    const _src = currentRoomId;                 // [ROOM_LAYOUT_INHERIT_V1] capture BEFORE we switch
+    const _id  = newDraftRoomId();
+    seedAppearanceFrom(_src, _id);              // copy colour + panes so the new room matches this one
+    enterRoom(_id, null);
     setMcpDot('unknown');
     showToast('New room started', 'info');
   }
@@ -3800,6 +3819,7 @@
     PINNED_ROOM = name;
     currentRoomId = name;
     applyRoomBg(name);
+    applyLayout(name);   // [ROOM_LAYOUT_INHERIT_V1] restore panes on Room-button switch (A -> B -> A, no reload)
     roomEpoch++;
     roomServerConfirmed = false;   // [ROOMLINK_V1]
     pendingLinkRoomId = null;      // [ROOMLINK_V1]
@@ -4330,6 +4350,7 @@
     newWinBtn.style.cursor = 'pointer';
     const freshNewTabHref = () => {
       const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
+      try { seedAppearanceFrom(currentRoomId, rid); } catch (e) {}   // [ROOM_LAYOUT_INHERIT_V1] new tab inherits this room's look
       const u = new URL(location.href); u.searchParams.set('room', rid);
       newWinBtn.href = u.href;
     };

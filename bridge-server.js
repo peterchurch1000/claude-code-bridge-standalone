@@ -1983,11 +1983,14 @@ function engineAccounts() {
   const xrec = codex.accounts.find(a => a.active) || null;
   const xOk  = !!xrec && codex.enabled;
   return {
+    // [ENGINE_ACCT_COUNT_V1] count = accounts registered in that engine's family;
+    // selected = 1 when one of them is the active account (0 if none), so the UI can
+    // render "1 of N" per LLM.
     claude: { name: cname || null, email: (crec && crec.email) || base.active || '',
-              available: cOk,
+              available: cOk, count: base.accounts.length, selected: crec ? 1 : 0,
               reason: cOk ? '' : (crec ? (crec.healthReason || 'token refresh failing') : 'no registered active account') },
     codex:  { name: xrec ? xrec.name : null, email: xrec ? xrec.email : '',
-              available: xOk,
+              available: xOk, count: codex.accounts.length, selected: xrec ? 1 : 0,
               reason: xOk ? '' : (xrec ? 'switcher not installed' : 'not signed in') },
   };
 }
@@ -2942,11 +2945,23 @@ if (_memGuard.unref) _memGuard.unref();
 // (sent in the `hello` message), NOT in the WebSocket closure. This lets a live
 // Claude process survive a disconnect and reattach to a reconnecting browser, so
 // a page refresh / network blip / laptop sleep doesn't lose the in-flight answer.
-const CLAUDE_TIMEOUT_MS      = 10 * 60 * 1000; // 10 min — max silence once running
+function timerEnv(name, def) {   // [TASK474] strict, bounded timer-ms env parse
+  const raw = process.env[name];
+  if (typeof raw !== 'string' || raw === '' || raw !== raw.trim()) return def;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 && n <= 2147483647 ? n : def;
+}
+const CLAUDE_TIMEOUT_MS      = timerEnv('CLAUDE_TIMEOUT_MS', 50 * 60 * 1000); // [TASK474] silence budget, env-overridable (default 50 min)
 const CLAUDE_STARTUP_TIMEOUT = 2  * 60 * 1000; // 2 min  — must produce first output
 const RECONNECT_GRACE_MS     = 30 * 1000;      // keep the proc alive this long after disconnect
 const MAX_BUFFER             = 4000;           // cap on events buffered while detached
-const WATCH_RUN = '⏱ Claude stopped responding (10 min timeout) — session reset.';
+const WATCH_RUN = `⏱ Claude stopped responding (${Math.round(CLAUDE_TIMEOUT_MS/60000)} min timeout) — session reset.`;
+const ENGINE_LABEL = { claude: 'Claude', codex: 'Codex' };   // [TASK474] internal -> user-facing
+function watchMsg(engine) {   // [TASK474] engine-aware silence-timeout message from configured duration
+  const label = ENGINE_LABEL[engine] || 'Claude';
+  return `⏱ ${label} stopped responding (${Math.round(CLAUDE_TIMEOUT_MS/60000)} min timeout) — session reset.`;
+}
+console.log('[Bridge] [TASK474] silence watchdog budget = %d ms (%d min); startup = %d ms', CLAUDE_TIMEOUT_MS, Math.round(CLAUDE_TIMEOUT_MS/60000), CLAUDE_STARTUP_TIMEOUT);
 // A "warm" room = an empty (no sockets) room whose Claude proc is kept alive so
 // switching away from an idle room doesn't tear it down. Bounded so we never keep
 // too many live Claude procs on the memory-tight container.
@@ -3330,6 +3345,14 @@ function ensureRowIds(key) {
 //   - row never deleted, except opts.retractMids (conf: only, conference writer only)
 function upsertRows(key, incoming, writer, opts) {
   opts = opts || {};
+  // [CONF_DEDUP_V1] Collapse multi-socket adjacent twins in a client snapshot on the way
+  // in, to a fixpoint. The twins are adjacent in every client push, so this is durable
+  // against re-push. Never removes a row without an identical surviving copy.
+  if (writer === 'client' && CONF_HEAL && typeof CONF_HEAL.dedupeAdjacent === 'function' && Array.isArray(incoming)) {
+    let _in = incoming;
+    for (let _g = 0; _g < 12; _g++) { const _d = CONF_HEAL.dedupeAdjacent(_in, { window: 3 }); _in = _d.messages; if (!_d.removed) break; }
+    incoming = _in;
+  }
   let rec = chatData[key];
   if (!rec || !Array.isArray(rec.messages)) rec = chatData[key] = { messages: [], updated_at: 0 };
   ensureRowIds(key);
@@ -3370,6 +3393,16 @@ function upsertRows(key, incoming, writer, opts) {
     const before = rec.messages.length;
     rec.messages = rec.messages.filter(m => !(m && m.owner === 'conf' && kill.has(m.mid)));
     if (rec.messages.length !== before) changed = true;
+  }
+  // [CONF_DEDUP_V1] Clear client twins already in the stored array (what accumulated before
+  // this fix). Conservative: client-owned text twins only; conf: and recover: rows are never
+  // touched, and a row is only dropped when an identical copy survives, so nothing is lost.
+  if (CONF_HEAL && typeof CONF_HEAL.dedupeAdjacent === 'function') {
+    for (let _g = 0; _g < 12; _g++) {
+      const _d = CONF_HEAL.dedupeAdjacent(rec.messages, { window: 3, requireOwner: 'client' });
+      if (!_d.removed) break;
+      rec.messages = _d.messages; changed = true;
+    }
   }
   if (changed) { rec.updated_at = Date.now(); saveChatData(); }
   return rec;
@@ -4193,6 +4226,33 @@ function confPushConclusion(S, reason) {
            verdict: null, remainingIssues: [], ts: _concludedAt });   // [BUBBLE_TS_V1]
 }
 
+// [CONF_TASK_COMPLETE_V1] When a conference finishes SUCCESSFULLY, auto-complete every
+// still-open task linked to this room via task_rooms. Fail-soft: bounded timeout, every
+// outcome logged (incl. the no-JWT skip), and never awaited in the conference-completion
+// path so a task-side failure cannot alter or delay the conference result. Idempotency,
+// atomicity (status+timestamp+note) and concurrency-safety live in the Laravel endpoint.
+function confCompleteLinkedTasks(S) {
+  try {
+    const key = S && S.key;
+    if (!key || String(key).startsWith('draft-')) return;   // only canonical, shareable keys are linkable
+    const jwt = bridgeTaskJwt();
+    if (!jwt) { console.log('[Bridge] [CONF_TASK_COMPLETE_V1] no task JWT for this pane — skipping task auto-complete', key); return; }
+    const url = BRIDGE_TASK_API + '/complete-by-room';
+    fetch(url, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ room_key: key }),
+      signal: AbortSignal.timeout(5000),
+    })
+      .then(async (r) => {
+        let j = null; try { j = await r.json(); } catch {}
+        if (r.ok) console.log('[Bridge] [CONF_TASK_COMPLETE_V1] room', key, 'completed=' + JSON.stringify((j && j.completed) || []), 'already=' + JSON.stringify((j && j.already) || []));
+        else console.log('[Bridge] [CONF_TASK_COMPLETE_V1] HTTP', r.status, 'room', key);
+      })
+      .catch((e) => console.log('[Bridge] [CONF_TASK_COMPLETE_V1] error', (e && e.message) || e, 'room', key));
+  } catch (e) { try { console.log('[Bridge] [CONF_TASK_COMPLETE_V1] fatal', e && e.message); } catch {} }
+}
+
 function confComplete(S, finalStatus) {
   const c = S.conf;
   c.status = finalStatus || 'done'; c.finishedAt = Date.now(); c.activeTurnId = null;
@@ -4212,6 +4272,7 @@ function confComplete(S, finalStatus) {
   confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   confSendStatus(S);
   S.send({ type: 'done', code: 0 });
+  if (c.stage === 'final' && c.status === 'done') { try { confCompleteLinkedTasks(S); } catch (e) {} }   // [CONF_TASK_COMPLETE_V1] success-only, fail-soft
   console.log('[Bridge] [CONFERENCE_V2] conference', c.status, 'room', S.key, 'stage', c.stage);
   return true;
 }
@@ -4466,7 +4527,14 @@ function makeSession(key) {
   S.clearWatch = () => { if (S.watchdogTimer) { clearTimeout(S.watchdogTimer); S.watchdogTimer = null; } };
   S.armWatch = (ms, msg) => {
     S.clearWatch();
-    S.watchdogTimer = setTimeout(() => { S.send({ type: 'error', text: msg }); S.killCurrentProc('watchdog timeout'); }, ms);
+    S.watchdogTimer = setTimeout(() => {
+      // [TASK474] capture diagnostics BEFORE killCurrentProc clears turn state
+      const _idleMs = S._lastEvAt ? (Date.now() - S._lastEvAt) : null;
+      console.log('[Bridge] [TASK474] watchdog fired room=%s engine=%s budgetMs=%d lastEvType=%s lastTool=%s idleMs=%s pendingTurns=%s',
+        S.key, S.procEngine || '-', ms, S._lastEvType || '-', S._lastToolName || '-', _idleMs == null ? '-' : _idleMs, S.pendingTurns);
+      S.send({ type: 'error', text: msg });
+      S.killCurrentProc('watchdog timeout');
+    }, ms);
   };
 
   S.killCurrentProc = (reason) => {
@@ -4530,6 +4598,22 @@ function makeSession(key) {
     if (_confMode && _confMode !== 'write') {
       args.push('--permission-mode', 'plan', '--disallowedTools', 'Bash,Edit,Write,NotebookEdit,Task');
     }
+    // [SSH_RO_BROKER_V1] task-473: in read-only conference stages, expose the bridge-owned
+    // read-only SSH broker (stdio MCP) so Claude can read/compare data over SSH with NO
+    // mutation capability. Pre-approve its two read-only tools (plan mode requires it) and
+    // inject the server into the strict MCP config below. Gated on the broker script
+    // existing in this tenant's HOME, so tenants without it are byte-identical to before.
+    // Codex gets the same broker via ~/.codex/config.toml (mcp_servers.ssh_ro).
+    const _sshRoBrokerJs = path.join(process.env.HOME || os.homedir(), 'ssh-ro-broker', 'ssh-ro-broker.js');
+    let _sshRoServers = {};
+    if (_confMode && _confMode !== 'write') {
+      try {
+        if (fs.existsSync(_sshRoBrokerJs)) {
+          _sshRoServers = { ssh_ro: { command: 'node', args: [_sshRoBrokerJs] } };
+          args.push('--allowedTools', 'mcp__ssh_ro__ssh_read', 'mcp__ssh_ro__ssh_list_hosts');
+        }
+      } catch (e) { console.log('[Bridge] [SSH_RO_BROKER_V1] broker probe failed:', e.message); }
+    }
     S._spawnedConfMode = _confMode;
     // Point Claude at this room's browser MCP. Preferred: the room's OWN isolated
     // Playwright MCP (per-room browsers). It must already be listening — sendToClaude
@@ -4541,7 +4625,7 @@ function makeSession(key) {
       const roomUrl = `http://localhost:${_roomMcpPort}/mcp`;
       const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
       /* [ORCH_V1 no-browser] children get no browser MCP */ if (!S.orchNoBrowser) try {
-        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
+        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: Object.assign({ playwright: { type: 'http', url: roomUrl } }, _sshRoServers) }));   // [SSH_RO_BROKER_V1]
         args.push('--mcp-config', mcpFile, '--strict-mcp-config');
       } catch (e) { console.log('[Bridge] room mcp-config write failed:', e.message); }
     } else if (SHIM_PORT) {
@@ -4549,9 +4633,16 @@ function makeSession(key) {
       S.shimMountKey = S.key;   // /mcp/<key> is baked into this claude process; alias target = this key
       const mcpFile = path.join(os.tmpdir(), `mcp-room-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
       /* [ORCH_V1 no-browser] children get no browser MCP */ if (!S.orchNoBrowser) try {
-        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: { playwright: { type: 'http', url: roomUrl } } }));
+        fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers: Object.assign({ playwright: { type: 'http', url: roomUrl } }, _sshRoServers) }));   // [SSH_RO_BROKER_V1]
         args.push('--mcp-config', mcpFile, '--strict-mcp-config');
       } catch (e) { console.log('[Bridge] shim mcp-config write failed:', e.message); }
+    }
+    // [SSH_RO_BROKER_V1] No browser MCP file written (no room/shim MCP) but broker active:
+    // still give Claude a strict MCP config containing just the read-only SSH broker.
+    if (!_roomMcpPort && !SHIM_PORT && Object.keys(_sshRoServers).length) {
+      const _mf = path.join(os.tmpdir(), `mcp-sshro-${S.key.replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
+      try { fs.writeFileSync(_mf, JSON.stringify({ mcpServers: _sshRoServers })); args.push('--mcp-config', _mf, '--strict-mcp-config'); }
+      catch (e) { console.log('[Bridge] [SSH_RO_BROKER_V1] sshro-only mcp write failed:', e.message); }
     }
     if (S.sessionId) args.push('--resume', S.sessionId);
 
@@ -4610,6 +4701,7 @@ function makeSession(key) {
     S.currentProc = proc;
     S.procEngine = 'claude';
     S.lastEngine = 'claude';
+    S._lastEvAt = null; S._lastEvType = null; S._lastToolName = null;   // [TASK474] reset diagnostics per spawn
     // Startup watchdog: must produce first output within 2 min (catches MCP init hangs).
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '⏱ Claude failed to start (MCP/init timeout) — session reset.');
 
@@ -4625,6 +4717,8 @@ function makeSession(key) {
         let ev;
         try { ev = JSON.parse(line); } catch { continue; }   // drop non-JSON debug noise
         if (!ev || typeof ev !== 'object' || !ev.type) continue;   // ignore stray fragments
+        S._lastEvAt = Date.now(); S._lastEvType = ev.type;   // [TASK474] watchdog diagnostics
+        if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) { for (const _tb of ev.message.content) { if (_tb && _tb.type === 'tool_use' && _tb.name) { S._lastToolName = _tb.name; break; } } }
 
         if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
           S.sessionId = ev.session_id;
@@ -4791,7 +4885,7 @@ function makeSession(key) {
           S.pendingTurns = Math.max(0, S.pendingTurns - 1);
           journalPending(S);   // record remaining queued turns, or clear when none left
           if (S.pendingTurns > 0) {
-            S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);   // a queued turn is still coming
+            S.armWatch(CLAUDE_TIMEOUT_MS, watchMsg(S.procEngine));   // a queued turn is still coming
           } else {
             S.processing = false;
             S.clearWatch();
@@ -4803,7 +4897,7 @@ function makeSession(key) {
             S.evictIfReady();
           }
         } else {
-          S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);     // keep alive while output flows
+          S.armWatch(CLAUDE_TIMEOUT_MS, watchMsg(S.procEngine));     // keep alive while output flows
         }
       }
     });
@@ -4942,7 +5036,7 @@ function makeSession(key) {
     if (!wasProcessing) S.send({ type: 'thinking' });   // only show the spinner when starting from idle
     try { S.currentProc.stdin.write(userMsgJSON(text)); }
     catch (e) { console.error('[Bridge] stdin write failed:', e.message); }
-    if (!fresh) S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
+    if (!fresh) S.armWatch(CLAUDE_TIMEOUT_MS, watchMsg(S.procEngine));
   };
 
   // Send one user turn. If the streaming process is already live, the message is
@@ -5028,6 +5122,7 @@ function makeSession(key) {
     S.currentProc = proc;
     S.procEngine = 'codex';
     S.lastEngine = 'codex';
+    S._lastEvAt = null; S._lastEvType = null; S._lastToolName = null;   // [TASK474] reset diagnostics per spawn
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '\u23F1 Codex failed to start \u2014 session reset.');
     let accountEmail = '';
     try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
@@ -5044,6 +5139,8 @@ function makeSession(key) {
         if (!line.trim()) continue;
         let ev; try { ev = JSON.parse(line); } catch { continue; }
         if (!ev || !ev.type) continue;
+        S._lastEvAt = Date.now(); S._lastEvType = ev.type;   // [TASK474] watchdog diagnostics
+        if (ev.type === 'item.started' && ev.item && ev.item.type === 'command_execution') S._lastToolName = 'command_execution';
         if (ev.type === 'turn.failed' || ev.type === 'error') {
           sawFailure = true;   // [CONF_CRED_RETRY_V1] pre-exit failure signal
           errors.failed((ev.error && ev.error.message) || ev.message || '');
@@ -5058,7 +5155,7 @@ function makeSession(key) {
             S.send({ type: 'codex_usage', usage: m.usage, ctxTokens: S.codexCtxTokens });
           }
         }
-        S.armWatch(CLAUDE_TIMEOUT_MS, WATCH_RUN);
+        S.armWatch(CLAUDE_TIMEOUT_MS, watchMsg(S.procEngine));
       }
     });
     proc.stderr.on('data', d => {
