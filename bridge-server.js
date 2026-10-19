@@ -78,6 +78,18 @@ const fs = require('fs');
   const CREDENTIAL_STEWARD_ENABLED = process.env.CREDENTIAL_STEWARD_ENABLED !== '0';
   const CREDENTIAL_STEWARD = path.join(process.env.HOME || os.homedir(), 'credential-steward.js');
   const CREDENTIAL_STATE_DIR = path.join(process.env.HOME || os.homedir(), '.credential-steward');
+  // >>> [ROOM_MEMORY_VIEWER_V1] Shared, injective room -> Claude config-dir derivation.
+  // Single source of truth with spawnProc (sanitized key prefix + full sha256(key), so
+  // distinct keys never collide on a path component). Mirrors credential-steward
+  // issue-claude's <dir> argument. Pure/deterministic — safe to call from the endpoint.
+  function roomSafeId(key) {
+    return String(key).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80) + '-' +
+      require('crypto').createHash('sha256').update(String(key)).digest('hex');
+  }
+  function roomClaudeConfigDir(account, key) {
+    return path.join(CREDENTIAL_STATE_DIR, 'runtime', 'claude', String(account), roomSafeId(key));
+  }
+  // <<< [ROOM_MEMORY_VIEWER_V1]
   // [CLAUDE_CRED_REVOKED_V2] how long a room waits for the owner's push after a 401
   // before giving up (distributor cron is */2, serial scp adds ~30s).
   const CRED_REVOKED_WAIT_MS = Number(process.env.CRED_REVOKED_WAIT_MS || 180000);
@@ -140,11 +152,330 @@ app.get('/config.js', (req, res) => {
 
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
+// [ROOM_MONITOR_V1] Serve the room-status map written by autonomy-room-monitor.sh (cron).
+app.get('/room-monitor', (req, res) => {
+  try {
+    const p = require('path').join(require('os').homedir(), '.claude', 'autonomy', 'room-monitor-status.json');
+    res.type('application/json').send(require('fs').readFileSync(p, 'utf8'));
+  } catch (e) { res.json({ rooms: {} }); }
+});
+
+// [CONF_SPAWN_BTN_V1] Spawn a NEW conference room linked to a task; return its promoted
+// (shareable) room key so the task-detail "New associated room" button can pop it out in
+// a new tab. Reuses the exact client conf_start path via an internal WS self-connection:
+// hello(draft) -> conference chat(taskDecision:'linked') -> wait for the draft->session
+// promotion ('session_id'), which is the shareable key CONF_ROOM_ASSOC_V1 also registers
+// against the task. One Claude turn (the conference lead) starts, as with a manual start.
+// [SPAWN_TASK_DB_FALLBACK_V1] Resolve a task from the authoritative task-list API when
+// its .md is absent from disk. Synchronous (curl) to keep the spawn handlers simple.
+function resolveTaskFromDbSync(file) {
+  try {
+    const jwt = bridgeTaskJwt();
+    if (!jwt) return null;
+    const cmd = "curl -s -m 8 -H 'Authorization: Bearer " + jwt + "' '" + BRIDGE_TASK_API + "'";
+    const out = require('child_process').execSync(cmd, { encoding: 'utf8', timeout: 10000 });
+    const j = JSON.parse(out);
+    const row = (j && Array.isArray(j.tasks)) ? j.tasks.find(function (x) { return x && x.file === file; }) : null;
+    if (!row) return null;
+    return { id: String(row.id || ''), title: String(row.title || ''), objective: String(row.objective || '') };
+  } catch (e) { return null; }
+}
+app.post('/conf/spawn', (req, res) => {
+  const file = String((req.body && req.body.taskFile) || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ ok: false, error: 'bad task file' });
+  let t = null;
+  try { t = parseTaskFile(path.join(TASKS_DIR, file)); } catch (e) { t = null; }
+  if (!t) t = resolveTaskFromDbSync(file); /* SPAWN_TASK_DB_FALLBACK_V1 */
+  if (!t) return res.status(404).json({ ok: false, error: 'task not found' });
+  const task = { id: String(t.id || '').slice(0, 16), file, title: String(t.title || '').slice(0, 200) };
+  const objective = String(t.objective || '').trim();
+  const brief = ('Work the associated task in this conference room.\n\n' +
+    'Task: ' + task.title + ' (' + file + ')' + (objective ? ('\n\nObjective: ' + objective) : '')).slice(0, 4000);
+  const clientId = 'c-confspawn-' + Math.random().toString(36).slice(2, 10);
+  const draftId = 'draft-' + clientId + '-' + Math.random().toString(36).slice(2, 8);
+  const reqId = 'req-' + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 8);
+  let done = false, sent = false, sock = null;
+  const finish = (code, body) => { if (done) return; done = true; try { if (sock) sock.close(); } catch (e) {} try { res.status(code).json(body); } catch (e) {} };
+  try { sock = new WebSocket('ws://127.0.0.1:' + BRIDGE_PORT + '/ws'); }
+  catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  const sendChat = () => { if (sent) return; sent = true; try { sock.send(JSON.stringify({ type: 'chat', text: brief, engineMode: 'conference', leadEngine: 'claude', roomId: draftId, reqId: reqId, taskDecision: 'linked', task: task, rowTs: Date.now() })); } catch (e) {} };
+  sock.on('open', () => { try { sock.send(JSON.stringify({ type: 'hello', clientId: clientId, roomId: draftId })); } catch (e) {} });
+  sock.on('message', (d) => {
+    let m = null; try { m = JSON.parse(d.toString()); } catch (e) { return; }
+    if (!m) return;
+    if (m.type === 'status' && !sent) sendChat();
+    else if (m.type === 'conf_need_task') finish(409, { ok: false, error: 'task association rejected (' + (m.reason || '') + ')' });
+    else if (m.type === 'session_id' && m.id && !String(m.id).startsWith('draft-')) finish(200, { ok: true, roomKey: m.id, task: task });
+  });
+  sock.on('error', (e) => finish(502, { ok: false, error: String((e && e.message) || e) }));
+  setTimeout(() => finish(504, { ok: false, error: 'timeout waiting for room promotion' }), 90000);
+});
+
+// [NORMAL_SPAWN_BTN_V1] Spawn a NEW normal (single-engine) room linked to a task; return its
+// promoted shareable key so the task-detail New room button can pop it out in a new tab.
+app.post('/room/spawn', (req, res) => {
+  const file = String((req.body && req.body.taskFile) || '');
+  if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ ok: false, error: 'bad task file' });
+  let t = null;
+  try { t = parseTaskFile(path.join(TASKS_DIR, file)); } catch (e) { t = null; }
+  if (!t) t = resolveTaskFromDbSync(file); /* SPAWN_TASK_DB_FALLBACK_V1 */
+  if (!t) return res.status(404).json({ ok: false, error: 'task not found' });
+  const id = String(t.id || '').slice(0, 16);
+  const title = String(t.title || '').slice(0, 200);
+  const objective = String(t.objective || '').trim();
+  const seed = ('This room is associated with the task ' + title + ' (' + file + ').' +
+    (objective ? ('\n\nObjective: ' + objective) : '') +
+    '\n\nStanding by on this task.').slice(0, 4000);
+  const clientId = 'c-roomspawn-' + Math.random().toString(36).slice(2, 10);
+  const draftId = 'draft-' + clientId + '-' + Math.random().toString(36).slice(2, 8);
+  let done = false, sent = false, sock = null;
+  const finish = (code, body) => { if (done) return; done = true; try { if (sock) sock.close(); } catch (e) {} try { res.status(code).json(body); } catch (e) {} };
+  const linkAndFinish = (key) => {
+    let jwt = null; try { jwt = bridgeTaskJwt(); } catch (e) {}
+    const base = { ok: true, roomKey: key, task: { id: id, file: file, title: title } };
+    if (!jwt) return finish(200, Object.assign({ linked: false }, base));
+    const url = BRIDGE_TASK_API + '/' + encodeURIComponent(file) + '/rooms';
+    fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' }, body: JSON.stringify({ room_key: key, label: (title || 'Associated room') }) })
+      .then((r) => finish(200, Object.assign({ linked: !!(r && r.ok) }, base)))
+      .catch(() => finish(200, Object.assign({ linked: false }, base)));
+  };
+  try { sock = new WebSocket('ws://127.0.0.1:' + BRIDGE_PORT + '/ws'); }
+  catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  const eng = (function () { try { return currentEngine(); } catch (e) { return 'claude'; } })();
+  const sendChat = () => { if (sent) return; sent = true; try { sock.send(JSON.stringify({ type: 'chat', text: seed, roomId: draftId, displayedEngine: eng, rowTs: Date.now() })); } catch (e) {} };
+  sock.on('open', () => { try { sock.send(JSON.stringify({ type: 'hello', clientId: clientId, roomId: draftId })); } catch (e) {} });
+  sock.on('message', (d) => {
+    let m = null; try { m = JSON.parse(d.toString()); } catch (e) { return; }
+    if (!m) return;
+    if (m.type === 'status' && !sent) sendChat();
+    else if (m.type === 'session_id' && m.id && !String(m.id).startsWith('draft-')) linkAndFinish(m.id);
+  });
+  sock.on('error', (e) => finish(502, { ok: false, error: String((e && e.message) || e) }));
+  setTimeout(() => finish(504, { ok: false, error: 'timeout waiting for normal room promotion' }), 90000);
+});
+
+// ===================== [CROSS_ROOM_MSG_V1] visible + linked + WAKING cross-room message =====================
+// Routed through the bridge (not a raw disk append) so a bubble live-pushes to an open room
+// AND the receiver is actually woken to process it. Loopback-only (room-msg.sh / helpers).
+function _crAppendAssistant(sid, text) {
+  const tr = require('path').join(transcriptsDir(), sid + '.jsonl');
+  let parent = null;
+  try {
+    const lines = fs.readFileSync(tr, 'utf8').split('\n').filter(x => x.trim());
+    for (let i = lines.length - 1; i >= 0; i--) { try { const o = JSON.parse(lines[i]); if (o.uuid) { parent = o.uuid; break; } } catch (e) {} }
+  } catch (e) {}
+  const uuid = require('crypto').randomUUID();
+  const line = { parentUuid: parent, isSidechain: false, userType: 'external', entrypoint: 'sdk-cli',
+    cwd: '/var/www/castle-sistema', sessionId: sid, version: '2.1.161', gitBranch: 'main',
+    type: 'assistant', uuid, timestamp: new Date().toISOString(),
+    message: { role: 'assistant', model: 'cross-room', content: [{ type: 'text', text: text }] } };
+  fs.appendFileSync(tr, JSON.stringify(line) + '\n');
+  return uuid;
+}
+function _crLiveSync(sid) {
+  try {
+    const S = clientSessions.get(sid);
+    if (S && S.sockets && S.sockets.size && typeof S.send === 'function') {
+      S.send({ type: 'history_sync', roomId: S.key, sessionId: S.sessionId || sid, processing: !!S.processing, resync: true, messages: transcriptToMessages(sid), hiddenMids: roomHiddenMids(sid) });
+    }
+  } catch (e) { console.error('[Bridge] [CROSS_ROOM_MSG_V1] liveSync', e && e.message); }
+}
+function _crRoomLink(label, sid) {
+  const safe = String(label || sid).replace(/\]/g, '\\]');
+  const e = encodeURIComponent(sid);
+  return '[' + safe + '](?room=' + e + '#room=' + e + ')';
+}
+// CROSS_ROOM_MSG_V1 WAKELIMIT helpers
+function _crFmtReset(ms) {
+  if (!ms) return '';
+  try { return new Date(ms).toLocaleString('en-GB', { timeZone: 'America/Argentina/Buenos_Aires', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' (BA)'; } catch (e) { return ''; }
+}
+function _crReceiverLimit(sid, S) {
+  try {
+    const id = paneClaudeIdentity(sid, S);
+    const u = normalizeUsage(id && id.name ? readAccountUsageByName(id.name) : null);
+    if (!u) return { limited: false };
+    const now = Date.now();
+    const r5 = wakeResetMs(u.five_hour_resets_at), r7 = wakeResetMs(u.seven_day_resets_at);
+    if (u.five_hour_pct != null && u.five_hour_pct >= 100 && r5 && r5 > now) return { limited: true, which: '5h limit', resetAt: r5 };
+    if (u.seven_day_pct != null && u.seven_day_pct >= 100 && r7 && r7 > now) return { limited: true, which: 'weekly limit', resetAt: r7 };
+    return { limited: false };
+  } catch (e) { return { limited: false }; }
+}
+app.post('/room/message', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  const b = req.body || {};
+  const fromSid = String(b.fromKey || b.fromSid || '').trim();
+  const toSid = String(b.toKey || b.toSid || '').trim();
+  const message = String(b.message || '').trim();
+  const fromLabel = String(b.fromLabel || fromSid).slice(0, 200);
+  const toLabel = String(b.toLabel || toSid).slice(0, 200);
+  const wake = b.wake === false ? false : true;
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID.test(fromSid) || !UUID.test(toSid)) return res.status(400).json({ ok: false, error: 'fromKey/toKey must be session UUIDs' });
+  if (fromSid === toSid) return res.status(400).json({ ok: false, error: 'cannot message a room from itself' });
+  if (!message) return res.status(400).json({ ok: false, error: 'empty message' });
+  if (!sessionFileExists(toSid)) return res.status(404).json({ ok: false, error: 'receiving room has no transcript' });
+  let fromUuid = null, toUuid = null, woke = false, limitReason = null;
+  try {
+    if (sessionFileExists(fromSid)) {
+      fromUuid = _crAppendAssistant(fromSid, '\uD83D\uDCE4 **Sent to room ' + _crRoomLink(toLabel, toSid) + '**\n\n' + message);
+      _crLiveSync(fromSid);
+    }
+    toUuid = _crAppendAssistant(toSid, '\uD83D\uDCE5 **Message from room ' + _crRoomLink(fromLabel, fromSid) + '**\n\n' + message);
+    _crLiveSync(toSid);
+  } catch (e) { return res.status(500).json({ ok: false, error: 'append failed: ' + (e && e.message) }); }
+  if (wake) {
+    try {
+      let S = clientSessions.get(toSid);
+      if (!S) { S = makeSession(toSid); if (sessionFileExists(toSid)) S.sessionId = toSid; restoreRoom(S); clientSessions.set(toSid, S); }
+      if (!S.sessionId && sessionFileExists(toSid)) S.sessionId = toSid;
+      const send = (typeof S.sendToEngine === 'function') ? (t) => S.sendToEngine('claude', t) : (typeof S.sendToClaude === 'function' ? S.sendToClaude.bind(S) : null);
+      if (send && S.sessionId && sessionFileExists(S.sessionId)) {
+        const _lim = _crReceiverLimit(toSid, S);
+        if (_lim && _lim.limited) {
+          const _when = _crFmtReset(_lim.resetAt);
+          const _note = '\u26A0\uFE0F **Could not wake room ' + _crRoomLink(toLabel, toSid) + '** \u2014 its Claude account is usage-limited' + (_lim.which ? ' (' + _lim.which + ')' : '') + (_when ? ', resets ' + _when : '') + '. The \uD83D\uDCE5 message was delivered; open that room to run it once the window resets.';
+          if (sessionFileExists(fromSid)) { try { _crAppendAssistant(fromSid, _note); _crLiveSync(fromSid); } catch (e) {} }
+          woke = false; limitReason = (_lim.which || 'limited');
+        } else {
+          const prompt = 'You have just received a cross-room message from "' + fromLabel + '" (shown as the \uD83D\uDCE5 bubble just above in this chat):\n\n' + message + '\n\nPlease act on it now.';
+          send(prompt);
+          woke = true;
+        }
+      }
+    } catch (e) { console.error('[Bridge] [CROSS_ROOM_MSG_V1] wake', e && e.message); }
+  }
+  res.json({ ok: true, fromSid: fromSid, toSid: toSid, fromUuid: fromUuid, toUuid: toUuid, woke: woke, limitReason: limitReason });
+});
+// =================== end [CROSS_ROOM_MSG_V1] ===================
+// =================== [ROOM_RESUME_V1] silent orphan-room recovery ===================
+// Loopback-only. Re-inject ONE turn into a room whose last turn was killed mid-step
+// (e.g. auto-compaction grace-kill) and left no scheduled wake. No cross-room bubble.
+// Body: { key: <session uuid>, prompt?: string, force?: bool }
+app.post('/room/resume', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  const b = req.body || {};
+  const key = String(b.key || b.toKey || '').trim();
+  const prompt = String(b.prompt || 'Continue from where you left off.').trim();
+  const force = b.force === true;
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID.test(key)) return res.status(400).json({ ok: false, error: 'key must be a session UUID' });
+  if (!sessionFileExists(key)) return res.status(404).json({ ok: false, error: 'room has no transcript' });
+  try {
+    let S = clientSessions.get(key);
+    // Already busy? Never double-fire a live turn (unless explicitly forced).
+    if (!force && S && S.inFlight && S.inFlight.length) return res.json({ ok: true, woke: false, skipped: 'in_flight' });
+    if (!S) { S = makeSession(key); if (sessionFileExists(key)) S.sessionId = key; restoreRoom(S); clientSessions.set(key, S); }
+    if (!S.sessionId && sessionFileExists(key)) S.sessionId = key;
+    const send = (typeof S.sendToEngine === 'function') ? (t) => S.sendToEngine('claude', t) : (typeof S.sendToClaude === 'function' ? S.sendToClaude.bind(S) : null);
+    if (!send || !S.sessionId || !sessionFileExists(S.sessionId)) return res.status(500).json({ ok: false, error: 'room not resumable' });
+    const _lim = (typeof _crReceiverLimit === 'function') ? _crReceiverLimit(key, S) : null;
+    if (_lim && _lim.limited) return res.json({ ok: false, woke: false, limited: true, which: _lim.which || 'limited', resetAt: _lim.resetAt || null });
+    send(prompt);
+    console.log('[Bridge] [ROOM_RESUME_V1] resumed room ' + key);
+    return res.json({ ok: true, woke: true });
+  } catch (e) {
+    console.error('[Bridge] [ROOM_RESUME_V1]', e && e.message);
+    return res.status(500).json({ ok: false, error: e && e.message });
+  }
+});
+// =================== end [ROOM_RESUME_V1] ===================
+
+// =================== [HEALTH_INFLIGHT_V1] live-turn count (drain-before-restart) ===================
+// Loopback-only. Authoritative count of in-flight turns from in-memory session state so a
+// deferred bridge restart can wait for turns to drain instead of killing one mid-step.
+app.get('/health/inflight', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  let n = 0; const rooms = [];
+  try {
+    for (const [k, S] of clientSessions.entries()) {
+      if (S && (((S.inFlight && S.inFlight.length) ? true : false) || S.processing)) { n++; rooms.push(k); }
+    }
+  } catch (e) {}
+  return res.json({ ok: true, inflight: n, rooms });
+});
+// =================== end [HEALTH_INFLIGHT_V1] ===================
+
+// [ROOM_INJECT_V1] Loopback-only: inject TEXT as a user turn into a room and run it.
+app.post('/room/inject', (req, res) => {
+  if (!_confLoopbackOnly(req, res)) return;
+  const b = req.body || {};
+  const sid = String(b.sid || '').trim();
+  const text = String(b.text || '').trim();
+  const run = b.run === false ? false : true;
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID.test(sid)) return res.status(400).json({ ok: false, error: 'sid must be a session UUID' });
+  if (!text) return res.status(400).json({ ok: false, error: 'empty text' });
+  if (!sessionFileExists(sid)) return res.status(404).json({ ok: false, error: 'room has no transcript' });
+  try {
+    let S = clientSessions.get(sid);
+    if (!S) { S = makeSession(sid); if (sessionFileExists(sid)) S.sessionId = sid; restoreRoom(S); clientSessions.set(sid, S); }
+    if (!S.sessionId && sessionFileExists(sid)) S.sessionId = sid;
+    if (S.processing || (S.pendingTurns || 0) > 0) return res.json({ ok: true, ran: false, busy: true });
+    if (!run) return res.json({ ok: true, ran: false });
+    const send = (typeof S.sendToEngine === 'function') ? (t) => S.sendToEngine('claude', t) : (typeof S.sendToClaude === 'function' ? S.sendToClaude.bind(S) : null);
+    if (send && S.sessionId && sessionFileExists(S.sessionId)) { send(text); return res.json({ ok: true, ran: true }); }
+    return res.json({ ok: true, ran: false, error: 'no send path' });
+  } catch (e) { return res.status(500).json({ ok: false, error: (e && e.message) || 'inject failed' }); }
+});
+
+// [GSD_ANSWER_RESUME_V1] Core room injection shared by /room/inject and /room/answer-resume.
+// Returns { code, body }. Injects `text` into room `sid` and (when run) starts the turn.
+function _roomInjectCore(sid, text, run) {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID.test(sid)) return { code: 400, body: { ok: false, error: 'sid must be a session UUID' } };
+  if (!text) return { code: 400, body: { ok: false, error: 'empty text' } };
+  if (!sessionFileExists(sid)) return { code: 404, body: { ok: false, error: 'room has no transcript' } };
+  try {
+    let S = clientSessions.get(sid);
+    if (!S) { S = makeSession(sid); if (sessionFileExists(sid)) S.sessionId = sid; restoreRoom(S); clientSessions.set(sid, S); }
+    if (!S.sessionId && sessionFileExists(sid)) S.sessionId = sid;
+    if (S.processing || (S.pendingTurns || 0) > 0) return { code: 200, body: { ok: true, ran: false, busy: true } };
+    if (!run) return { code: 200, body: { ok: true, ran: false } };
+    const send = (typeof S.sendToEngine === 'function') ? (t) => S.sendToEngine('claude', t) : (typeof S.sendToClaude === 'function' ? S.sendToClaude.bind(S) : null);
+    if (send && S.sessionId && sessionFileExists(S.sessionId)) { send(text); return { code: 200, body: { ok: true, ran: true } }; }
+    return { code: 200, body: { ok: true, ran: false, error: 'no send path' } };
+  } catch (e) { return { code: 500, body: { ok: false, error: (e && e.message) || 'inject failed' } }; }
+}
+
+// [GSD_ANSWER_RESUME_V1] Flip one room's status-map entry to "working" immediately, so the dot
+// clears red + shows the spinner the instant Peter's answer is injected -- no waiting for the
+// renderer's next pass. autonomy-room-monitor.sh re-affirms it from the live turn thereafter.
+function _gsdMarkWorking(sid, detail) {
+  const fs = require('fs'), path = require('path');
+  const p = path.join(require('os').homedir(), '.claude', 'autonomy', 'room-monitor-status.json');
+  let d = {};
+  try { d = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { d = {}; }
+  if (!d || typeof d !== 'object') d = {};
+  if (!d.rooms || typeof d.rooms !== 'object') d.rooms = {};
+  const prev = d.rooms[sid] || {};
+  d.rooms[sid] = { status: 'working', task_file: prev.task_file || '', idle_min: -1, detail: detail || 'processing' };
+  try { fs.writeFileSync(p, JSON.stringify(d)); } catch (e) {}
+}
+
+// [GSD_ANSWER_RESUME_V1] Browser-reachable: Peter submitted an answer to a room's question.
+// Inject it and start the turn AT ONCE (replaces autonomy-room-qa.sh PASS C's 2-min cron),
+// and flip the dot to working now. Reachable via the authenticated per-user proxy like the
+// other /tasks mutation routes.
+app.post('/room/answer-resume', (req, res) => {
+  const b = req.body || {};
+  const sid = String(b.sid || '').trim();
+  const answer = String(b.answer || b.text || '').trim();
+  const msg = answer ? ('Peter has answered your question:\n\n' + answer + '\n\nPlease take this answer on board and continue with the task.') : '';
+  const r = _roomInjectCore(sid, msg, true);
+  if (r && r.body && r.body.ran) { try { _gsdMarkWorking(sid, 'processing your answer'); } catch (e) {} }
+  res.status(r.code).json(r.body);
+});
+
+
+
+
 // ── [CONF_ACTIVATION_V1] Activation build id + loopback probe/emitter ─────────
 // buildId is a constant baked into THIS code. A conference records the build it is
 // waiting for before it self-restarts; on respawn the boot resume only proceeds when
 // this constant matches — proving the new code is actually loaded (behaviour, not mtime).
-const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1+CRED_401_HEAL_V3+CONF_USERROW_IDENTITY_V1+BUBBLE_TS_V1';
+const CONF_BUILD_ID = 'CONF_ACTIVATION_V1+CONF_ACCT_SWITCH_V1+CONF_NEEDTASK_RECOVER_V1+CRED_401_HEAL_V3+CONF_USERROW_IDENTITY_V1+BUBBLE_TS_V1+MOBILE_RESYNC_V1+LOOPS_BY_TASK_V1';
 function _confLoopbackOnly(req, res) {
   const ip = (req.socket && req.socket.remoteAddress) || '';
   if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
@@ -269,6 +600,513 @@ app.get('/infra-health', (req, res) => {
   res.json({ status, history });
 });
 
+// >>> [ROOM_MEMORY_VIEWER_V1] Read-only viewer: this room's memory (.md) + instructions in force.
+// Resolves the room's OWN Claude config dir via roomClaudeConfigDir (same derivation spawnProc
+// uses); serves only whitelisted *.md memory files + the fixed Project/Room CLAUDE.md. Secrets
+// (.credentials.json/.claude.json/backups/sessions/*.jsonl) are never in scope. lstat regular-file
+// guard (no symlink -> secret), realpath containment, per-file 256KB + total 2MB content-byte caps.
+const RM_PER_FILE_CAP = 256 * 1024;      // per-file content-byte cap
+const RM_TOTAL_CAP    = 2 * 1024 * 1024; // total content-byte budget (reserved files charged first)
+function _rmSafeUtf8(buf) {
+  // Trim a trailing incomplete multibyte sequence so a byte-cut slice never ends in U+FFFD.
+  return buf.toString('utf8').replace(/\uFFFD+$/, '');
+}
+function _rmMakeEntry(fullPath, name, label, reserved, spentRef, expectedParentReal) {
+  let st;
+  try { st = fs.lstatSync(fullPath); } catch { return null; }
+  if (!st.isFile() || st.isSymbolicLink()) return null;   // regular files only — never follow a symlink to a secret
+  try {
+    const real = fs.realpathSync(fullPath);
+    if (expectedParentReal && path.dirname(real) !== expectedParentReal) return null;   // canonical file must sit directly under the intended dir
+  } catch { return null; }
+  let buf;
+  try { buf = fs.readFileSync(fullPath); } catch { return null; }
+  const originalBytes = buf.length;
+  const e = { name: name, originalBytes: originalBytes, truncated: false };
+  if (label) e.label = label;
+  if (!reserved && spentRef.n >= RM_TOTAL_CAP) { e.content = ''; e.truncated = true; e.omitted = true; return e; }
+  let cap = RM_PER_FILE_CAP;
+  if (!reserved) cap = Math.min(cap, RM_TOTAL_CAP - spentRef.n);
+  let out = buf;
+  if (originalBytes > cap) { out = buf.slice(0, cap); e.truncated = true; }
+  const content = _rmSafeUtf8(out);
+  e.content = content;
+  spentRef.n += Buffer.byteLength(content, 'utf8');
+  return e;
+}
+function _rmRealDir(p) {
+  // true iff p is a real directory (NOT a symlink). lstat does not follow the final component.
+  try { const st = fs.lstatSync(p); return st.isDirectory() && !st.isSymbolicLink(); } catch { return false; }
+}
+function _rmResolveMemDir(configDir, slug) {
+  // Follow ONLY the credential-steward 'projects' directory symlink. configDir, <slug> and
+  // memory must each be real (non-symlink) directories, so a symlinked memory/<slug> pointing
+  // at an arbitrary tree is rejected. Returns the trusted canonical memory realpath, or null.
+  if (!_rmRealDir(configDir)) return null;
+  const projects = path.join(configDir, 'projects');
+  let st; try { st = fs.lstatSync(projects); } catch { return null; }
+  if (st.isSymbolicLink()) {
+    // Only the credential-steward projects symlink (-> <HOME>/.claude/projects) may be followed;
+    // a symlink to any other target is rejected. Expected target derived dynamically, not hardcoded.
+    const _stewardProjects = path.join(process.env.HOME || os.homedir(), '.claude', 'projects');
+    let realProjects, realExpected;
+    try { realProjects = fs.realpathSync(projects); realExpected = fs.realpathSync(_stewardProjects); } catch { return null; }
+    if (realProjects !== realExpected) return null;
+    try { if (!fs.statSync(realProjects).isDirectory()) return null; } catch { return null; }
+  } else if (!st.isDirectory()) return null;   // a real (non-symlink) projects dir stays valid for future isolated stores
+  const slugDir = path.join(projects, slug);
+  try { st = fs.lstatSync(slugDir); } catch { return null; }
+  if (!st.isDirectory() || st.isSymbolicLink()) return null;
+  const memDir = path.join(slugDir, 'memory');
+  try { st = fs.lstatSync(memDir); } catch { return null; }
+  if (!st.isDirectory() || st.isSymbolicLink()) return null;
+  try { return fs.realpathSync(memDir); } catch { return null; }
+}
+app.get('/room-memory', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const roomId = String((req.query && req.query.roomId) || '');
+    if (!roomId || roomId.length > 512) return res.status(400).json({ error: 'Invalid roomId' });
+    // Canonical room-validity: a warm session, else the persisted room map. The raw key is
+    // NEVER used as a path component (hashed by roomSafeId), so no character whitelist is needed.
+    let S = clientSessions.get(roomId);
+    if (!S) {
+      let known = false;
+      try { known = !!_loadRoomMap()[roomId]; } catch {}
+      if (!known) return res.status(404).json({ error: 'Unknown room' });
+      try { S = makeSession(roomId); restoreRoom(S); } catch (e) { S = null; }
+      if (!S) return res.status(404).json({ error: 'Unknown room' });
+    }
+    const spentRef = { n: 0 };
+    const projPath = path.join(CLAUDE_CWD, 'CLAUDE.md');
+    let projReal = null; try { projReal = fs.realpathSync(CLAUDE_CWD); } catch {}
+    const mkProj = () => _rmMakeEntry(projPath, 'CLAUDE.md', 'Project CLAUDE.md', true, spentRef, projReal);
+    // Non-Claude (Codex) room: no Claude memory layout — empty memory + project instruction only.
+    let engine = 'claude';
+    try { engine = ((typeof resolveRoomEngine === 'function' && resolveRoomEngine(S)) || {}).engine || 'claude'; } catch {}
+    if (engine === 'codex') {
+      const instructions = []; const p = mkProj(); if (p) instructions.push(p);
+      return res.json({ memoryIndex: null, memoryFiles: [], instructions: instructions, editable: false });
+    }
+    // Claude room: authoritative account binding ONLY (never fall back to the active account).
+    let account = S.credentialClaudeAccount || S.selClaudeAccount || null;
+    if (!account) { try { account = resolveRoomAccount(S, 'claude') || null; } catch {} }
+    if (!account) { try { const rm = _loadRoomMap()[roomId]; if (rm && rm.claudeAccount) account = rm.claudeAccount; } catch {} }
+    if (!account) return res.status(409).json({ error: "Cannot determine this room's account" });
+    const configDir = _rmRuntimeDir(S, roomClaudeConfigDir(account, roomId));
+    const slug = CLAUDE_CWD.replace(/\//g, '-');
+    const cfgReal = _rmRealDir(configDir) ? configDir : null;   // configDir itself must be a real (non-symlink) dir
+    const memRootReal = cfgReal ? _rmResolveMemDir(cfgReal, slug) : null;   // validates the chain; follows ONLY the projects symlink
+    // Canonical reserved order: MEMORY.md -> Project CLAUDE.md -> Room CLAUDE.md -> topic files.
+    const memoryIndex = memRootReal ? _rmMakeEntry(path.join(memRootReal, 'MEMORY.md'), 'MEMORY.md', null, true, spentRef, memRootReal) : null;
+    const instructions = [];
+    const p = mkProj(); if (p) instructions.push(p);
+    const room = cfgReal ? _rmMakeEntry(path.join(cfgReal, 'CLAUDE.md'), 'CLAUDE.md', 'Room CLAUDE.md', true, spentRef, cfgReal) : null;
+    if (room) instructions.push(room);
+    const memoryFiles = [];
+    if (memRootReal) {
+      let names = [];
+      try { names = fs.readdirSync(memRootReal).filter(n => /\.md$/i.test(n) && n !== 'MEMORY.md').sort(); } catch {}
+      for (const n of names) {
+        const e = _rmMakeEntry(path.join(memRootReal, n), n, null, false, spentRef, memRootReal);
+        if (e) memoryFiles.push(e);
+      }
+    }
+    _rmTagEditable(instructions, memoryFiles, memoryIndex);   // [ROOM_MEMORY_EDIT_V1]
+    let _rmInstrEnabled = true; try { const _rmRec = _loadRoomMap()[roomId]; if (_rmRec && _rmRec.instructionsEnabled === false) _rmInstrEnabled = false; } catch {}
+    const _rmRoomClaudePresent = instructions.some(function (e) { return e && e.fileType === 'instruction'; });
+    return res.json({ memoryIndex: memoryIndex, memoryFiles: memoryFiles, instructions: instructions, editable: true, instructionsEnabled: _rmInstrEnabled, roomClaudePresent: _rmRoomClaudePresent });
+  } catch (e) {
+    console.error('[Bridge] [ROOM_MEMORY_VIEWER_V1] error:', e && e.message);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+// <<< [ROOM_MEMORY_VIEWER_V1]
+
+// >>> [ROOM_DOCS_V1] Per-room generated-documents folder + download. Documents Claude
+// generates for a room live in <roomConfigDir>/documents/. The titlebar folder button
+// lists them and offers a download link. Read-only to the client (list + stream only).
+// Mirrors room-memory's authoritative room->account->configDir resolution; the raw room
+// key is never a path component (hashed by roomSafeId).
+function _rdResolveDocsDir(roomId) {
+  let S = clientSessions.get(roomId);
+  if (!S) {
+    let known = false;
+    try { known = !!_loadRoomMap()[roomId]; } catch {}
+    if (!known) return { err: 404 };
+    try { S = makeSession(roomId); restoreRoom(S); } catch (e) { S = null; }
+    if (!S) return { err: 404 };
+  }
+  let engine = 'claude';
+  try { engine = ((typeof resolveRoomEngine === 'function' && resolveRoomEngine(S)) || {}).engine || 'claude'; } catch {}
+  let account = S.credentialClaudeAccount || S.selClaudeAccount || null;
+  if (!account) { try { account = resolveRoomAccount(S, engine === 'codex' ? 'codex' : 'claude') || null; } catch {} }
+  if (!account) { try { const rm = _loadRoomMap()[roomId]; if (rm && (rm.claudeAccount || rm.codexAccount)) account = rm.claudeAccount || rm.codexAccount; } catch {} }
+  if (!account) return { err: 409 };
+  const configDir = _rmRuntimeDir(S, roomClaudeConfigDir(account, roomId));
+  return { docsDir: path.join(configDir, 'documents') };
+}
+app.get('/room-documents', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const roomId = String((req.query && req.query.roomId) || '');
+    if (!roomId || roomId.length > 512) return res.status(400).json({ error: 'Invalid roomId' });
+    const r = _rdResolveDocsDir(roomId);
+    if (r.err === 404) return res.status(404).json({ error: 'Unknown room' });
+    if (r.err === 409) return res.status(409).json({ error: "Cannot determine this room's account" });
+    let dirReal = null;
+    try { dirReal = fs.realpathSync(r.docsDir); } catch { dirReal = null; }
+    const docs = [];
+    if (dirReal && _rmRealDir(dirReal)) {
+      let names = [];
+      try { names = fs.readdirSync(dirReal); } catch { names = []; }
+      for (const n of names) {
+        if (!n || n.startsWith('.')) continue;
+        const full = path.join(dirReal, n);
+        let st; try { st = fs.lstatSync(full); } catch { continue; }
+        if (!st.isFile() || st.isSymbolicLink()) continue;
+        docs.push({ name: n, size: st.size, mtime: st.mtimeMs });
+      }
+      docs.sort((a, b) => b.mtime - a.mtime);
+    }
+    return res.json({ documents: docs });
+  } catch (e) {
+    console.error('[Bridge] [ROOM_DOCS_V1] list error:', e && e.message);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+app.get('/room-documents/download', (req, res) => {
+  try {
+    const roomId = String((req.query && req.query.roomId) || '');
+    const name = String((req.query && req.query.name) || '');
+    if (!roomId || roomId.length > 512) return res.status(400).json({ error: 'Invalid roomId' });
+    if (!name || name.length > 255 || name !== path.basename(name) || name.startsWith('.') || /[\/\\]/.test(name)) {
+      return res.status(400).json({ error: 'Invalid name' });
+    }
+    const r = _rdResolveDocsDir(roomId);
+    if (r.err) return res.status(r.err).json({ error: r.err === 404 ? 'Unknown room' : "Cannot determine this room's account" });
+    let dirReal = null;
+    try { dirReal = fs.realpathSync(r.docsDir); } catch { return res.status(404).json({ error: 'No documents' }); }
+    if (!_rmRealDir(dirReal)) return res.status(404).json({ error: 'No documents' });
+    const full = path.join(dirReal, name);
+    let st; try { st = fs.lstatSync(full); } catch { return res.status(404).json({ error: 'Not found' }); }
+    if (!st.isFile() || st.isSymbolicLink()) return res.status(404).json({ error: 'Not found' });
+    let realFull; try { realFull = fs.realpathSync(full); } catch { return res.status(404).json({ error: 'Not found' }); }
+    if (path.dirname(realFull) !== dirReal) return res.status(404).json({ error: 'Not found' });
+    return res.download(realFull, name);
+  } catch (e) {
+    console.error('[Bridge] [ROOM_DOCS_V1] download error:', e && e.message);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+// <<< [ROOM_DOCS_V1]
+
+// >>> [ROOM_MEMORY_EDIT_V1] Editable room memory + [ROOM_INSTR_INJECT_V1] instruction injection.
+// Builds directly on [ROOM_MEMORY_VIEWER_V1]: same room-validity check, authoritative account
+// binding, roomClaudeConfigDir derivation, realpath containment and 256KB/2MB caps. Whitelist is a
+// SERVER-SIDE security boundary: only the room-level CLAUDE.md and topic *.md files in the room
+// memory dir are writable; project CLAUDE.md, shared MEMORY.md and everything else are rejected.
+
+// Tag each viewer entry with server-authoritative editability so the panel never decides it itself.
+function _rmTagEditable(instructions, memoryFiles, memoryIndex) {
+  try {
+    if (memoryIndex) { memoryIndex.editable = false; memoryIndex.fileType = 'locked'; }
+    (memoryFiles || []).forEach(e => { if (e) { e.editable = true; e.fileType = 'memory'; e.postName = e.name; } });
+    (instructions || []).forEach(e => {
+      if (!e) return;
+      if (e.label === 'Room CLAUDE.md') { e.editable = true; e.fileType = 'instruction'; e.postName = 'CLAUDE.md'; }
+      else { e.editable = false; e.fileType = 'locked'; }   // Project CLAUDE.md stays locked
+    });
+  } catch {}
+}
+
+// Create-capable variant of _rmResolveMemDir. Follows ONLY the credential-steward projects symlink
+// (or an already-real projects dir); every created/existing component must be a real, non-symlink
+// directory, created 0700. When create=true and the room's projects layout is absent, it fabricates
+// the SAME layout the credential-steward's issueClaude does: the canonical <HOME>/.claude/projects
+// store plus a `projects` symlink in the room runtime dir pointing at it — so the file is written where
+// the room's Claude actually reads it AND where the viewer/injection resolve it. Returns the trusted
+// memory realpath, or null.
+function _rmResolveMemDirW(configDir, slug, create) {
+  const stewardProjects = path.join(process.env.HOME || os.homedir(), '.claude', 'projects');
+  if (!_rmRealDir(configDir)) {
+    if (!create) return null;
+    try { fs.mkdirSync(configDir, { recursive: true, mode: 0o700 }); } catch { return null; }
+    if (!_rmRealDir(configDir)) return null;
+  }
+  const projects = path.join(configDir, 'projects');
+  let st; try { st = fs.lstatSync(projects); } catch { st = null; }
+  let projReal = null;
+  const _validateSymlink = () => {
+    let realProjects, realExpected;
+    try { realProjects = fs.realpathSync(projects); realExpected = fs.realpathSync(stewardProjects); } catch { return null; }
+    if (!realProjects || realProjects !== realExpected) return null;
+    try { if (!fs.statSync(realProjects).isDirectory()) return null; } catch { return null; }
+    return realProjects;
+  };
+  if (st && st.isSymbolicLink()) {
+    projReal = _validateSymlink();
+    if (!projReal) return null;
+  } else if (st && st.isDirectory()) {
+    try { projReal = fs.realpathSync(projects); } catch { return null; }
+  } else if (!st && create) {
+    // Fabricate the steward-consistent layout, idempotently.
+    try { fs.mkdirSync(stewardProjects, { recursive: true, mode: 0o700 }); } catch { return null; }
+    try { fs.symlinkSync(stewardProjects, projects, 'dir'); } catch (e) { /* raced or now exists — re-stat below */ }
+    try { st = fs.lstatSync(projects); } catch { return null; }
+    if (st.isSymbolicLink()) { projReal = _validateSymlink(); if (!projReal) return null; }
+    else if (st.isDirectory()) { try { projReal = fs.realpathSync(projects); } catch { return null; } }
+    else return null;
+  } else {
+    return null;   // absent and not creating
+  }
+  const slugDir = path.join(projReal, slug);
+  try { st = fs.lstatSync(slugDir); } catch { st = null; }
+  if (st) { if (!st.isDirectory() || st.isSymbolicLink()) return null; }
+  else if (create) { try { fs.mkdirSync(slugDir, { mode: 0o700 }); } catch { return null; } }
+  else return null;
+  const memDir = path.join(slugDir, 'memory');
+  try { st = fs.lstatSync(memDir); } catch { st = null; }
+  if (st) { if (!st.isDirectory() || st.isSymbolicLink()) return null; }
+  else if (create) { try { fs.mkdirSync(memDir, { mode: 0o700 }); } catch { return null; } }
+  else return null;
+  try { return fs.realpathSync(memDir); } catch { return null; }
+}
+
+// [ROOM_INSTR_INJECT_V1] Assemble the room's EFFECTIVE instructions: project CLAUDE.md + room
+// CLAUDE.md (mandatory, whichever exist), with a tiny POINTER to MEMORY.md prepended when the index
+// file exists. MEMORY.md CONTENT is NOT injected (nor are the topic *.md files) — the index + topic
+// files are the autonomous long-term memory store, recalled on demand, and the harness also loads
+// MEMORY.md natively; injecting the ~42KB index re-fed it into the transcript on every memory write
+// (whole-block hash) and kept compaction heavy. Returns a hash (over exactly the injected block) +
+// byte size + the wrapped block. FAILS CLOSED (returns disabled, injects nothing) on any present-
+// but-unreadable CLAUDE.md, if the mandatory CLAUDE.md(s) exceed the 96KB injected cap, or if any
+// single file exceeds the 256KB per-file cap. Disabled for Codex rooms and when the room's
+// bridge-rooms.json instructionsEnabled === false.
+const ROOM_INSTR_OPEN = '<room-instructions>';
+const ROOM_INSTR_CLOSE = '</room-instructions>';
+function assembleRoomInstructions(S) {
+  const OFF = { enabled: false, text: '', bytes: 0, hash: null };
+  try {
+    if (!S || !S.key) return OFF;
+    let rec = null; try { rec = _loadRoomMap()[S.key] || null; } catch {}
+    if (rec && rec.instructionsEnabled === false) return OFF;   // per-room opt-out
+    let engine = 'claude';
+    try { engine = ((typeof resolveRoomEngine === 'function' && resolveRoomEngine(S)) || {}).engine || 'claude'; } catch {}
+    if (engine === 'codex') return OFF;   // no Claude memory layout
+    let account = S.credentialClaudeAccount || S.selClaudeAccount || null;
+    if (!account) { try { account = resolveRoomAccount(S, 'claude') || null; } catch {} }
+    if (!account && rec && rec.claudeAccount) account = rec.claudeAccount;
+    if (!account) return OFF;   // authoritative binding only
+    const configDir = _rmRuntimeDir(S, roomClaudeConfigDir(account, S.key));
+    const slug = CLAUDE_CWD.replace(/\//g, '-');
+    const cfgReal = _rmRealDir(configDir) ? configDir : null;
+    const memRootReal = cfgReal ? _rmResolveMemDir(cfgReal, slug) : null;
+    // [ROOM_INSTR_INJECT_V1] Inject ONLY the CLAUDE.md(s) plus a tiny POINTER to MEMORY.md — NEVER
+    // the index content or the autonomous-memory topic *.md files. Those are the long-term memory
+    // store (recalled on demand); injecting the index re-fed ~42KB into the transcript on every
+    // memory write (whole-block hash) and kept compaction heavy. RM_INSTR_INJECT_CAP bounds the
+    // injected block deterministically; the hash is computed over exactly what is injected.
+    const RM_INSTR_INJECT_CAP = 96 * 1024;   // 96KB hard ceiling on the injected instruction block
+    let failClosed = false;
+    // Read one instruction file -> trimmed string, else null. ENOENT = legitimately absent = skip.
+    // A file that EXISTS but cannot be lstat'd / realpath'd / read (EACCES etc.) or exceeds the
+    // 256KB per-file cap fails the WHOLE assembly closed (never inject a silently partial set).
+    const readPart = (full, dirReal) => {
+      let st;
+      try { st = fs.lstatSync(full); }
+      catch (e) { if (e && e.code === 'ENOENT') return null; failClosed = true; console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: lstat ' + full + ' ' + e.message); return null; }
+      if (!st.isFile() || st.isSymbolicLink()) return null;
+      try { const real = fs.realpathSync(full); if (path.dirname(real) !== dirReal) return null; }
+      catch (e) { if (e && e.code === 'ENOENT') return null; failClosed = true; console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: realpath ' + full + ' ' + e.message); return null; }
+      let buf;
+      try { buf = fs.readFileSync(full); }
+      catch (e) { if (e && e.code === 'ENOENT') return null; failClosed = true; console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: read ' + full + ' ' + e.message); return null; }
+      if (buf.length > RM_PER_FILE_CAP) { failClosed = true; console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: ' + full + ' ' + buf.length + 'B > 256KB'); return null; }
+      const s = _rmSafeUtf8(buf).trim();
+      return s || null;
+    };
+    let projReal = null;
+    try { projReal = fs.realpathSync(CLAUDE_CWD); } catch (e) { if (!(e && e.code === 'ENOENT')) { console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: realpath cwd ' + e.message); return OFF; } }
+    // MEMORY.md is referenced by a tiny pointer only (its CONTENT is never injected). We just
+    // confirm the index file exists, then point the agent at it to read on demand.
+    let memPointer = null;
+    if (memRootReal) {
+      const _memFile = path.join(memRootReal, 'MEMORY.md');
+      try {
+        const _mst = fs.lstatSync(_memFile);
+        if (_mst.isFile() && !_mst.isSymbolicLink()) {
+          memPointer = '# Memory\nYour long-term memory index lives at ' + _memFile + ' (topic *.md files alongside it). Read it on demand — it is intentionally NOT injected here, to keep the transcript light.';
+        }
+      } catch (e) { if (!(e && e.code === 'ENOENT')) console.log('[Bridge] [ROOM_INSTR_INJECT_V1] memory-pointer stat ' + _memFile + ' ' + e.message); }
+    }
+    const projPart = projReal    ? readPart(path.join(CLAUDE_CWD, 'CLAUDE.md'), projReal) : null;
+    const roomPart = cfgReal     ? readPart(path.join(cfgReal, 'CLAUDE.md'), cfgReal) : null;
+    if (failClosed) return OFF;   // any present-but-unreadable instruction file fails closed
+    const _wrap = (arr) => ROOM_INSTR_OPEN + '\n' + arr.join('\n\n') + '\n' + ROOM_INSTR_CLOSE;
+    // Mandatory = whichever CLAUDE.md files EXIST (a missing room CLAUDE.md must NOT disable a valid
+    // project CLAUDE.md). The tiny MEMORY.md pointer is prepended when present (it is far under the
+    // cap); only the CLAUDE.md(s) are the size-bearing content and are bounded by the cap.
+    const mandatory = [projPart, roomPart].filter(Boolean);
+    if (mandatory.length) {
+      const mandBytes = Buffer.byteLength(_wrap(mandatory), 'utf8');
+      if (mandBytes > RM_INSTR_INJECT_CAP) { console.log('[Bridge] [ROOM_INSTR_INJECT_V1] fail-closed: mandatory CLAUDE.md ' + mandBytes + 'B > ' + RM_INSTR_INJECT_CAP + 'B cap room ' + S.key); return OFF; }
+    }
+    let chosen;
+    if (memPointer && Buffer.byteLength(_wrap([memPointer].concat(mandatory)), 'utf8') <= RM_INSTR_INJECT_CAP) {
+      chosen = [memPointer].concat(mandatory);   // tiny memory pointer first, then CLAUDE.md(s)
+    } else {
+      chosen = mandatory;                        // CLAUDE.md(s) only
+    }
+    if (!chosen.length) return OFF;
+    const body = chosen.join('\n\n');
+    if (!body) return OFF;
+    const wrapped = _wrap(chosen);
+    const bytes = Buffer.byteLength(wrapped, 'utf8');
+    const hash = require('crypto').createHash('sha256').update(wrapped).digest('hex');
+    return { enabled: true, text: wrapped, bytes: bytes, hash: hash };
+  } catch (e) { console.log('[Bridge] [ROOM_INSTR_INJECT_V1] assemble error: ' + (e && e.message)); return OFF; }
+}
+
+// [ROOM_INSTR_INJECT_V1] Normalize a queued/journaled turn to {text, meta}. Backward compatible:
+// legacy string entries (older journals, Codex string turns) become {text, meta:{}}.
+function _instrNormTurn(e) {
+  if (e && typeof e === 'object' && 'text' in e) return { text: String(e.text == null ? '' : e.text), meta: (e.meta && typeof e.meta === 'object') ? e.meta : {} };
+  return { text: String(e == null ? '' : e), meta: {} };
+}
+
+// [ROOM_MEMORY_EDIT_V1] Write a whitelisted room memory file. See boundary notes above.
+app.post('/room-memory', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    const b = req.body || {};
+    const roomId = String(b.roomId || '');
+    const fileType = String(b.fileType || '');
+    let fileName = String(b.fileName || '');
+    const content = (typeof b.content === 'string') ? b.content : null;
+    const create = b.create === true;
+    if (!roomId || roomId.length > 512) return res.status(400).json({ error: 'Invalid roomId' });
+    if (fileType !== 'instruction' && fileType !== 'memory') return res.status(400).json({ error: 'Invalid fileType' });
+    if (content == null) return res.status(400).json({ error: 'Missing content' });
+    // Room validity — mirror the GET handler exactly.
+    let S = clientSessions.get(roomId);
+    if (!S) {
+      let known = false; try { known = !!_loadRoomMap()[roomId]; } catch {}
+      if (!known) return res.status(404).json({ error: 'Unknown room' });
+      try { S = makeSession(roomId); restoreRoom(S); } catch { S = null; }
+      if (!S) return res.status(404).json({ error: 'Unknown room' });
+    }
+    // Codex rooms have no editable Claude memory layout.
+    let engine = 'claude';
+    try { engine = ((typeof resolveRoomEngine === 'function' && resolveRoomEngine(S)) || {}).engine || 'claude'; } catch {}
+    if (engine === 'codex') return res.status(403).json({ error: 'This room has no editable Claude memory' });
+    // Authoritative account binding ONLY (never the active account).
+    let account = S.credentialClaudeAccount || S.selClaudeAccount || null;
+    if (!account) { try { account = resolveRoomAccount(S, 'claude') || null; } catch {} }
+    if (!account) { try { const rm = _loadRoomMap()[roomId]; if (rm && rm.claudeAccount) account = rm.claudeAccount; } catch {} }
+    if (!account) return res.status(409).json({ error: "Cannot determine this room's account" });
+    const configDir = _rmRuntimeDir(S, roomClaudeConfigDir(account, roomId));
+    const slug = CLAUDE_CWD.replace(/\//g, '-');
+
+    // Resolve the whitelisted target + its validated (realpath'd) parent dir.
+    let parentReal = null, targetPath = null;
+    if (fileType === 'instruction') {
+      // Only the fixed room CLAUDE.md is writable via this fileType. The payload MUST name it exactly
+      // (reject omitted / traversal / project path / topic) — never trust or infer the client's intent.
+      if (String(b.fileName || '') !== 'CLAUDE.md') return res.status(400).json({ error: "instruction fileType requires fileName 'CLAUDE.md'" });
+      let cfgReal = _rmRealDir(configDir) ? configDir : null;
+      if (!cfgReal && create) { try { fs.mkdirSync(configDir, { recursive: true, mode: 0o700 }); } catch {} cfgReal = _rmRealDir(configDir) ? configDir : null; }
+      if (!cfgReal) return res.status(409).json({ error: 'Room config dir unavailable' });
+      try { parentReal = fs.realpathSync(cfgReal); } catch { return res.status(409).json({ error: 'Room config dir unavailable' }); }
+      fileName = 'CLAUDE.md';                          // fixed; client fileName ignored
+      targetPath = path.join(parentReal, 'CLAUDE.md');
+    } else {
+      // topic .md — basename only, .md, not MEMORY.md, no dotfile/traversal.
+      if (!/^[A-Za-z0-9._-]+\.md$/i.test(fileName) || path.basename(fileName) !== fileName || fileName === 'MEMORY.md' || fileName.charAt(0) === '.') {
+        return res.status(400).json({ error: 'Invalid fileName' });
+      }
+      const memRootReal = _rmResolveMemDirW(configDir, slug, create);
+      if (!memRootReal) return res.status(409).json({ error: 'Room memory store not initialised' });
+      parentReal = memRootReal;
+      targetPath = path.join(parentReal, fileName);
+    }
+
+    // Containment + existence.
+    const exists = fs.existsSync(targetPath);
+    if (exists) {
+      let st; try { st = fs.lstatSync(targetPath); } catch { st = null; }
+      if (!st || !st.isFile() || st.isSymbolicLink()) return res.status(400).json({ error: 'Target is not a regular file' });
+      try { if (path.dirname(fs.realpathSync(targetPath)) !== parentReal) return res.status(400).json({ error: 'Path containment failed' }); }
+      catch { return res.status(400).json({ error: 'Path containment failed' }); }
+    } else if (!create) {
+      return res.status(404).json({ error: 'File does not exist (pass create:true)' });
+    }
+
+    // Managed single-line audit comment at the top (mirrors the task-update timestamp pattern).
+    // Strip any prior managed comment the client echoed back so it never accumulates.
+    const auditRe = /^<!--\s*\[ROOM_MEMORY_EDIT\][^\n]*-->\n?/;
+    let bodyContent = String(content).replace(auditRe, '');
+    const audit = '<!-- [ROOM_MEMORY_EDIT] saved ' + new Date().toISOString() + ' acct=' + account + ' -->\n';
+    let finalStr = audit + bodyContent;
+    if (!finalStr.endsWith('\n')) finalStr += '\n';
+    const finalBytes = Buffer.byteLength(finalStr, 'utf8');
+    if (finalBytes > RM_PER_FILE_CAP) return res.status(413).json({ error: 'File exceeds 256KB' });
+
+    // 2MB total across ALL active injectable files (mirrors assembly: MEMORY.md + project CLAUDE.md +
+    // room CLAUDE.md + topic files), with THIS file's proposed size substituted, plus the wrapper and
+    // '\n\n' separator bytes assembly adds. Authoritative guard is assembly's own final-size check;
+    // this is the pre-write mirror. Errors are logged, never silently swallowed.
+    {
+      let total = finalBytes, files = 1, capErr = null;
+      const addSz = (fp) => { if (!fp || fp === targetPath || capErr) return; try { const st = fs.lstatSync(fp); if (st.isFile() && !st.isSymbolicLink()) { total += st.size; files++; } } catch (e) { if (e && e.code !== 'ENOENT') capErr = e; } };
+      try {
+        const cfgR = _rmRealDir(configDir) ? fs.realpathSync(configDir) : null;
+        const memR = cfgR ? _rmResolveMemDir(cfgR, slug) : null;
+        if (memR) addSz(path.join(memR, 'MEMORY.md'));
+        let projReal2 = null; try { projReal2 = fs.realpathSync(CLAUDE_CWD); } catch (e) { if (e && e.code !== 'ENOENT') capErr = e; }
+        if (projReal2) addSz(path.join(projReal2, 'CLAUDE.md'));   // project CLAUDE.md counts toward the injected budget
+        if (cfgR) addSz(path.join(cfgR, 'CLAUDE.md'));
+        if (memR && !capErr) { let names = []; try { names = fs.readdirSync(memR).filter(n => /\.md$/i.test(n) && n !== 'MEMORY.md'); } catch (e) { if (e && e.code !== 'ENOENT') capErr = e; } for (const n of names) addSz(path.join(memR, n)); }
+      } catch (e) { capErr = e; }
+      // Caps are a security boundary: any accounting failure (other than a legitimately absent file)
+      // aborts the save fail-closed rather than proceeding on an unknown total.
+      if (capErr) { console.log('[Bridge] [ROOM_MEMORY_EDIT_V1] cap accounting failed (fail-closed): ' + capErr.message); return res.status(500).json({ error: 'cap accounting failed' }); }
+      total += (ROOM_INSTR_OPEN.length + ROOM_INSTR_CLOSE.length + 2) + Math.max(0, files - 1) * 2;   // wrapper + inter-file '\n\n'
+      if (total > RM_TOTAL_CAP) return res.status(413).json({ error: 'Room memory total exceeds 2MB' });
+    }
+
+    // Single .bak of the prior version. GUARANTEED: if we cannot make the backup we abort the save
+    // (never overwrite without one). Race-safe: verify + remove any existing .bak, then create with
+    // wx (O_EXCL) so a symlink raced into the path fails the write closed instead of being followed.
+    if (exists) {
+      const bak = targetPath + '.bak';
+      let priorBuf; try { priorBuf = fs.readFileSync(targetPath); } catch (e) { return res.status(500).json({ error: 'cannot read current file for backup' }); }
+      let bst = null; try { bst = fs.lstatSync(bak); } catch {}
+      if (bst && (!bst.isFile() || bst.isSymbolicLink())) return res.status(400).json({ error: 'Unsafe .bak target' });
+      if (bst) { try { fs.unlinkSync(bak); } catch (e) { return res.status(500).json({ error: 'cannot rotate .bak' }); } }
+      try { fs.writeFileSync(bak, priorBuf, { mode: 0o664, flag: 'wx' }); }
+      catch (e) { console.log('[Bridge] [ROOM_MEMORY_EDIT_V1] bak failed: ' + e.message); return res.status(500).json({ error: 'backup failed — save aborted' }); }
+    }
+    const tmp = path.join(parentReal, '.rm-' + process.pid + '-' + Date.now() + '.tmp');   // temp in the SAME validated parent
+    try {
+      fs.writeFileSync(tmp, finalStr, { mode: 0o664, flag: 'wx' });   // wx: O_EXCL defeats a pre-planted temp symlink
+      fs.renameSync(tmp, targetPath);
+      try { fs.chmodSync(targetPath, 0o664); } catch {}
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch {}
+      console.log('[Bridge] [ROOM_MEMORY_EDIT_V1] write failed: ' + e.message);
+      return res.status(500).json({ error: 'write failed' });
+    }
+    console.log('[Bridge] [ROOM_MEMORY_EDIT_V1] saved ' + fileType + ' ' + fileName + ' (' + finalBytes + 'B) room ' + roomId + (exists ? '' : ' [created]'));
+    return res.json({ ok: true, name: fileName, bytes: finalBytes, created: !exists });
+  } catch (e) {
+    console.error('[Bridge] [ROOM_MEMORY_EDIT_V1] error:', e && e.message);
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+// <<< [ROOM_MEMORY_EDIT_V1]
+
+
 // ── Task panel: list/create/update/delete tasks in ~/workspace/tasks/ ─────────
 // Each task is a markdown file with YAML-ish frontmatter. Tasks are per-user
 // because each bridge process runs with a different HOME (bridge-peter/roy/john).
@@ -312,7 +1150,7 @@ function parseTaskFile(full) {
     session: (fm.session && fm.session.toLowerCase() !== 'unknown') ? fm.session : '',
     area: fm.area || '', type: fm.type || '', person: fm.person || '',
     duration: fm.duration || '', priority: fm.priority || '', project: fm.project || '',
-    scheduled: fm.scheduled || '', order: fm.order || '', queued: fm.queued || '', queued_autonomous: fm.queued_autonomous || '', requires_desktop: fm.requires_desktop || '', completed_at: fm.completed_at || '',
+    scheduled: fm.scheduled || '', order: fm.order || '', queued: fm.queued || '', queued_autonomous: fm.queued_autonomous || '', gsd_loop: fm.gsd_loop || '', requires_desktop: fm.requires_desktop || '', completed_at: fm.completed_at || '',
     notes, plan,
     description, objective, location: full,
   };
@@ -539,7 +1377,7 @@ app.post('/tasks/:file/session', (req, res) => {
   res.json({ ok: true, file, session: sessionId });
 });
 
-const UPDATABLE_FIELDS = ['area', 'type', 'person', 'duration', 'priority', 'project', 'scheduled', 'order', 'queued', 'queued_autonomous', 'requires_desktop'];
+const UPDATABLE_FIELDS = ['area', 'type', 'person', 'duration', 'priority', 'project', 'scheduled', 'order', 'queued', 'queued_autonomous', 'requires_desktop', 'gsd_loop'];
 app.post('/tasks/:file/update', (req, res) => {
   const file = String(req.params.file || '');
   if (!/^task-[a-z0-9-]+\.md$/.test(file)) return res.status(400).json({ error: 'bad file name' });
@@ -799,6 +1637,32 @@ try {
   CONF_TX = require('./tx-read.js');
 } catch (e) { console.log('[Bridge] [CONF_HEAL_V1] disabled — ' + (e && e.message)); }
 
+// [ROOMVIEW_STALL_V1] Transcript-reconcile module: insert-only projection+merge that
+// restores a room pane's dropped mid-turn tail from the append-only transcript.
+let ROOM_RECOVER = null;
+try { ROOM_RECOVER = require('./room-recover.js'); }
+catch (e) { console.log('[Bridge] [ROOMVIEW_STALL_V1] room-recover disabled — ' + (e && e.message)); }
+
+// [ROOMVIEW_STALL_V1] Insert-only merge of a stored UI copy with the authoritative
+// transcript projection. historyKey (which chatData entry to persist) and transcriptId
+// (which .jsonl to project) are DISTINCT so the two are never conflated. Persists the
+// grown copy so later reads stay consistent. Returns baseMsgs unchanged on any failure.
+// Projection is incrementally cached (ino + byte-offset) so a big .jsonl is not re-parsed.
+async function roomRecoverMerge(historyKey, transcriptId, baseMsgs) {
+  if (!ROOM_RECOVER || !transcriptId) return baseMsgs;
+  try {
+    const proj = await ROOM_RECOVER.getProjection(path.join(transcriptsDir(), transcriptId + '.jsonl'));
+    const merged = ROOM_RECOVER.mergeInsertOnly(baseMsgs, proj.rows);
+    let _changed = merged.length !== baseMsgs.length;   // insertions grew the row count…
+    if (!_changed) { for (let _k = 0; _k < merged.length; _k++) { if (merged[_k] !== baseMsgs[_k]) { _changed = true; break; } } }   // …or an equal-length in-place enrichment (a tool result filled by _pickCommon swaps the row ref)
+    if (_changed) {
+      const rec = chatData[historyKey];
+      if (rec && Array.isArray(rec.messages)) { rec.messages = merged; rec.updated_at = Date.now(); saveChatData(); }
+    }
+    return merged;
+  } catch (e) { console.log('[Bridge] [ROOMVIEW_STALL_V1] merge failed for ' + transcriptId + ': ' + (e && e.message)); return baseMsgs; }
+}
+
 function transcriptToMessages(id) {
   const file = path.join(transcriptsDir(), `${id}.jsonl`);
   const msgs = [];
@@ -810,10 +1674,10 @@ function transcriptToMessages(id) {
     if (ev.isCompactSummary === true) continue; // drop the continuation summary
     if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
       const t = stripPlumbing(extractText(ev.message.content));
-      if (t) msgs.push({ type: 'user', text: t });
+      if (t) { const _ets = Date.parse(ev.timestamp); msgs.push(Number.isFinite(_ets) ? { type: 'user', text: t, ts: _ets } : { type: 'user', text: t }); }   /* BUBBLE_TS_PERSIST_V1 */
     } else if (ev.type === 'assistant' && ev.message && ev.message.content) {
       const t = extractText(ev.message.content);
-      if (t.trim() && !t.includes('🗜')) msgs.push({ type: 'assistant', text: t });
+      if (t.trim() && !t.includes('🗜')) { const _ets = Date.parse(ev.timestamp); msgs.push(Number.isFinite(_ets) ? { type: 'assistant', text: t, ts: _ets } : { type: 'assistant', text: t }); }   /* BUBBLE_TS_PERSIST_V1 */
     }
   }
   return msgs;
@@ -929,8 +1793,11 @@ function confHealReconcile(key) {
   } catch (e) { console.log('[Bridge] [CONF_HEAL_V1] reconcile failed for ' + key + ': ' + (e && e.message)); }
 }
 
-app.get('/history/:sessionId', (req, res) => {
+app.get('/history/:sessionId', async (req, res) => {
   const id = req.params.sessionId;
+  const _hbList = roomHiddenMids(id);   // [HIDE_BUBBLE_V1] attach per-room hidden set to every messages response
+  const _hbJson = res.json.bind(res);
+  res.json = (o) => _hbJson((o && typeof o === 'object' && 'messages' in o) ? Object.assign({ hiddenMids: _hbList }, o) : o);
   // [CONFERENCE_HISTORY_V1] A conference room is served from its authoritative,
   // ordered conference log — NOT from the divergent raw-stream chatData/transcript
   // (which caused the "jumbled / out of order" rendering). Sits inside the existing
@@ -961,6 +1828,14 @@ app.get('/history/:sessionId', (req, res) => {
   if (data && Array.isArray(data.messages) && data.messages.length) {
     let healed = healEmptyAssistantText(id, data.messages);
     healed = healEmptyUserText(id, healed);
+    // [ROOMVIEW_STALL_V1] Insert-only merge of the stored UI copy with the authoritative
+    // transcript projection: restores a dropped mid-turn tail (trailing tool calls +
+    // closing summary) AND preserves tool cards. The old count compare below could not —
+    // transcriptToMessages is text-only, so a tool-card-inflated client copy always won.
+    if (ROOM_RECOVER) {
+      try { const merged = await roomRecoverMerge(id, id, healed); return res.json({ messages: merged }); }
+      catch (e) { /* fall through to legacy behaviour */ }
+    }
     // The append-only transcript is the complete, unaltered record. If the stored
     // UI copy is shorter, it was truncated (e.g. a post-compaction client POSTed a
     // shrunken view) — serve the full transcript so no history ever disappears.
@@ -1020,7 +1895,7 @@ app.post('/history/:sessionId', (req, res) => {
       }
       if (!_isPrefix) return res.status(409).json({ ok: false, error: 'conf-canonical-conflict', note: 'conference record is append-only' });
     }
-    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now(), conf: (existing && existing.conf) ? true : undefined };   // [CONF_CONTAINED_V1] preserve self-contained marker
+    chatData[req.params.sessionId] = { messages: msgs, updated_at: Date.now(), conf: (existing && existing.conf) ? true : undefined, hiddenMids: (existing && Array.isArray(existing.hiddenMids)) ? existing.hiddenMids : [] };   // [CONF_CONTAINED_V1] preserve self-contained marker
     saveChatData();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1113,22 +1988,62 @@ function purgeAutonameScratch() {
 
 // [TASK_TITLE_HAIKU_V2] Deterministic 5-7 word label, used when the model call
 // fails. Falling back to the raw sentence would be defect #1 all over again.
-const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new').split(' '));
+const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new one two three something somehow whether add adds added adding investigate investigating look looking also maybe perhaps actually basically anything everything someone somebody trying try consider figure id ive im ill dont cant wont didnt doesnt isnt arent wasnt werent youre theyre weve hes shes thats whats heres').split(' '));
 function heuristicTaskTitle(text) {
-  const raw = String(text || '').replace(/https?:\/\/\S+/g, ' ').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+  const raw = String(text || '').replace(/https?:\/\/\S+/g, ' ').replace(/['\u2019]/g, '').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(w => w.length > 1);
   if (!raw.length) return '';
-  const content = raw.filter(w => !_TT_STOP.has(w.toLowerCase()));
-  // Never pad with filler: a short honest label beats "Fix Login Bug The".
-  const picked = (content.length ? content : raw).slice(0, 7);
+  // [TT_READABLE_FALLBACK_V1] Drop ONLY leading filler so the label starts on a
+  // content word, but keep interior words IN ORDER so the result reads as natural
+  // English ("Modify The Conference Room Status Panel"), not a scrambled bag of
+  // keywords ("Also Conference Rooms Show Status Panel One") -- the gibberish defect.
+  let words = raw.slice();
+  while (words.length > 1 && _TT_STOP.has(words[0].toLowerCase())) words.shift();
+  const picked = words.slice(0, 6);
   return picked.map(w => { w = w.toLowerCase(); return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ').slice(0, 80);
 }
-// True only for something that reads like a 5-7 word label, not a sentence/refusal.
+// [TT_CANON_V1] One canonical title pipeline shared by BOTH request modes (the
+// conf-modal single-field path and the room-linkage describe two-field path).
+// Haiku's real output varies — labeled/unlabeled, Markdown-wrapped, preamble-
+// prefixed, 3-9 words — so we EXTRACT a candidate (label-first, anywhere in the
+// output), CLEAN wrappers, TRUNCATE to eight words, then VALIDATE a 2-8 word
+// label. This replaces the old "whole stdout is the title" + rigid 5-7 filter
+// that silently dropped good titles into the heuristic fallback (the defect).
+function _ttExtractTitle(raw) {
+  const lines = String(raw || '').replace(/\r/g, '').split('\n');
+  // 1. Label-first: a `TITLE:` label ANYWHERE wins over line position. Tolerates
+  //    case, heading/list/blockquote prefixes and **/__ wrappers on the label.
+  const labelRe = /^[ \t]*[#>*\-]*[ \t]*(?:\*\*|__)?[ \t]*title[ \t]*(?:\*\*|__)?[ \t]*:[ \t]*(.+?)[ \t]*$/i;
+  for (const ln of lines) { const m = ln.match(labelRe); if (m && m[1].trim()) return m[1]; }
+  // 2. Inline preamble: "Here is the title: X" / "Here's a suggested title: X".
+  const preRe = /^[ \t]*here(?:'s| is| are)?(?:[ \t]+a|[ \t]+the)?[ \t]+(?:suggested |proposed )?title[^:]*:[ \t]*(.+)$/i;
+  for (const ln of lines) { const m = ln.match(preRe); if (m && m[1].trim()) return m[1]; }
+  // 3. Unlabeled fallback: first non-empty line that is not a SUMMARY/metadata/
+  //    preamble line. A bare preamble ("Here is a title for your task") is skipped
+  //    here and, if it were the only content, rejected by the validator downstream.
+  const skipRe = /^[ \t]*(?:\*\*|__|#+|>|-|\*)?[ \t]*(summary|description|notes?|here|sure|okay|ok|of course|certainly)\b/i;
+  for (const ln of lines) { if (!ln.trim()) continue; if (skipRe.test(ln)) continue; return ln; }
+  return '';
+}
+// Strip wrappers/markers and cap at eight words. NEVER pads. Leaves benign inner
+// punctuation (colon, hyphen, ampersand) intact; removes one trailing period.
+function _ttCleanTitle(s) {
+  let t = String(s || '').replace(/\s+/g, ' ').trim();
+  t = t.replace(/^[#>\-*\s]+/, '');                 // leading heading/list/blockquote markers
+  t = t.replace(/^[`"'*_\s]+|[`"'*_\s]+$/g, '');     // surrounding quotes / ** / __ / backticks
+  t = t.replace(/[ \t]*\.+$/, '').trim();            // one trailing sentence period
+  const words = t.split(' ').filter(Boolean);
+  return (words.length > 8 ? words.slice(0, 8).join(' ') : t).trim();
+}
+// [TT_CANON_V1] A 2-8 word label, not a sentence or refusal. Benign inner
+// punctuation (: - & , / ') is allowed; only sentence punctuation (a terminal
+// or mid-string . ? !) and refusal/meta prose are rejected.
 function looksLikeTaskTitle(str) {
   if (!str) return false;
   const words = String(str).split(' ').filter(Boolean);
-  if (words.length < 5 || words.length > 7) return false;
-  if (/[.?!:;]/.test(str)) return false;
-  if (/\b(instruction|provide|incomplete|sorry|cannot|unable|please|summar|the user|it seems|appears)\b/i.test(str)) return false;
+  if (words.length < 2 || words.length > 8) return false;
+  if (/[?!]/.test(str)) return false;                // question/exclamation => prose
+  if (/\.(\s|$)/.test(str)) return false;            // terminal / sentence period => prose (keeps "v2.0")
+  if (/\b(instruction|incomplete|sorry|cannot|unable|please|the user|it seems|appears|here (is|are)|title for)\b/i.test(str)) return false;
   return true;
 }
 function _firstUserLineText(line) {
@@ -1269,18 +2184,26 @@ function _looksLikeSummary(str) {
   if (/^(sorry|i\s+cannot|i\s+can't|i'm\s+unable|unable\s+to|as\s+an\s+ai)\b/i.test(t)) return false;
   return true;
 }
+// [TASK_TITLE_AUTHRETRY_V1] A spawned `claude -p` can 401 while the account token is
+// mid-rotation; its output then carries the auth error instead of a label, which the
+// heuristic would turn into keyword-salad. Detect it so the caller can retry once and,
+// if it still fails, skip (blank) rather than emit a garbage title.
+function _ttIsAuthFailure(s) {
+  const t = String(s || '');
+  return /OAuth access token (?:has )?expired|Failed to authenticate|authentication_error|invalid[_ ]?api[_ ]?key|\b40[13]\b[^\n]*OAuth|Please run\s+\/login/i.test(t);
+}
 // Parse the two-field describe reply. TITLE is one line; SUMMARY runs to the end of
 // the output (multiline tolerated) and is then normalised to a single line, so a
 // model that wraps its 1-3 sentences is not treated as a failure.
 function _parseTitleSummary(out) {
   const raw = String(out || '').replace(/\r/g, '');
-  const tm = raw.match(/^[ \t]*TITLE:[ \t]*(.*)$/m);
-  let title = (tm ? tm[1] : '').replace(/\s+/g, ' ').trim()
-    .replace(/^["'\s]+|["'\s]+$/g, '').replace(/[.]+$/, '');
-  let summary = '';
-  const si = raw.search(/^[ \t]*SUMMARY:/m);
-  if (si !== -1) summary = raw.slice(si).replace(/^[ \t]*SUMMARY:[ \t]*/, '');
-  summary = summary.replace(/\s+/g, ' ').trim().replace(/^["']+|["']+$/g, '');
+  let title = _ttCleanTitle(_ttExtractTitle(raw));   // [TT_CANON_V1] shared canonical pipeline
+  // [TT_CANON_V1] Capture the summary BODY with a tolerant label regex so Markdown
+  // wrappers (**SUMMARY:** / __SUMMARY:__), headings and case variants never leak
+  // into the description prose.
+  const sm = raw.match(/^[ \t]*[#>*\-]*[ \t]*(?:\*\*|__)?[ \t]*summary[ \t]*(?:\*\*|__)?[ \t]*:[ \t]*([\s\S]*)$/im);
+  let summary = sm ? sm[1] : '';
+  summary = summary.replace(/\s+/g, ' ').trim().replace(/^[`"'*_\s]+|[`"'*_\s]+$/g, '');
   if (summary.length > TT_SUMMARY_CHARS) {
     const cut = summary.slice(0, TT_SUMMARY_CHARS);
     const stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
@@ -1290,7 +2213,7 @@ function _parseTitleSummary(out) {
   if (!_looksLikeSummary(summary)) summary = '';
   return { title: title, summary: summary };
 }
-const TASK_TITLE_MAX_INFLIGHT = 2;
+const TASK_TITLE_MAX_INFLIGHT = 3;   // [TASK_TITLE_HAIKU_V3] was 2; fewer inflight-cap fallbacks
 let _taskTitleInFlight = 0;
 // deps is injectable so the test harness can drive the lifecycle without a real child.
 function handleTaskTitle(req, res, deps) {
@@ -1330,10 +2253,10 @@ function handleTaskTitle(req, res, deps) {
   const fallbackDescription = _ttClip(latestInstruction, TT_SUMMARY_CHARS);                         // [ROOMTASK_HAIKU_V3]
   const fallback = fallbackTitle;   // legacy field name; always a title, never a sentence
   if (!source) { res.json({ ok: true, title: '', description: '', source: '', fallback: '', fallbackTitle: '', fallbackDescription: '', hasContent: false }); return; }
-  if (_taskTitleInFlight >= TASK_TITLE_MAX_INFLIGHT) { res.json({ ok: true, title: '', description: '', source: source, fallback: fallback, fallbackTitle: fallbackTitle, fallbackDescription: fallbackDescription, hasContent: true }); return; }
+  if (_taskTitleInFlight >= TASK_TITLE_MAX_INFLIGHT) { console.log('[task-title] fallback used: reason=inflight-cap'); res.json({ ok: true, title: '', description: '', source: source, fallback: fallback, fallbackTitle: fallbackTitle, fallbackDescription: fallbackDescription, hasContent: true }); return; }
 
   let state = 'pending';      // 'pending' | 'responded' | 'cancelled'
-  let cleaned = false, child = null, killer = null, out = '';
+  let cleaned = false, child = null, killer = null, out = '', err = '', attempt = 0;
   _taskTitleInFlight++;
   function cleanup() {
     if (cleaned) return; cleaned = true;
@@ -1371,23 +2294,63 @@ function handleTaskTitle(req, res, deps) {
       + 'Output ONLY the label — no punctuation, quotes, or explanation. '
       + 'If the request is cut off, infer the objective from what is present.\n\nRequest: '
       + promptSource);
-  try {
-    child = _spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
-      { cwd: AUTONAME_SCRATCH, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch (e) { settle(''); cleanup(); return; }
-  try { child.stdout.on('data', c => { out += c.toString(); }); } catch {}
-  try { child.stderr.on('data', () => {}); } catch {}
-  killer = setTimeout(function () { cleanup(); settle('', ''); }, describe ? 18000 : 13000);   // [ROOMTASK_HAIKU_V3] two fields take longer
-  child.on('error', function () { settle('', ''); cleanup(); });
-  child.on('close', function () {
+  // [TASK_TITLE_AUTHRETRY_V1] Response that carries NO heuristic fallback — used when the
+  // spawn auth-failed, so neither this server nor the client emits keyword-salad.
+  function settleAuthSkip() {
+    if (state !== 'pending') return;
+    if (res.destroyed || res.writableEnded) { state = 'cancelled'; return; }
+    state = 'responded';
+    res.json({ ok: true, title: '', description: '', source: source,
+      fallback: '', fallbackTitle: '', fallbackDescription: '', hasContent: true, authFailed: true });
+  }
+  // [TASK_TITLE_AUTHRETRY_V2] Token "flap" windows (the shared account tripping
+  // reuse-detection on the other server) are short-lived, so a few spaced retries
+  // ride out the window and still produce a real title. Bounded by a deadline that
+  // stays under the client's 28s abort; only goes blank if the whole window is dead.
+  const started = Date.now();
+  const TT_MAX_ATTEMPTS = 4;        // attempts at ~0, +4s, +8s, +12s
+  const TT_RETRY_DELAY_MS = 4000;
+  const TT_DEADLINE_MS = 24000;     // leave headroom under the client's 28s abort
+  function retryAfterAuthFailure() {
+    if (killer) { clearTimeout(killer); killer = null; }
+    if (child) { try { child.kill('SIGKILL'); } catch {} child = null; }
+    const elapsed = Date.now() - started;
+    if (attempt >= TT_MAX_ATTEMPTS || elapsed + TT_RETRY_DELAY_MS + 3000 > TT_DEADLINE_MS) {
+      console.log('[task-title] skipped: reason=auth-failure, retries exhausted after ' + attempt + ' attempt(s)/' + elapsed + 'ms (no garbage fallback)');
+      settleAuthSkip(); cleanup(); return;
+    }
+    console.log('[task-title] auth-failure on attempt ' + attempt + ' — retry ' + (attempt + 1) + ' in ' + TT_RETRY_DELAY_MS + 'ms');
+    setTimeout(function () { if (state === 'pending' && !cleaned) spawnAttempt(); }, TT_RETRY_DELAY_MS);
+  }
+  function onClose() {
+    if (killer) { clearTimeout(killer); killer = null; }
+    if (_ttIsAuthFailure(out) || _ttIsAuthFailure(err)) {
+      return retryAfterAuthFailure();
+    }
     if (describe) {                                   // [ROOMTASK_HAIKU_V3]
       const parsed = _parseTitleSummary(out);         // each field falls back on its own
+      if (!parsed.title) console.log('[task-title] fallback used: reason=validation-reject (describe) cand=' + JSON.stringify(_ttCleanTitle(_ttExtractTitle(out)).slice(0, 80)));
       settle(parsed.title, parsed.summary); cleanup(); return;
     }
-    let name = (out || '').replace(/\s+/g, ' ').trim().replace(/^["'\s]+|["'\s]+$/g, '').replace(/[.]+$/, '');
-    if (!looksLikeTaskTitle(name)) name = '';
+    let name = _ttCleanTitle(_ttExtractTitle(out));   // [TT_CANON_V1] shared canonical pipeline
+    if (!looksLikeTaskTitle(name)) { console.log('[task-title] fallback used: reason=validation-reject cand=' + JSON.stringify(name.slice(0, 80))); name = ''; }
     settle(name, ''); cleanup();
-  });
+  }
+  function spawnAttempt() {
+    attempt++;
+    out = ''; err = '';
+    try {
+      child = _spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
+        { cwd: AUTONAME_SCRATCH, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { console.log('[task-title] fallback used: reason=spawn-error', e && e.message); settle('', ''); cleanup(); return; }
+    try { child.stdout.on('data', c => { out += c.toString(); }); } catch {}
+    try { child.stderr.on('data', c => { err += c.toString(); }); } catch {}
+    const _perAttempt = Math.max(4000, Math.min(12000, TT_DEADLINE_MS - (Date.now() - started)));   // [TASK_TITLE_AUTHRETRY_V2] bound each attempt so the retry sequence never overruns the client's 28s abort
+    killer = setTimeout(function () { console.log('[task-title] fallback used: reason=timeout'); cleanup(); settle('', ''); }, _perAttempt);
+    child.on('error', function (e) { console.log('[task-title] fallback used: reason=spawn-error', e && e.message); settle('', ''); cleanup(); });
+    child.on('close', onClose);
+  }
+  spawnAttempt();
 }
 app.post('/task-title', (req, res) => handleTaskTitle(req, res));
 // <<< TASK_TITLE_HAIKU_V1_END
@@ -1453,8 +2416,16 @@ function autoNameRoom(S) {
 
 app.post('/sessions/:id/name', (req, res) => {
   try {
-    const name = (req.body && typeof req.body.name === 'string') ? req.body.name.trim().slice(0, 80) : '';
-    if (name) sessionNames[req.params.id] = name; else delete sessionNames[req.params.id];
+    // [ROOMNAME_NBSP_SERVER_V1] preserve leading/trailing padding as non-breaking
+    // spaces (Chrome keeps U+00A0 in a tab title; plain trim() would strip them).
+    // [ROOMNAME_BRAILLE_SERVER_V1] pad with U+2800 (Chrome trims U+00A0 in tabs)
+    let name = (req.body && typeof req.body.name === 'string') ? req.body.name : '';
+    name = name.replace(/[\r\n\t]+/g, ' ')
+               .replace(/^[ \u00A0\u2800]+/, m => '\u2800'.repeat(m.length))
+               .replace(/[ \u00A0\u2800]+$/, m => '\u2800'.repeat(m.length))
+               .slice(0, 80);
+    const _hasContent = /[^\s\u2800]/.test(name);
+    if (_hasContent) sessionNames[req.params.id] = name; else { delete sessionNames[req.params.id]; name = ''; }
     saveSessionNames();
     res.json({ ok: true, name });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1750,6 +2721,129 @@ function broadcastGlobalEngineChange() {
     try { S.send(S.engineState()); } catch {}
   }
 }
+
+// [ACCT_GLOBAL_ONLY_V1] + [ACCT_AUTOSWITCH_V2] -------------------------------------
+// Account selection is a single GLOBAL choice per engine (mirrors [ENGINE_GLOBAL_ONLY_V1]).
+// Switching sets the canonical active account via the switch scripts (which patch
+// ~/.claude.json / ~/.codex/auth.json — exactly what the steward's activeClaude()/
+// activeCodex() read) and clears every room's per-room account pin so all rooms re-resolve
+// to it on their next turn. Steward per-room runtime isolation is preserved.
+function clearAllAccountPins(provider) {
+  const isCodex = provider === 'codex';
+  for (const S of clientSessions.values()) {
+    if (!S) continue;
+    if (isCodex) {
+      S.selCodexAccount = null;
+      if (S.processing && S.procEngine === 'codex') S.pendingCodexCredentialRefresh = true;
+      else { S.credentialCodexAccount = null; S.pendingCodexCredentialRefresh = false; }
+    } else {
+      S.selClaudeAccount = null;
+      if (S.currentProc && S.procEngine === 'claude' && S.processing) {
+        S.pendingClaudeCredentialRefresh = true;
+      } else {
+        if (S.currentProc && S.procEngine === 'claude') { try { S.currentProc.kill('SIGKILL'); } catch (e) {} S.currentProc = null; S.procEngine = null; }
+        S.credentialClaudeAccount = null; S.pendingClaudeCredentialRefresh = false;
+      }
+    }
+    try { persistRoom(S); } catch (e) {}
+  }
+  try {
+    const m = _loadRoomMap(); let dirty = false;
+    const field = isCodex ? 'codexAccount' : 'claudeAccount';
+    for (const k of Object.keys(m)) { if (m[k] && m[k][field]) { m[k][field] = null; dirty = true; } }
+    if (dirty) _writeRoomMap(m);
+  } catch (e) {}
+}
+function applyGlobalAccountSwitch(provider, name, reason, cb) {
+  const isCodex = provider === 'codex';
+  const sh = isCodex ? CODEX_SWITCH_SH : SWITCH_SH;
+  if (!fs.existsSync(sh)) return cb(new Error((isCodex ? 'Codex ' : '') + 'account switcher not installed.'));
+  execFile(sh, [name], { timeout: 20000, env: { ...process.env, HOME: os.homedir() } }, (err, stdout, stderr) => {
+    const out = ((stdout || '') + (stderr || '')).trim();
+    if (err) return cb(new Error(out || err.message));
+    try { clearAllAccountPins(provider); } catch (e) {}
+    try { broadcastGlobalEngineChange(); } catch (e) {}
+    console.log('[Bridge] [ACCT_GLOBAL_ONLY_V1] global ' + provider + ' account -> ' + name + (reason ? ' (' + reason + ')' : ''));
+    cb(null, out);
+  });
+}
+// One-shot migration: drop any per-room account pins left by the old pane-local selector.
+setTimeout(function migrateAccountPins() {
+  const guard = path.join(os.homedir(), '.claude', '.account-global-only');
+  try {
+    if (fs.existsSync(guard)) return;
+    if (fs.existsSync(ROOM_MAP_FILE)) fs.copyFileSync(ROOM_MAP_FILE, ROOM_MAP_FILE + '.bak-account-global-only');
+    const m = _loadRoomMap(); let dirty = false;
+    for (const k of Object.keys(m)) { if (m[k] && (m[k].claudeAccount || m[k].codexAccount)) { m[k].claudeAccount = null; m[k].codexAccount = null; dirty = true; } }
+    if (dirty) _writeRoomMap(m);
+    fs.writeFileSync(guard, new Date().toISOString());
+    console.log('[Bridge] [ACCT_GLOBAL_ONLY_V1] migrated: per-room account pins cleared');
+  } catch (e) { console.log('[Bridge] [ACCT_GLOBAL_ONLY_V1] migration skipped:', e.message); }
+}, 0);
+// [ACCT_AUTOSWITCH_V2] Server-side auto-switch: when the active account of an engine reaches
+// >=95% in EITHER the 5h OR 7d window (reset-aware), switch globally to the same-engine
+// account with more headroom in BOTH windows (the most). Fires with no browser open. No-op
+// when nothing is strictly better. Disable per-pane with ACCT_AUTOSWITCH=0.
+const ACCT_AUTOSWITCH_ENABLED = process.env.ACCT_AUTOSWITCH !== '0';
+const ACCT_AUTOSWITCH_HIGH = Number(process.env.ACCT_AUTOSWITCH_HIGH || 95);
+// [ACCT_AUTOSWITCH_NOTIFY] TEMPORARY WhatsApp-self alert on each auto-switch; auto-expires
+// 2026-10-17T12:00:00Z (after that Date.now() exceeds it and no alert is sent). Self-cleaning.
+const ACCT_AUTOSWITCH_NOTIFY_UNTIL = 1792238400000;
+const _acctAutoCooldown = {};
+function _acctListForProvider(provider) {
+  if (provider === 'codex') {
+    return listCodexAccounts().accounts.map(a => {
+      const u = readCodexAccountUsage(a.name);
+      if (codexUsageStale(u)) { try { queueCodexProbe(a.name); } catch (e) {} }
+      return { name: a.name, usage: normalizeUsage(u), expired: false };
+    });
+  }
+  return listAccounts().accounts;
+}
+function evalAcctAutoSwitch(provider) {
+  const now = Date.now();
+  if (_acctAutoCooldown[provider] && (now - _acctAutoCooldown[provider]) < 120000) return;
+  let active = '';
+  try { active = stewardText([provider === 'codex' ? 'active-codex' : 'active-claude']); } catch (e) { return; }
+  if (!active) return;
+  // [ACCT_AUTOSWITCH_LIVETURN_V1] never swap credentials out from under a live turn —
+  // the running CLI holds ~/.claude.json open, so the in-place metadata write collides.
+  try { for (const _S of clientSessions.values()) { if (_S && _S.inFlight && _S.inFlight.length) return; } } catch (e) {}
+  const list = _acctListForProvider(provider);
+  const act = list.find(a => a.name === active);
+  if (!act || !act.usage) return;
+  const a5 = act.usage.five_hour_pct, a7 = act.usage.seven_day_pct;
+  const hot = (a5 != null && a5 >= ACCT_AUTOSWITCH_HIGH) || (a7 != null && a7 >= ACCT_AUTOSWITCH_HIGH);
+  if (!hot) return;
+  const capA5 = a5 == null ? 101 : a5, capA7 = a7 == null ? 101 : a7;
+  const cands = list
+    .filter(a => a.name !== active && !a.expired && a.usage)
+    .map(a => ({ name: a.name, five: a.usage.five_hour_pct == null ? 0 : a.usage.five_hour_pct, seven: a.usage.seven_day_pct == null ? 0 : a.usage.seven_day_pct }))
+    .filter(a => a.five < capA5 && a.seven < capA7)
+    .filter(a => a.five < ACCT_AUTOSWITCH_HIGH && a.seven < ACCT_AUTOSWITCH_HIGH)
+    .sort((x, y) => Math.max(x.five, x.seven) - Math.max(y.five, y.seven) || (x.five + x.seven) - (y.five + y.seven));
+  if (!cands.length) return;
+  const best = cands[0];
+  _acctAutoCooldown[provider] = now;
+  const why = 'auto' + (a5 != null && a5 >= ACCT_AUTOSWITCH_HIGH ? ' 5h ' + a5 + '%' : '') + (a7 != null && a7 >= ACCT_AUTOSWITCH_HIGH ? ' 7d ' + a7 + '%' : '');
+  applyGlobalAccountSwitch(provider, best.name, why, (err) => {
+    if (err) { console.log('[Bridge] [ACCT_AUTOSWITCH_V2] ' + provider + ' switch failed: ' + err.message); return; }
+    console.log('[Bridge] [ACCT_AUTOSWITCH_V2] ' + provider + ' ' + active + ' -> ' + best.name + ' (' + why + ')');
+    try {
+      if (Date.now() < ACCT_AUTOSWITCH_NOTIFY_UNTIL) {
+        execFile(path.join(os.homedir(), 'autonomy-notify.sh'),
+          ['acct-autoswitch', '\u{1F504} Auto-switched ' + provider + ' account: ' + active + ' \u2192 ' + best.name + ' (' + why + '). Now global across all rooms.'],
+          { timeout: 20000 }, () => {});
+      }
+    } catch (e) {}
+  });
+}
+function acctAutoSwitchTick() {
+  if (!ACCT_AUTOSWITCH_ENABLED || !CREDENTIAL_STEWARD_ENABLED) return;
+  for (const p of ['claude', 'codex']) { try { evalAcctAutoSwitch(p); } catch (e) {} }
+}
+try { const _asIv = setInterval(acctAutoSwitchTick, 60000); if (_asIv.unref) _asIv.unref(); } catch (e) {}
+// [ACCT_GLOBAL_ONLY_V1] + [ACCT_AUTOSWITCH_V2] end ---------------------------------
 // [ENGINE_GLOBAL_ONLY_V1] Per-room engine pins are retired. This drops any that survive
 // (live sessions + the durable room map) so `engineOverride` is uniformly null and
 // resolveRoomEngine() can only ever answer with the global marker.
@@ -1963,24 +3057,31 @@ function listAccounts() {
 // Access-token expiry (accounts[].expired) is refreshed in place by the credential steward
 // on every spawn, so it is deliberately NOT an availability input — and neither is usage
 // quota: an exhausted account is still signed in.
-function engineAccounts() {
+function engineAccounts(S) {
   const base = listAccounts();
   const codex = listCodexAccounts();
-  let uuid = '';
-  try { uuid = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount || {}).accountUuid || ''; } catch (e) {}
+  // [ACCT_PANE_ISO_V1] Prefer this room's durable selection; else fall back to the global-active login.
   let cname = '';
-  if (uuid) {
-    try {
-      for (const f of fs.readdirSync(ACCT_DIR)) {
-        const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
-        let u = ''; try { u = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).accountUuid || ''; } catch (e) {}
-        if (u && u === uuid) { cname = m[1]; break; }
-      }
-    } catch (e) {}
+  const _selC = S && S.selClaudeAccount;
+  if (_selC && base.accounts.find(a => a.name === _selC)) cname = _selC;
+  else {
+    let uuid = '';
+    try { uuid = (JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8')).oauthAccount || {}).accountUuid || ''; } catch (e) {}
+    if (uuid) {
+      try {
+        for (const f of fs.readdirSync(ACCT_DIR)) {
+          const m = f.match(/^(.+)\.account\.json$/); if (!m) continue;
+          let u = ''; try { u = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).accountUuid || ''; } catch (e) {}
+          if (u && u === uuid) { cname = m[1]; break; }
+        }
+      } catch (e) {}
+    }
   }
   const crec = base.accounts.find(a => a.name === cname) || null;
   const cOk  = !!crec && crec.health !== 'fail';
-  const xrec = codex.accounts.find(a => a.active) || null;
+  const _selX = S && S.selCodexAccount;
+  let xrec = _selX ? (codex.accounts.find(a => a.name === _selX) || null) : null;
+  if (!xrec) xrec = codex.accounts.find(a => a.active) || null;
   const xOk  = !!xrec && codex.enabled;
   return {
     // [ENGINE_ACCT_COUNT_V1] count = accounts registered in that engine's family;
@@ -2004,26 +3105,38 @@ app.get('/accounts', (req, res) => {
     if (codexUsageStale(u)) queueCodexProbe(a.name);
     return { ...a, usage: normalizeUsage(u) };
   }));
+  const _rid = String(req.query.roomId || '');
   res.json({ ok: true, active: base.active, accounts, enabled: base.enabled, codexEnabled: codex.enabled, engine: currentEngine(),
-             engineAccounts: engineAccounts() });   // [ENGINE_GLOBAL_ONLY_V1]
+             engineAccounts: engineAccounts(clientSessions.get(_rid)), paneRuntime: paneClaudeIdentity(_rid, clientSessions.get(_rid)) });   // [ACCT_PANE_ISO_V1] + [ACCT_RUNTIME_IDENTITY_V1]
 });
 app.post('/accounts/switch', (req, res) => {
   const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
   const wantType = String((req.body && req.body.type) || '').toLowerCase();
   if (!name) return res.status(400).json({ ok: false, error: 'Missing account name.' });
-  // Route to the Codex switcher when the caller says type:'codex' or the name is a
-  // stored Codex account. Also drop an engine marker (~/.claude/engine) so the pane
-  // runs the matching backend on its next spawn.
   let isCodex = wantType === 'codex';
   if (!isCodex && wantType !== 'code') { try { isCodex = fs.existsSync(path.join(CODEX_ACCT_DIR, name + '.auth.json')); } catch {} }
+  // [ACCT_PANE_ISO_V1] Pane-local selection: choosing an account affects ONLY the calling
+  // room. It never rewrites the global login pointers (~/.claude.json / ~/.codex/auth.json)
+  // and never disturbs another pane. Requires the credential steward (per-account runtime
+  // isolation); with it disabled we fall back to the legacy global switcher below.
+  if (CREDENTIAL_STEWARD_ENABLED) {
+    const provider = isCodex ? 'codex' : 'claude';
+    if (!accountExists(provider, name)) return res.status(404).json({ ok: false, error: 'No ' + provider + ' account named "' + name + '".' });
+    const key = String((req.body && req.body.roomId) || '');
+    // [ACCT_GLOBAL_ONLY_V1] Account selection is GLOBAL per engine: set the canonical
+    // active account and clear every room's pin so all rooms adopt it on their next turn.
+    return applyGlobalAccountSwitch(provider, name, 'manual', (err) => {
+      if (err) return res.status(500).json({ ok: false, error: err.message });
+      const S = clientSessions.get(key);
+      return res.json({ ok: true, message: 'All rooms now use ' + name + '.', engine: provider, roomId: key, ...listAccounts(), engineAccounts: engineAccounts(S) });
+    });
+  }
+  // Legacy global switch (credential steward disabled) - rollback path only.
   if (isCodex) {
     if (!fs.existsSync(CODEX_SWITCH_SH)) return res.status(404).json({ ok: false, error: 'Codex switcher not installed.' });
     return execFile(CODEX_SWITCH_SH, [name], { timeout: 20000, env: { ...process.env, HOME: os.homedir() } }, (err, stdout, stderr) => {
       const out = ((stdout || '') + (stderr || '')).trim();
       if (err) return res.status(500).json({ ok: false, error: out || err.message });
-      // [ENGINE_GLOBAL_ONLY_V1] Choosing an account NEVER changes which engine runs: each
-      // engine keeps its own selected account and the room selector alone picks the engine.
-      // The broadcast still fires so every room's label picks up the new email.
       try { broadcastGlobalEngineChange(); } catch {}
       const codex = listCodexAccounts();
       res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'codex', ...listAccounts(), codexAccounts: codex.accounts });
@@ -2033,30 +3146,7 @@ app.post('/accounts/switch', (req, res) => {
   execFile(SWITCH_SH, [name], { timeout: 20000 }, (err, stdout, stderr) => {
     const out = ((stdout || '') + (stderr || '')).trim();
     if (err) return res.status(500).json({ ok: false, error: out || err.message });
-    // [ENGINE_GLOBAL_ONLY_V1] Account choice is independent of engine choice (see the Codex
-    // branch above); only the labels are refreshed here.
     try { broadcastGlobalEngineChange(); } catch {}
-    // [CONF_ACCT_SWITCH_V1] The Claude account is global, but a live session pins the
-    // account it was first spawned under (S.credentialClaudeAccount, set-once) and a
-    // persistent/kept-alive worker (esp. a conference, which is never idle-evicted) keeps
-    // its original CLAUDE_CONFIG_DIR for its whole life. Propagate the switch into every
-    // live session so each adopts the new account on its NEXT turn: clear the set-once
-    // pin, and retire the Claude worker at a safe boundary. An idle Claude worker is
-    // dropped now (direct kill, NOT killCurrentProc, which would pause a conference); a
-    // busy worker is flagged to retire when it next goes idle. Sessions with no worker or
-    // a non-Claude worker only need the pin cleared. A fresh spawn re-reads the active
-    // account, so transcripts resume seamlessly (shared projects symlink).
-    try {
-      for (const S of clientSessions.values()) {
-        S.credentialClaudeAccount = null;
-        if (S.currentProc && S.procEngine === 'claude') {
-          if (!S.processing) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false; }
-          else { S.pendingCredentialRefresh = true; }
-        } else {
-          S.pendingCredentialRefresh = false;
-        }
-      }
-    } catch (e) { console.log('[Bridge] [CONF_ACCT_SWITCH_V1] account-switch propagation failed:', e.message); }
     res.json({ ok: true, message: (out.split('\n')[0] || ('Switched to ' + name)), engine: 'claude', ...listAccounts() });
   });
 });
@@ -2089,6 +3179,20 @@ app.post('/accounts/rename', (req, res) => {
 // only forgets the saved login used by the switcher — it does NOT touch the live
 // ~/.claude/.credentials.json, so we refuse to delete the currently-active account
 // (switch away first) to avoid a confusing orphaned-but-still-running state.
+// [TASK407] AC7: room keys that pin this account, or are running a live turn on it.
+function accountPinnedBy(provider, name) {
+  const hits = [];
+  try {
+    for (const [key, S] of clientSessions.entries()) {
+      const sel = provider === 'codex' ? S.selCodexAccount : S.selClaudeAccount;
+      const live = provider === 'codex' ? S.credentialCodexAccount : S.credentialClaudeAccount;
+      if (sel === name || (S.processing && live === name)) if (!hits.includes(key)) hits.push(key);
+    }
+    const m = _loadRoomMap();
+    for (const k of Object.keys(m)) { const f = m[k] && (provider === 'codex' ? m[k].codexAccount : m[k].claudeAccount); if (f === name && !hits.includes(k)) hits.push(k); }
+  } catch (e) {}
+  return hits;
+}
 app.post('/accounts/delete', (req, res) => {
   const name = String((req.body && req.body.name) || '').replace(/[^a-zA-Z0-9_-]/g, '');
   if (!name) return res.status(400).json({ ok: false, error: 'Missing account name.' });
@@ -2106,6 +3210,7 @@ app.post('/accounts/delete', (req, res) => {
       let thisId = '';   try { thisId   = codexAcctId(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch {}
       if (activeId && thisId && activeId === thisId && currentEngine() === 'codex')
         return res.status(409).json({ ok: false, error: 'That is the Codex login this pane is running on — switch to another account first, then delete it.' });
+      { const _pins = accountPinnedBy('codex', name); if (_pins.length) return res.status(409).json({ ok: false, error: `That Codex account is selected by ${_pins.length} pane(s) — clear the selection there first, then delete it.`, panes: _pins }); }
       fs.unlinkSync(f);
       const codex = listCodexAccounts();
       return res.json({ ok: true, message: `Deleted Codex account "${name}".`, removed: 1, ...listAccounts(), codexAccounts: codex.accounts });
@@ -2121,6 +3226,7 @@ app.post('/accounts/delete', (req, res) => {
     try { thisEmail = (JSON.parse(fs.readFileSync(acctFile, 'utf8')) || {}).emailAddress || ''; } catch (e) {}
     if (activeEmail && thisEmail && activeEmail === thisEmail)
       return res.status(409).json({ ok: false, error: 'That is the account this pane is running on — switch to another account first, then delete it.' });
+    { const _pins = accountPinnedBy('claude', name); if (_pins.length) return res.status(409).json({ ok: false, error: `That account is selected by ${_pins.length} pane(s) — clear the selection there first, then delete it.`, panes: _pins }); }
     let removed = 0;
     for (const f of fs.readdirSync(ACCT_DIR)) {
       if (f === name + '.account.json' || (f.startsWith(name + '.') && f.slice(name.length)[0] === '.')) {
@@ -2145,6 +3251,18 @@ let cxProc = null, cxBuf = '', cxUrl = '', cxDone = false, cxResult = null, cxNa
 // [CODEX_DEVICE_OPT_V1] device-code flow state (mode 'device' vs default 'browser')
 let cxCode = '', cxMode = 'browser', cxWatch = null;
 let cxStartAuthMtime = 0, cxFinalized = false;
+let cxExpectedAccountId = '', cxPriorAuth = null;
+function registeredCodexAccountId(name) {
+  try {
+    const reg = JSON.parse(fs.readFileSync(path.join(os.homedir(), 'credential-accounts.json'), 'utf8'));
+    const rec = (reg.accounts || []).find(a => a && a.provider === 'codex' && a.name === name);
+    return String((rec && rec.accountId) || '').trim().toLowerCase();
+  } catch { return ''; }
+}
+function codexIdMatchesExpected(actual, expected) {
+  actual = String(actual || '').toLowerCase(); expected = String(expected || '').toLowerCase();
+  return !!actual && !!expected && (actual === expected || actual.startsWith(expected));
+}
 function killCodexAuth() {
   if (cxWatch) { try { clearInterval(cxWatch); } catch {} cxWatch = null; }
   if (cxProc) { try { process.kill(-cxProc.pid, 'SIGKILL'); } catch { try { cxProc.kill('SIGKILL'); } catch {} } }
@@ -2156,8 +3274,20 @@ function killCodexAuth() {
 function finalizeCodexAuth() {
   if (cxFinalized) return;
   cxFinalized = true; cxDone = true;
-  let ok = false, email = '';
-  try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); ok = !!((a.tokens || {}).account_id); email = codexEmail(a); } catch {}
+  let ok = false, email = '', actualId = '';
+  try { const a = JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8')); actualId = codexAcctId(a); ok = !!actualId; email = codexEmail(a); } catch {}
+  if (ok && (!cxExpectedAccountId || !codexIdMatchesExpected(actualId, cxExpectedAccountId))) {
+    // Never allow a successful OAuth flow for account A to overwrite the named slot for
+    // account B. Restore the active credential that existed before login as well, because
+    // `codex login` writes ~/.codex/auth.json before this finalizer gets control.
+    try {
+      if (cxPriorAuth !== null) fs.writeFileSync(CODEX_AUTH, cxPriorAuth, { mode: 0o600 });
+      else fs.unlinkSync(CODEX_AUTH);
+    } catch {}
+    cxResult = { ok: false, message: 'Wrong OpenAI account: signed in as ' + (email || actualId) +
+      ', but the “' + cxName + '” slot expects account ' + (cxExpectedAccountId || '(unregistered)') + '. Nothing was saved.' };
+    return;
+  }
   if (ok) {
     try { execFileSync(CODEX_SWITCH_SH, ['--save', cxName], { timeout: 15000, env: { ...process.env, HOME: os.homedir() } }); } catch (e) {}
     // [ENGINE_GLOBAL_ONLY_V1] Re-auth restores a Codex login; it does not hijack the engine.
@@ -2185,8 +3315,11 @@ app.post('/codex/auth/start', (req, res) => {
   try {
     killCodexAuth();
     cxBuf = ''; cxUrl = ''; cxCode = ''; cxDone = false; cxResult = null; cxFinalized = false;
+    try { cxPriorAuth = fs.readFileSync(CODEX_AUTH); } catch { cxPriorAuth = null; }
     try { cxStartAuthMtime = fs.statSync(CODEX_AUTH).mtimeMs; } catch { cxStartAuthMtime = 0; }
     cxName = String((req.body && req.body.name) || 'peter').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'peter';
+    cxExpectedAccountId = registeredCodexAccountId(cxName);
+    if (!cxExpectedAccountId) return res.status(400).json({ ok: false, error: 'Codex account “' + cxName + '” has no registered account ID; refusing an unverified login.' });
     // [CODEX_DEVICE_OPT_V1] mode selects the flow:
     //  'browser' (default) — full `codex login`: grants api.connectors.* scopes, starts a
     //     local callback server on 127.0.0.1:1455 + prints the auth URL; user pastes back
@@ -2374,6 +3507,128 @@ app.get('/sessions', (req, res) => {
   } catch (e) { res.json({ sessions: [] }); }
 });
 
+// ── [LOOPS_BY_TASK_V1] Settings ▸ Loops data source (task-355) ────────────────
+// Enumerate the RUNNING autonomy loops from ~/.claude/autonomy/rooms and resolve
+// the task each is working, so the client can render them grouped BY TASK. A loop
+// is a non-retired autonomy room bound to a task:
+//   task-NNN-<slug>.sid            → the primary loop; file holds its room/session id
+//   task-NNN-<slug>.codex-room-sid → the Codex loop's own room id  (preferred)
+//   task-NNN-<slug>.codex-sid      → the Codex loop's thread id    (alias fallback)
+// The two codex-* files are ALIASES for ONE codex loop (room id wins). pool-*.sid
+// and *.sid.retired-* are NOT task loops and are excluded. Engine is the durable
+// room map's lastEngine (else the source default); account is chosen BY that engine
+// from the SAME room's authoritative claudeAccount/codexAccount, else null
+// ("unavailable") — never an unrelated active account. Read-only dir + map scan;
+// same auth boundary as every other app route.
+function readAutonomyLoops() {
+  const out = [];
+  let map = {};
+  try { map = _loadRoomMap(); } catch {}
+  const dir = path.join(os.homedir(), '.claude', 'autonomy', 'rooms');
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch { return out; }
+  const read1 = (f) => { try { return fs.readFileSync(path.join(dir, f), 'utf8').trim(); } catch { return ''; } };
+  const bases = new Map();   // base -> { num, slug, sidRoom, codexRoom }
+  const ensure = (base) => {
+    let b = bases.get(base);
+    if (b !== undefined) return b;   // may be null (cached "not a task")
+    const m = /^task-0*(\d+)-(.*)$/.exec(base);
+    b = m ? { base, num: parseInt(m[1], 10), slug: m[2], sidRoom: null, codexRoom: null } : null;
+    bases.set(base, b);
+    return b;
+  };
+  for (const f of files) {
+    if (f.startsWith('pool-')) continue;               // pool loops are not task-bound
+    if (f.indexOf('.sid.retired-') !== -1) continue;   // retired loops are not running
+    let b = null, id = '';
+    if (f.endsWith('.codex-room-sid')) {
+      b = ensure(f.slice(0, -('.codex-room-sid'.length))); if (!b) continue;
+      id = read1(f); if (id) b.codexRoom = id;          // room id wins over the .codex-sid alias
+    } else if (f.endsWith('.codex-sid')) {
+      b = ensure(f.slice(0, -('.codex-sid'.length))); if (!b) continue;
+      id = read1(f); if (id && !b.codexRoom) b.codexRoom = id;
+    } else if (f.endsWith('.sid')) {
+      b = ensure(f.slice(0, -('.sid'.length))); if (!b) continue;
+      id = read1(f); if (id) b.sidRoom = id;
+    }
+  }
+  const acctFor = (roomId, engine) => {
+    const rec = map[roomId] || {};
+    return (engine === 'codex' ? rec.codexAccount : rec.claudeAccount) || null;
+  };
+  for (const b of bases.values()) {
+    if (!b) continue;
+    if (b.sidRoom) {
+      const engine = (map[b.sidRoom] && map[b.sidRoom].lastEngine) || 'claude';
+      out.push({ id: b.base + ':sid', taskNumber: b.num, taskSlug: b.slug, roomId: b.sidRoom, engine, account: acctFor(b.sidRoom, engine) });
+    }
+    if (b.codexRoom) {
+      const engine = 'codex';   // a .codex-room-sid/.codex-sid file IS, by definition, the Codex loop's room
+      out.push({ id: b.base + ':codex', taskNumber: b.num, taskSlug: b.slug, roomId: b.codexRoom, engine, account: acctFor(b.codexRoom, engine) });
+    }
+  }
+  out.sort((a, b) => (a.taskNumber - b.taskNumber) || (a.id < b.id ? -1 : 1));
+  return out;
+}
+
+app.get('/loops', (req, res) => {
+  try { res.json({ loops: readAutonomyLoops() }); }
+  catch (e) { res.json({ loops: [], error: e.message }); }
+});
+
+// ── [LOOPS_METRICS_V1] Settings ▸ Loops canonical data source (task-355) ──────
+// Per-user, read-only. "A loop" = a concurrent autonomy worker SLOT, as recorded
+// in ~/.claude/autonomy/turn-metrics.jsonl (one JSON line per completed run:
+// {ts, task, slot, rc, cost_usd, ...}). Scan the whole file once, keep EVERY
+// distinct slot (so an idle/stale slot is never dropped), and per slot report its
+// true last run (max ts) plus a bounded window of its newest runs BY TIMESTAMP.
+// No decision.json / account-pacing: turn-metrics is the reliable source. Errors
+// return a safe, well-formed envelope that never leaks a filesystem path.
+const LOOPS_RECENT_MAX = 20;
+function readAutonomyLoopMetrics() {
+  const file = path.join(os.homedir(), '.claude', 'autonomy', 'turn-metrics.jsonl');
+  let raw;
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch (e) {
+    if (e && e.code === 'ENOENT') return { loops: [], note: 'no runs recorded' };
+    return { loops: [], note: 'unavailable' };   // unexpected read error, not a missing file
+  }
+  const bySlot = new Map();   // slot -> { slot, runs:[{_t,ts,task,rc,cost_usd}] }
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s) continue;
+    let r; try { r = JSON.parse(s); } catch { continue; }   // tolerate malformed rows
+    if (!r || typeof r !== 'object') continue;
+    if (typeof r.slot !== 'number' || !r.ts) continue;
+    const t = Date.parse(r.ts);
+    if (isNaN(t)) continue;
+    let g = bySlot.get(r.slot);
+    if (!g) { g = { slot: r.slot, runs: [] }; bySlot.set(r.slot, g); }
+    g.runs.push({ _t: t, ts: r.ts, task: (r.task == null ? '' : String(r.task)),
+      rc: (typeof r.rc === 'number' ? r.rc : null),
+      cost_usd: (typeof r.cost_usd === 'number' ? r.cost_usd : null) });
+  }
+  const loops = [];
+  for (const g of bySlot.values()) {
+    g.runs.sort((a, b) => b._t - a._t);   // newest first, by TIMESTAMP (not file order)
+    const recent = g.runs.slice(0, LOOPS_RECENT_MAX).map(({ _t, ...r }) => r);
+    const last = g.runs[0];
+    loops.push({ slot: g.slot, lastRunTs: last.ts, lastTask: last.task,
+      windowRunCount: recent.length, recentRuns: recent });
+  }
+  loops.sort((a, b) => a.slot - b.slot);   // deterministic numeric order
+  return { loops, note: null };
+}
+
+app.get('/autonomy/loops', (req, res) => {
+  try {
+    const { loops, note } = readAutonomyLoopMetrics();
+    res.json({ generatedAt: new Date().toISOString(), note, loops });
+  } catch (_e) {
+    res.json({ generatedAt: new Date().toISOString(), note: 'unavailable', loops: [] });
+  }
+});
+
 // Per-user upload directory for files/screenshots attached in the chat. Lives in
 // the user's HOME (so it's isolated per bridge account) and is read back by Claude
 // via its Read tool (Read(*) is allowed in the user's settings.json), so attached
@@ -2502,6 +3757,34 @@ function accountIdentityByName(name) {
     return { email: d.emailAddress || "", uuid: d.accountUuid || "" };
   } catch { return { email: "", uuid: "" }; }
 }
+// [ACCT_RUNTIME_IDENTITY_V1] Map a global account UUID back to its saved account name.
+function accountNameByUuid(uuid) {
+  if (!uuid) return '';
+  try {
+    for (const f of fs.readdirSync(ACCT_DIR)) {
+      if (!f.endsWith('.account.json')) continue;
+      let u = ''; try { u = (JSON.parse(fs.readFileSync(path.join(ACCT_DIR, f), 'utf8')) || {}).accountUuid || ''; } catch (e) {}
+      if (u && u === uuid) return f.slice(0, -('.account.json'.length));
+    }
+  } catch (e) {}
+  return '';
+}
+// [ACCT_RUNTIME_IDENTITY_V1] Read-only, credential-first identity of the account a pane's turns
+// actually run/bill under. Precedence: live credential pin -> live selection -> durable room
+// record -> global login (mapped back to a saved name). Never mutates (no resolveRoomAccount).
+// [ACCT_RUNTIME_IDENTITY_V2] Usage snapshot by SAVED ACCOUNT NAME (robust to shared-email logins).
+function readAccountUsageByName(name) {
+  if (!name) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(ACCT_DIR, name + '.usage.json'), 'utf8')); } catch (e) { return null; }
+}
+function paneClaudeIdentity(roomId, S) {
+  let name = (S && S.credentialClaudeAccount) || (S && S.selClaudeAccount) || '';
+  if (!name && roomId) { try { name = (_loadRoomMap()[roomId] || {}).claudeAccount || ''; } catch (e) {} }
+  if (name) { const _id = accountIdentityByName(name); return { name: name, email: _id.email, uuid: _id.uuid }; }
+  const g = currentAccountIdentity();
+  return { name: accountNameByUuid(g.uuid), email: g.email, uuid: g.uuid };
+}
+
 let _rlPending = {};
 // [USAGE_ATTRIB_V1] Attribute usage to the account THIS worker runs on
 // (S.credentialClaudeAccount), not the globally-active account; per-session
@@ -2604,7 +3887,7 @@ app.get('/usage', (req, res) => {
   if (_engine === 'codex') {
     return readCodexMetrics((err, raw) => err
       ? res.status(502).json({ ok: false, engine: 'codex', error: err.message })
-      : res.json({ ...codexUsageResponse(raw, _rid), engineAccounts: engineAccounts() }));   // [ENGINE_GLOBAL_ONLY_V1]
+      : res.json({ ...codexUsageResponse(raw, _rid), engineAccounts: engineAccounts(clientSessions.get(_rid)) }));   // [ACCT_PANE_ISO_V1]
   }
   let blockResult = null, weekResult = null, done = 0;
   const rateLimits = readRateLimits() || {};
@@ -2612,7 +3895,8 @@ app.get('/usage', (req, res) => {
   // written by the Haiku refresher, so its model/ctx fields describe the throwaway
   // session, not this user's Opus chat — override them with authoritative values.
   rateLimits.model = modelDisplayName(CLAUDE_MODEL);
-  const activeEmail = readAccountEmail();
+  const _paneId = paneClaudeIdentity(_rid, clientSessions.get(_rid));   // [ACCT_RUNTIME_IDENTITY_V1] credential-first pane account
+  const activeEmail = _paneId.email || readAccountEmail();
   rateLimits.email = activeEmail;
   if (latestCtxPct != null) rateLimits.ctx_pct = latestCtxPct;
   if (latestCtxTokens != null) rateLimits.ctx_tokens = latestCtxTokens;
@@ -2624,7 +3908,7 @@ app.get('/usage', (req, res) => {
   // %s so the UI shows "–" rather than another account's usage.
   const globalFresh = rateLimits.five_hour_pct != null && rateLimits.account_email === activeEmail;
   if (!globalFresh) {
-    const snap = normalizeUsage(readAccountUsageByEmail(activeEmail));
+    const snap = normalizeUsage(_paneId.name ? readAccountUsageByName(_paneId.name) : readAccountUsageByEmail(activeEmail));
     if (snap) {
       rateLimits.five_hour_pct = snap.five_hour_pct;
       rateLimits.five_hour_resets_at = snap.five_hour_resets_at;
@@ -2644,7 +3928,7 @@ app.get('/usage', (req, res) => {
   function finish() {
     if (++done < 2) return;
     res.json({ ok: true, engine: 'claude', block: blockResult, week: weekResult, rateLimits,
-               engineAccounts: engineAccounts() });   // [ENGINE_GLOBAL_ONLY_V1] keeps the selector's emails live on the 30s poll
+               engineAccounts: engineAccounts(clientSessions.get(_rid)), paneRuntime: _paneId });   // [ACCT_PANE_ISO_V1] + [ACCT_RUNTIME_IDENTITY_V1]
   }
 
   // 5-hour block data
@@ -2700,20 +3984,31 @@ app.get('/usage', (req, res) => {
 // currently-active account so the 5h/7d rate-limit headers get scraped + snapshotted
 // right now, instead of waiting for the next real chat turn. Costs one minimal Haiku
 // message. Used by the "↻ Refresh usage now" button (esp. for a freshly-added account).
-let _usageRefreshing = false;
+let _usageRefreshing = {};
 app.post('/usage/refresh', (req, res) => {
-  if (_usageRefreshing) return res.json({ ok: false, error: 'already refreshing' });
-  _usageRefreshing = true;
+  const _rid = String((req.body && req.body.roomId) || req.query.roomId || '');   // [ACCT_RUNTIME_IDENTITY_V1] refresh the pane account, not the global login
+  const _S = _rid ? clientSessions.get(_rid) : null;
+  const _paneId = paneClaudeIdentity(_rid, _S);
+  const _paneName = _paneId.name || '';
+  const _guardKey = _paneName || '_global';
+  if (_usageRefreshing[_guardKey]) return res.json({ ok: false, error: 'already refreshing' });
+  _usageRefreshing[_guardKey] = true;
   const env = { ...process.env };
   if (!env.HOME) env.HOME = process.env.HOME || os.homedir();
   if (!env.PATH) env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
   env.ANTHROPIC_LOG = 'debug';
   lastRateCaptureAt = 0;                       // bypass the throttle for this manual refresh
-  const before = (readRateLimits() || {}).updated_at || '';
+  if (_paneName && _rid) {
+    if (!CREDENTIAL_STEWARD_ENABLED) { console.log('[Bridge] [ACCT_RUNTIME_IDENTITY_V3] pane-scoped refresh blocked: credential steward disabled'); delete _usageRefreshing[_guardKey]; return res.json({ ok: false, error: 'Usage refresh is temporarily unavailable for this account.' }); }
+    try { const _dir = roomClaudeConfigDir(_paneName, _rid); stewardText(['issue-claude', _paneName, _dir]); env.CLAUDE_CONFIG_DIR = _dir; }
+    catch (e) { console.log('[Bridge] [ACCT_RUNTIME_IDENTITY_V3] issue-claude failed for', _paneName, (e && e.message) || e); delete _usageRefreshing[_guardKey]; return res.json({ ok: false, error: 'Usage refresh is temporarily unavailable for this account. Please try again shortly.' }); }
+  }
+  const probeCtx = { credentialClaudeAccount: _paneName || null, _rlPending: {} };
+  const before = (_paneName ? (readAccountUsageByName(_paneName) || {}) : (readRateLimits() || {})).updated_at || '';
   let settled = false;
   const finish = (ok, extra) => {
-    if (settled) return; settled = true; _usageRefreshing = false;
-    const rl = readRateLimits() || {};
+    if (settled) return; settled = true; delete _usageRefreshing[_guardKey];
+    const rl = _paneName ? (readAccountUsageByName(_paneName) || {}) : (readRateLimits() || {});
     res.json({ ok, updated: !!(rl.updated_at && rl.updated_at !== before), rateLimits: rl, ...(extra || {}) });
   };
   let proc;
@@ -2721,7 +4016,7 @@ app.post('/usage/refresh', (req, res) => {
     proc = spawn('claude', ['-p', 'hi', '--model', 'claude-haiku-4-5-20251001'],
       { cwd: CLAUDE_CWD, env, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) { return finish(false, { error: e.message }); }
-  const scan = chunk => { for (const line of chunk.toString().split('\n')) { if (line) scrapeRateLimits(line); } };
+  const scan = chunk => { for (const line of chunk.toString().split('\n')) { if (line) scrapeRateLimits(line, probeCtx); } };
   proc.stdout.on('data', scan);
   proc.stderr.on('data', scan);
   const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30000);
@@ -2962,6 +4257,14 @@ function watchMsg(engine) {   // [TASK474] engine-aware silence-timeout message 
   return `⏱ ${label} stopped responding (${Math.round(CLAUDE_TIMEOUT_MS/60000)} min timeout) — session reset.`;
 }
 console.log('[Bridge] [TASK474] silence watchdog budget = %d ms (%d min); startup = %d ms', CLAUDE_TIMEOUT_MS, Math.round(CLAUDE_TIMEOUT_MS/60000), CLAUDE_STARTUP_TIMEOUT);
+// [TASK646] durable-send + stall-notify + failed-marking knobs (all env-overridable).
+const STALL_NOTIFY_MS = timerEnv('STALL_NOTIFY_MS', 5 * 60 * 1000);   // no-forward-progress budget before an out-of-band stall notify
+const STALL_SCAN_MS   = timerEnv('STALL_SCAN_MS', 45 * 1000);         // how often the stall watchdog scans live rooms
+const DURABLE_SEND    = process.env.DURABLE_SEND !== '0';             // ACK a chat only after it is durably journaled; else chat_nack
+const FAIL_TTL_MS     = timerEnv('FAIL_TTL_MS', 10 * 60 * 1000);      // a 'failed' journal is non-replayable within this window
+const REAP_FRESH_MS   = timerEnv('REAP_FRESH_MS', 60 * 60 * 1000);    // a .reaped marker only poisons a turn journaled within this window before killTs
+const AUTONOMY_NOTIFY = path.join(process.env.HOME || os.homedir(), 'autonomy-notify.sh');   // out-of-band WhatsApp-to-self (rate-limited, recipient hardcoded)
+console.log('[Bridge] [TASK646] durable_send=%s stall_notify=%dms scan=%dms fail_ttl=%dms', DURABLE_SEND, STALL_NOTIFY_MS, STALL_SCAN_MS, FAIL_TTL_MS);
 // A "warm" room = an empty (no sockets) room whose Claude proc is kept alive so
 // switching away from an idle room doesn't tear it down. Bounded so we never keep
 // too many live Claude procs on the memory-tight container.
@@ -3034,6 +4337,191 @@ const GENERAL_ASSISTANT_PROMPT =
 function userMsgJSON(text) {
   return JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } }) + '\n';
 }
+
+// ===================== [WAKE_V1] durable scheduled-wakeup store + scheduler =====================
+const WAKES_FILE = path.join(os.homedir(), '.claude', 'bridge-wakes.json');
+const WAKE_GRACE_MS = Number(process.env.WAKE_GRACE_MS || 75000);
+const WAKE_FIRING_TIMEOUT_MS = Number(process.env.WAKE_FIRING_TIMEOUT_MS || 180000); // re-queue a wake stuck 'firing' (proc dropped its turn)
+const WAKE_NATIVE_WAIT_MS = Number(process.env.WAKE_NATIVE_WAIT_MS || 180000);        // after a native fire is seen, await its result before falling back
+const WAKE_NATIVE_MATCH_MS = Number(process.env.WAKE_NATIVE_MATCH_MS || 120000);      // [WAKE_V1_NATIVE_PREF] tight window for prompt-matched native attribution
+const WAKE_MAX_ATTEMPTS = Number(process.env.WAKE_MAX_ATTEMPTS || 5);
+const WAKE_MAX_RECORDS = Number(process.env.WAKE_MAX_RECORDS || 500);
+const WAKE_RETENTION_MS = Number(process.env.WAKE_RETENTION_MS || 7 * 24 * 3600e3);
+const WAKE_TERMINAL = new Set(['completed', 'failed', 'canceled', 'superseded']);
+let wakes = {};
+function loadWakes() { try { wakes = JSON.parse(fs.readFileSync(WAKES_FILE, 'utf8')) || {}; } catch { wakes = {}; } }
+function saveWakes() {
+  try {
+    const now = Date.now();
+    for (const [id, w] of Object.entries(wakes)) { if (WAKE_TERMINAL.has(w.state) && (now - (w.updatedAt || 0)) > WAKE_RETENTION_MS) delete wakes[id]; }
+    const ids = Object.keys(wakes);
+    if (ids.length > WAKE_MAX_RECORDS) {
+      ids.map(id => wakes[id]).filter(w => WAKE_TERMINAL.has(w.state)).sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
+        .slice(0, ids.length - WAKE_MAX_RECORDS).forEach(w => delete wakes[w.wakeId]);
+    }
+    const tmp = WAKES_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(wakes), { mode: 0o600 });
+    try { fs.chmodSync(tmp, 0o600); } catch {}
+    fs.renameSync(tmp, WAKES_FILE);
+    try { fs.chmodSync(WAKES_FILE, 0o600); } catch {}
+  } catch (e) { console.error('[Bridge] [WAKE_V1] saveWakes failed:', e.message); }
+}
+// rateLimits.*_resets_at are epoch SECONDS (now=Date.now()/1000 in normalizeUsage). Normalise to ms.
+function wakeResetMs(v) { if (v == null) return null; const n = Number(v); if (!Number.isFinite(n) || n <= 0) return null; return n < 1e12 ? n * 1000 : n; }
+function wakePublic(w) {
+  return { wakeId: w.wakeId, toolUseId: w.toolUseId, roomKey: w.roomKey, prompt: w.prompt, reason: w.reason,
+    delaySeconds: w.delaySeconds, createdAt: w.createdAt, dueAt: w.dueAt, expectedFireAt: w.expectedFireAt,
+    state: w.state, attempts: w.attempts, maxAttempts: w.maxAttempts, nextRetryAt: w.nextRetryAt,
+    lastError: w.lastError, native: !!w.native, updatedAt: w.updatedAt };
+}
+function wakeEmit(w) { try { const S = clientSessions.get(w.roomKey); if (S && S.send) S.send({ type: 'wake_state', wake: wakePublic(w) }); } catch {} }
+function wakeSet(w, patch) { if (!w) return; Object.assign(w, patch, { updatedAt: Date.now() }); saveWakes(); wakeEmit(w); }
+function wakeText(w) { return String(w.prompt || '(scheduled wake-up)'); }
+function _wakeResolve(w, ev, native) {
+  if (!w || WAKE_TERMINAL.has(w.state)) return;
+  if (ev.is_error && Number(ev.api_error_status) === 429) {
+    wakeSet(w, { state: 'rate_limited', native: !!native, lastError: '429 on wake turn', nextRetryAt: Math.max((function () { const _u = wakeAccountUsage(w); return (_u && wakeResetMs(_u.five_hour_resets_at)) || 0; })(), Date.now() + 300000) });   // [WAKE_V1_ACCT_V1] account-scoped reset
+  } else if (!ev.is_error) {
+    wakeSet(w, { state: 'completed', native: !!native, lastError: null });
+  } else {
+    wakeSet(w, { state: 'rate_limited', native: !!native, lastError: 'wake turn error', nextRetryAt: Date.now() + 120000 });
+  }
+}
+// Native detection: unsolicited assistant activity while the room is idle means the SAME live
+// process's timer fired. DEFER only (set nativeSeen); the ensuing RESULT decides the outcome, so a
+// synthetic 429 assistant bubble no longer completes the wake. Prefer a wake whose sessionId matches.
+function _wakePromptNorm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+// [WAKE_V1_ACCT_V1] EXACT normalized full match ONLY. Prefix/truncation matching is removed:
+// overlapping prompts must never match, or a native success could retire the wrong wake (silent loss).
+function _wakePromptMatch(a, b) {
+  a = _wakePromptNorm(a); b = _wakePromptNorm(b);
+  return a.length > 0 && a === b;
+}
+// [WAKE_V1_NATIVE_PREF] Attribute a native fire to a scheduled wake ONLY when the injected prompt
+// text (captured while idle) MATCHES the wake's stored prompt within a tight time window. This is a
+// positive discriminator: an unrelated idle turn cannot match, so it can never falsely retire a wake.
+function wakeObserveNative(S) {
+  const now = Date.now();
+  const inTxt = (S._natInAt && (now - S._natInAt) <= WAKE_NATIVE_MATCH_MS) ? S._natInText : null;
+  if (!inTxt) return;
+  const matches = [];
+  for (const w of Object.values(wakes)) {
+    if (w.roomKey !== S.key || w.state !== 'scheduled') continue;
+    if (now < w.expectedFireAt - WAKE_NATIVE_MATCH_MS || now > w.expectedFireAt + WAKE_NATIVE_MATCH_MS) continue;
+    if (!_wakePromptMatch(inTxt, w.prompt)) continue;
+    matches.push(w);
+  }
+  // [WAKE_V1_ACCT_V1] 0 matches = not ours; >1 = AMBIGUOUS -> fail safe (never attribute/retire),
+  // the bridge fallback then delivers. Only an unambiguous single exact match enables native dedup.
+  if (matches.length !== 1) return;
+  const best = matches[0];
+  S._nativeWakeId = best.wakeId;
+  if (!best.nativePendingAt) { best.nativePendingAt = now; best.nativeSeen = true; best.nativeSeenAt = now; saveWakes(); wakeEmit(best); console.log('[Bridge] [WAKE_V1_NATIVE_PREF] native fire prompt-matched', best.wakeId, 'room', S.key, '(awaiting result)'); }
+}
+function wakeArm(S, tb) {
+  const inp = (tb && tb.input) || {};
+  const delay = Number(inp.delaySeconds);
+  if (!Number.isFinite(delay) || delay <= 0) return;
+  for (const w of Object.values(wakes)) { if (w.toolUseId === tb.id && !WAKE_TERMINAL.has(w.state)) return; }
+  const now = Date.now();
+  const id = (require('crypto').randomUUID ? require('crypto').randomUUID() : 'wake-' + now.toString(36) + Math.random().toString(36).slice(2, 8));
+  const dueAt = now + Math.round(delay * 1000);
+  wakes[id] = { wakeId: id, toolUseId: tb.id || null, roomKey: S.key, sessionId: S.sessionId || null,
+    prompt: String(inp.prompt || ''), reason: String(inp.reason || ''), delaySeconds: delay,
+    createdAt: now, dueAt, expectedFireAt: dueAt, state: 'scheduled', native: false, nativeSeen: false,
+    attempts: 0, maxAttempts: WAKE_MAX_ATTEMPTS, nextRetryAt: null, lastError: null, updatedAt: now };
+  saveWakes(); wakeEmit(wakes[id]);
+  console.log('[Bridge] [WAKE_V1] armed wake', id, 'room', S.key, 'due in', Math.round(delay) + 's');
+}
+// [WAKE_V1_ACCT_V1] resolve THIS wake's room account usage snapshot (there is no global rateLimits
+// in scope; usage is per-account). Falls back to open (unlimited) if the account can't be resolved.
+function wakeAccountUsage(w) {
+  try {
+    const S = clientSessions.get(w.roomKey);
+    const id = paneClaudeIdentity(w.roomKey, S);
+    const raw = id && id.name ? readAccountUsageByName(id.name)
+              : (id && id.email ? readAccountUsageByEmail(id.email) : null);
+    return normalizeUsage(raw) || null;
+  } catch (e) { return null; }
+}
+function wakeRateGate(w) {
+  try {
+    const now = Date.now();
+    const u = wakeAccountUsage(w);
+    if (!u) return { limited: false, resetAt: null };
+    const p5 = u.five_hour_pct, r5 = wakeResetMs(u.five_hour_resets_at);
+    const p7 = u.seven_day_pct, r7 = wakeResetMs(u.seven_day_resets_at);
+    if (p5 != null && p5 >= 100 && r5 && r5 > now) return { limited: true, resetAt: r5 };
+    if (p7 != null && p7 >= 100 && r7 && r7 > now) return { limited: true, resetAt: r7 };
+  } catch {}
+  return { limited: false, resetAt: null };
+}
+function wakeGetRoom(w) {
+  let S = clientSessions.get(w.roomKey);
+  if (S) return S;
+  S = makeSession(w.roomKey);
+  try {
+    if (w.sessionId && sessionFileExists(w.sessionId)) S.sessionId = w.sessionId;
+    else if (sessionFileExists(w.roomKey)) S.sessionId = w.roomKey;
+    restoreRoom(S);
+  } catch (e) { console.log('[Bridge] [WAKE_V1] restoreRoom failed:', e && e.message); }
+  clientSessions.set(w.roomKey, S);
+  return S;
+}
+function wakeDispatch(w) {
+  const gate = wakeRateGate(w);   // [WAKE_V1_ACCT_V1] account-scoped
+  if (gate.limited) { wakeSet(w, { state: 'rate_limited', lastError: 'usage limit', nextRetryAt: Math.max(gate.resetAt || 0, Date.now() + 60000) }); return; }
+  if ((w.attempts || 0) >= w.maxAttempts) { wakeSet(w, { state: 'failed', lastError: 'max attempts reached (' + w.maxAttempts + ')' }); return; }
+  let S;
+  try { S = wakeGetRoom(w); } catch (e) { wakeSet(w, { state: 'rate_limited', lastError: 'room unavailable: ' + e.message, nextRetryAt: Date.now() + 120000 }); return; }
+  const send = S && (typeof S.sendToEngine === 'function' ? (t, m) => S.sendToEngine('claude', t, m) : (typeof S.sendToClaude === 'function' ? S.sendToClaude.bind(S) : null));
+  if (!send) { wakeSet(w, { state: 'rate_limited', lastError: 'no room', nextRetryAt: Date.now() + 120000 }); return; }
+  w.attempts = (w.attempts || 0) + 1;
+  wakeSet(w, { state: 'firing', attempts: w.attempts, lastError: null });   // correlation is via the turn's meta.wakeId in S.inFlight
+  console.log('[Bridge] [WAKE_V1] dispatching wake', w.wakeId, 'room', w.roomKey, 'attempt', w.attempts, '(claude)');
+  try { send(wakeText(w), { wake: true, wakeId: w.wakeId }); }
+  catch (e) { wakeSet(w, { state: 'rate_limited', lastError: 'dispatch failed: ' + e.message, nextRetryAt: Date.now() + 120000 }); }
+}
+// Resolve a wake at a turn RESULT, correlated to the ACTUAL engine-turn queue (not dispatch order).
+function wakeResolveResult(S, ev) {
+  const it = S.inFlight && S.inFlight[0];   // the turn completing now (peeked before the normal shift)
+  if (it && it.meta && it.meta.wake && it.meta.wakeId) {
+    const w = wakes[it.meta.wakeId];
+    if (w && w.state === 'firing') _wakeResolve(w, ev, false);
+    return;
+  }
+  // [WAKE_V1_NATIVE_PREF] a PROMPT-MATCHED native turn (nativePendingAt set) may retire the wake on
+  // SUCCESS (dedup, no fallback). On error/429 it does NOT complete -> clear pending -> bridge redelivers.
+  if ((!S.inFlight || !S.inFlight.length) && S._nativeWakeId) {
+    const w = wakes[S._nativeWakeId]; S._nativeWakeId = null;
+    if (w && w.state === 'scheduled' && w.nativePendingAt) {
+      if (!ev.is_error) wakeSet(w, { state: 'completed', native: true, lastError: null, nativePendingAt: null });
+      else wakeSet(w, { nativePendingAt: null, lastError: 'native turn error; bridge will redeliver' });
+    }
+  }
+}
+function wakeTick() {
+  const now = Date.now();
+  for (const w of Object.values(wakes)) {
+    if (w.state === 'scheduled') {
+      // [WAKE_V1_NATIVE_PREF] while a PROMPT-MATCHED native fire is pending its result, defer the
+      // bridge fallback (dedup). If no result within the bounded window, revert -> bridge delivers (no loss).
+      if (w.nativePendingAt) {
+        if (now < w.nativePendingAt + WAKE_NATIVE_WAIT_MS) continue;
+        wakeSet(w, { nativePendingAt: null, lastError: 'native pending timed out; bridge fallback' });
+      }
+      if (now >= (w.expectedFireAt + WAKE_GRACE_MS)) wakeDispatch(w);
+    } else if (w.state === 'rate_limited' && w.nextRetryAt && now >= w.nextRetryAt) {
+      wakeDispatch(w);
+    } else if (w.state === 'firing' && now >= (w.updatedAt || 0) + WAKE_FIRING_TIMEOUT_MS) {
+      wakeSet(w, { state: 'rate_limited', lastError: 'no result within firing window', nextRetryAt: now + 30000 });
+    }
+  }
+}
+loadWakes();
+if (!global.__WAKE_V1_TICK) { global.__WAKE_V1_TICK = setInterval(() => { try { wakeTick(); } catch (e) {} }, 15000); if (global.__WAKE_V1_TICK.unref) global.__WAKE_V1_TICK.unref(); setTimeout(() => { try { wakeTick(); } catch (e) {} }, 8000); }
+// =================== end [WAKE_V1] ===================
+
 // [ASK_QUESTION_V1] A user turn answering a pending tool_use MUST lead with a tool_result
 // for that id — plain text is not a valid answer to a blocked AskUserQuestion call.
 function toolResultJSON(id, content) {
@@ -3135,12 +4623,47 @@ function _writeRoomMap(m) {
   try { const tmp = ROOM_MAP_FILE + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(m)); fs.renameSync(tmp, ROOM_MAP_FILE); }
   catch (e) { console.log('[Bridge] roomMap write failed:', e.message); }
 }
+// [ACCT_PANE_ISO_V1] Synchronous read-modify-write of a single room's durable fields. No await
+// between load and write => atomic on the single-threaded loop; used for offline (no live S) selection.
+function mergeRoomFields(key, patch) {
+  try { const m = _loadRoomMap(); m[key] = Object.assign({}, m[key], patch, { updatedAt: Date.now() }); _writeRoomMap(m); }
+  catch (e) { console.log('[Bridge] mergeRoomFields failed:', e.message); }
+}
+// [ACCT_PANE_ISO_V1] Does a stored account snapshot exist for this provider+name?
+function accountExists(provider, name) {
+  if (!name) return false;
+  try {
+    if (provider === 'codex') return fs.existsSync(path.join(CODEX_ACCT_DIR, name + '.auth.json'));
+    return fs.existsSync(path.join(ACCT_DIR, name + '.account.json'));
+  } catch (e) { return false; }
+}
+// [ACCT_PANE_ISO_V1] Resolve the account a room's turn runs under: its durable selection when set
+// and still valid, else capture the globally-active account on first use and pin it to the room.
+function resolveRoomAccount(S, provider) {
+  const sel = provider === 'codex' ? (S && S.selCodexAccount) : (S && S.selClaudeAccount);
+  if (sel && accountExists(provider, sel)) return sel;
+  let n = '';
+  try { n = stewardText([provider === 'codex' ? 'active-codex' : 'active-claude']); } catch (e) { n = ''; }
+  if (n && S) { if (provider === 'codex') S.selCodexAccount = n; else S.selClaudeAccount = n; try { persistRoom(S); } catch (e) {} }
+  return n;
+}
+// [ACCT_PANE_ISO_V1] Immutable per-turn attribution snapshot: durable id + display label.
+function acctMeta(provider, S) {
+  const name = provider === 'codex' ? (S && S.credentialCodexAccount) : (S && S.credentialClaudeAccount);
+  if (!name) return null;
+  let id = name, label = name;
+  try {
+    if (provider === 'codex') { const rec = (listCodexAccounts().accounts || []).find(a => a.name === name); label = (rec && rec.email) || name; }
+    else { const d = JSON.parse(fs.readFileSync(path.join(ACCT_DIR, name + '.account.json'), 'utf8')) || {}; label = d.emailAddress || name; id = d.accountUuid || name; }
+  } catch (e) {}
+  return { provider, name, id, label };
+}
 function persistRoom(S) {
   if (!S || !S.key) return;
-  if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride) return;   // nothing durable yet
+  if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride && !S.selClaudeAccount && !S.selCodexAccount) return;   // nothing durable yet
   try {
     const m = _loadRoomMap();
-    m[S.key] = { sessionId: S.sessionId || null, threadId: S.threadId || null, lastEngine: S.lastEngine || null, engineOverride: S.engineOverride || null, updatedAt: Date.now() };
+    m[S.key] = Object.assign({}, m[S.key], { sessionId: S.sessionId || null, threadId: S.threadId || null, lastEngine: S.lastEngine || null, engineOverride: S.engineOverride || null, claudeAccount: S.selClaudeAccount || null, codexAccount: S.selCodexAccount || null, contextOwnerClaudeAccount: S.contextOwnerClaudeAccount || null, contextOwnerSessionId: S.contextOwnerSessionId || null, runtimeDir: S.credentialRuntimeDir || (m[S.key] && m[S.key].runtimeDir) || null, updatedAt: Date.now() });   // [COMPACT_ACCT_STABLE_V1]
     _writeRoomMap(m);
   } catch (e) { console.log('[Bridge] persistRoom failed:', e.message); }
 }
@@ -3153,6 +4676,17 @@ function clearRoom(key) {
   } catch {}
 }
 const _ROOM_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// [ROOM_RUNTIME_DIR_FIX_V1] Authoritative Claude config dir for a room. The live Claude runs in the
+// dir captured at spawn (S.credentialRuntimeDir) / persisted (runtimeDir); a draft->session rekey
+// makes roomClaudeConfigDir(account,key) point elsewhere. Prefer the real dir; fall back to recompute.
+function _rmRuntimeDir(S, fallbackDir) {
+  try {
+    if (S && S.credentialRuntimeDir && _rmRealDir(S.credentialRuntimeDir)) return S.credentialRuntimeDir;
+    const rec = (S && S.key) ? _loadRoomMap()[S.key] : null;
+    if (rec && rec.runtimeDir && _rmRealDir(rec.runtimeDir)) return rec.runtimeDir;
+  } catch (e) {}
+  return fallbackDir;
+}
 function restoreRoom(S) {
   if (!S || !S.key) return;
   const rec = _loadRoomMap()[S.key];
@@ -3160,12 +4694,17 @@ function restoreRoom(S) {
     if (!S.sessionId && rec.sessionId && sessionFileExists(rec.sessionId)) S.sessionId = rec.sessionId;
     if (!S.threadId && rec.threadId && codexRolloutExists(rec.threadId)) S.threadId = rec.threadId;
     if (rec.lastEngine) S.lastEngine = rec.lastEngine;
+    if (!S.credentialRuntimeDir && rec.runtimeDir && _rmRealDir(rec.runtimeDir)) S.credentialRuntimeDir = rec.runtimeDir;   // [ROOM_RUNTIME_DIR_FIX_V1]
     if (rec.engineOverride) S.engineOverride = rec.engineOverride;
+    if (rec.claudeAccount) S.selClaudeAccount = rec.claudeAccount;   // [ACCT_PANE_ISO_V1] durable per-room account selection
+    if (rec.codexAccount) S.selCodexAccount = rec.codexAccount;
+    if (rec.contextOwnerClaudeAccount) S.contextOwnerClaudeAccount = rec.contextOwnerClaudeAccount;   // [COMPACT_ACCT_STABLE_V1] account that owns this session context
+    if (rec.contextOwnerSessionId) S.contextOwnerSessionId = rec.contextOwnerSessionId;
   }
   // [CODEX_DURABLE_V3] If a stored handle no longer validates, rewrite (or clear) the
   // record so we don't keep resurrecting a dead session/thread id.
   if (rec && (rec.sessionId !== (S.sessionId || null) || rec.threadId !== (S.threadId || null))) {
-    if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride) clearRoom(S.key);
+    if (!S.sessionId && !S.threadId && !S.lastEngine && !S.engineOverride && !S.selClaudeAccount && !S.selCodexAccount) clearRoom(S.key);
     else persistRoom(S);
   }
   // Legacy fallback ONLY: some older rooms are keyed by the Codex thread id itself.
@@ -3184,7 +4723,7 @@ const CONF_MAX_ROUNDS_DEFAULT = 16;   // [CONFERENCE_CAP16] was 4
 const CONF_HARD_ROUND_CAP = 16;   // [CONFERENCE_CAP16] was 8
 function confFile(key) { return path.join(CONF_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
 function confLoad(key) { try { return JSON.parse(fs.readFileSync(confFile(key), 'utf8')); } catch { return null; } }
-function confSave(S) { if (!S || !S.conf) return; try { fs.mkdirSync(CONF_DIR, { recursive: true }); fs.writeFileSync(confFile(S.key), JSON.stringify(S.conf)); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confSave failed:', e.message); } }
+function confSave(S) { if (!S || !S.conf) return; try { fs.mkdirSync(CONF_DIR, { recursive: true }); S.conf.rev = (S.conf.rev || 0) + 1; fs.writeFileSync(confFile(S.key), JSON.stringify(S.conf)); try { S._confLoadedMtime = fs.statSync(confFile(S.key)).mtimeMs; } catch (e2) {} } catch (e) { console.log('[Bridge] [CONFERENCE_V1] confSave failed:', e.message); } }
 
 // ── [CONF_ROOM_ASSOC_V1] Auto-register a promoted conference room into its linked task ──
 // One-way link fix: when a conference is linked to a task, register the room's CANONICAL
@@ -3304,6 +4843,11 @@ function confReconcileRegistrations() {
 // never from any field in the payload: a client cannot claim ownership of a conf: row
 // by sending owner:'conf' or an inflated rev.
 const ROW_NS_CONF = 'conf:';
+// [HIDE_BUBBLE_V1] Per-room hidden message ids (UI-only; the .jsonl transcript is never touched).
+function roomHiddenMids(key) {
+  const rec = key && chatData[key];
+  return (rec && Array.isArray(rec.hiddenMids)) ? rec.hiddenMids : [];
+}
 function _rowUuid() {
   try { return require('crypto').randomUUID(); }
   catch (e) { return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12); }
@@ -3613,6 +5157,52 @@ function confLogToMessages(c) {
 // error banner (not real work). Used to stop an errored/limited implementation turn from
 // being handed to the reviewer as if the lead had produced something to verify.
 const _CONF_JUNK_RE = /(hit your (session|usage) limit|session limit|usage limit|rate limit|resets?\s*\d|try again (later|in)|temporarily unavailable|overloaded|service unavailable|api error|context.{0,20}exceeded)/i;
+
+// [CONF_LIMIT_PAUSE_V1] A usage/session/rate-limit or 429 banner is not a real turn.
+// Strongly-identifying phrases only (no standalone "capacity"/"quota") to avoid pausing
+// a turn that merely discusses limits.
+const _CONF_LIMIT_RE = /(hit your (session|usage) limit|session limit reached|usage limit reached|reached your usage limit|rate[- ]?limit(ed)?|\b429\b|too many requests|quota exceeded|insufficient_quota|capacity limit|over capacity|overloaded|service unavailable|temporarily unavailable|resets?\s*\d)/i;
+// [CONF_LIMIT_BANNER_V1] Banner-SHAPED matcher: a known provider limit message anchored
+// at the START of the text. Distinguishes a real system banner from prose that mentions limits.
+const _CONF_LIMIT_BANNER_RE = /^(you(?:'ve| have)? (?:hit|reached) (?:your )?(?:session|usage|rate) limit|(?:session|usage|rate) limit reached|reached your usage limit|rate[- ]?limited\b|\b429\b|too many requests|quota exceeded|insufficient_quota|overloaded\b|over capacity|capacity limit|service unavailable|temporarily unavailable)/i;
+function _confHasVerdictBlock(raw) {
+  const m = String(raw || '').match(/<<<CONFERENCE_VERDICT\s*([\s\S]*?)\s*CONFERENCE_VERDICT>>>/);
+  if (!m) return false;
+  try { const j = JSON.parse(m[1].trim()); return !!(j && (j.verdict === 'approve' || j.verdict === 'revise' || j.verdict === 'blocked')); } catch (e) { return false; }
+}
+// Classify a completed turn's text (+ optional structured error state) as a limit/error banner.
+function confIsLimitTurn(raw, S, stage) {
+  const err = S && S._confResultErr;
+  if (err && err.isError && (err.status === 429 || /overloaded|rate.?limit|too.?many|unavailable|capacity/i.test(String(err.subtype || '')))) return true;
+  const t = String(raw || '').trim();
+  if (stage === 'final') {
+    // [CONF_LIMIT_BANNER_V1] No verdict-block protection in final, and a real synthesis can
+    // legitimately DISCUSS rate limits — so length alone is not enough. Require a genuinely
+    // banner-shaped response: a known provider limit banner at the very start of a short
+    // message (structured 429 already returned true above).
+    if (t.length >= 200) return false;
+    const head = t.replace(/^[^A-Za-z0-9]{0,8}/, '');
+    return _CONF_LIMIT_BANNER_RE.test(head);
+  }
+  if (!_CONF_LIMIT_RE.test(t)) return false;
+  return t.length < 300 && !_confHasVerdictBlock(t);            // a real discussion turn is long and/or carries a valid verdict block
+}
+// Nonterminal, resumable pause: record NOTHING (no verdict, no round, no log entry),
+// keep stage/subphase/round/engines + activeTurnId so Resume replays the SAME turn.
+function confLimitPause(S, engine) {
+  const c = S && S.conf; if (!c) return;
+  const engineLabel = engine === 'codex' ? 'Codex' : 'Claude';
+  c.status = 'paused';
+  c.pausedReason = engineLabel + ' hit a usage/session/rate limit during ' + confStageLabel(c.stage, c.taskType) + '. The turn was not counted - Resume when the limit resets to continue exactly where it stopped.';
+  c.limitPaused = true;                                          // resume marker for confResume same-turn replay
+  S._confTurnId = null; c._acc = ''; c._accParts = ''; S._confResultErr = null;
+  c.retryGen = (c.retryGen || 0) + 1;                            // invalidate any stale retry timer
+  try { confSave(S); } catch (e) {}
+  confSendStatus(S);
+  S.send({ type: 'status', text: c.pausedReason });
+  S.send({ type: 'done', code: 0 });
+  console.log('[Bridge] [CONF_LIMIT_PAUSE_V1] limit pause', engineLabel, 'room', S.key, 'stage', c.stage, 'round', c.round);
+}
 // Restriction mode per stage. Only 'write' (implementation) permits mutations
 // (edits, deploys, browser navigation/clicks/etc). Everything else is read-only.
 // Consumed by spawnProc (Claude flags), _runCodexTurn (Codex sandbox) and the shim.
@@ -3666,10 +5256,16 @@ function confRolePreamble(S, engine) {
         : '') + '\n\n';
   }
 
+  // [SSH_RO_BROKER_V1] Tell both engines about the read-only SSH research tool when the broker
+  // is installed in this tenant's HOME, so they gather host evidence themselves instead of
+  // asking the user to paste command output. Gated on existsSync => tenants without it are unchanged.
+  const _sshRoBrokerJsPrompt = path.join(process.env.HOME || os.homedir(), 'ssh-ro-broker', 'ssh-ro-broker.js');
+  let _sshRoHint = '';
+  try { if (fs.existsSync(_sshRoBrokerJsPrompt)) _sshRoHint = ' A read-only SSH research tool is also available this stage: the ssh_ro MCP (tools ssh_read and ssh_list_hosts) runs read-only commands on the remote hosts "castle" and "adlux" (e.g. ssh_read host=castle command="docker stats --no-stream"). PREFER IT \u2014 gather host evidence yourself via ssh_read instead of asking the user to paste command output. It is strictly read-only; mutating commands are refused.'; } catch (e) {}
   const readOnly = 'HARD RULE for this stage: you are in READ-ONLY mode. Do NOT edit files, run mutating shell commands, ' +
     'deploy, restart services, or mutate the browser (navigate/click/type/press/upload/eval/close). The bridge ENFORCES ' +
     'this: those tools are disabled and any attempt is blocked and PAUSES the conference for the user. Investigate only by ' +
-    'read-only means (read files, search, read logs, read-only browser snapshots/screenshots) and reason carefully. ';
+    'read-only means (read files, search, read logs, read-only browser snapshots/screenshots) and reason carefully.' + _sshRoHint + ' ';
 
   // [CONF_TASKTYPE_V1] Universal in both modes: never fabricate the user's intent.
   const noInvent = ' UNIVERSAL RULE: never invent the user\'s intent. If the intended behaviour or scope is ambiguous or ' +
@@ -3713,6 +5309,9 @@ function confRolePreamble(S, engine) {
     s += 'Consensus was reached and the implementation verified. Produce the polished, user-facing synthesis that resolves ' +
       'the objective, incorporating the collaboration. You are in READ-ONLY mode. Do NOT append a verdict block.';
   }
+  // [SSH_RO_BROKER_V1] verification + final are ALSO read-only stages but build their own
+  // prompt text (not the readOnly const), so surface the ssh_ro hint here too (AC2: all read-only stages).
+  if (_sshRoHint && (stage === 'verification' || stage === 'final')) s += _sshRoHint;
   return s;
 }
 
@@ -3781,16 +5380,17 @@ function confDispatch(S, reuseTurnId, opts) {
   // spawned under a different mode; spawnProc re-reads the stage and applies flags.
   if (engine === 'claude') {
     const need = confRestrictionMode(c);
-    if (S.currentProc && S.procEngine === 'claude' && !S.processing && (S._spawnedConfMode !== need || S.pendingCredentialRefresh)) {
+    if (S.currentProc && S.procEngine === 'claude' && !S.processing && (S._spawnedConfMode !== need || S.pendingClaudeCredentialRefresh)) {
+      const _acctRetire = S.pendingClaudeCredentialRefresh;
       try { S.currentProc.kill('SIGKILL'); } catch {}
-      S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false;   // [CONF_ACCT_SWITCH_V1] retire the idle worker so this turn respawns under the new account
+      S.currentProc = null; S.procEngine = null; S.pendingClaudeCredentialRefresh = false; if (_acctRetire) S.credentialClaudeAccount = null;   // [ACCT_PANE_ISO_V1] retire the idle worker so this turn respawns under the newly-selected account
     }
   }
   const turnId = reuseTurnId || _confNewTurnId();
   c.activeTurnId = turnId;
   c.activeTurnStartedAt = Date.now();   // [BUBBLE_TS_V1] the ONE instant for this turn's divider AND its bubble, live and after reload
   S._confTurnId = turnId;
-  c._acc = ''; c._accParts = '';
+  c._acc = ''; c._accParts = ''; S._confResultErr = null; c.limitPaused = false;   // [CONF_LIMIT_PAUSE_V1]
   const prompt = confBuildPrompt(S, engine);
   if (!opts.isRetry) _confConsumeInterjections(S);
   confClearDenials(S.key);   // fresh denial window for this turn
@@ -3799,7 +5399,7 @@ function confDispatch(S, reuseTurnId, opts) {
            stage: c.stage, stageLabel: confStageLabel(c.stage, c.taskType), subphase: c.subphase, round: c.round,
            turnId, ts: c.activeTurnStartedAt, restriction: confRestrictionMode(c) });   // [BUBBLE_TS_V1]
   confSendStatus(S);
-  try { S.sendToEngine(engine, prompt); }
+  try { S.sendToEngine(engine, prompt, (opts && opts.firstSpawn) ? { instructionPlacement: 'append' } : undefined); }   // [ROOM_INSTR_INJECT_V1]
   catch (e) { console.log('[Bridge] [CONFERENCE_V2] dispatch failed:', e.message); c.status = 'paused'; c.pausedReason = 'dispatch-error'; confSave(S); confSendStatus(S); }
 }
 
@@ -3919,6 +5519,50 @@ function confReclaimRetry(S) {
   }
 }
 // [CONF_CRED_RETRY_V1] Boot reclamation sweep for pending credential-retry leases.
+// [CONF_WATCHDOG_V1 · TASK #181] Authoritative recovery of a committed-turn orphan,
+// triggered by the external conf-watchdog.js over an authenticated WS control frame.
+// Coordinates with (never races) the credential-retry reconciler: refuses whenever a
+// live pendingRetry lease exists or the turn is genuinely in flight, and only ever
+// redispatches a durable-but-orphaned active turn (reusing its turn id).
+let _CONF_WD_SECRET = null;
+function confWatchdogSecret() {
+  if (_CONF_WD_SECRET === null) {
+    try {
+      const home = process.env.HOME || require('os').homedir() || '/home/bridge-peter';
+      _CONF_WD_SECRET = fs.readFileSync(path.join(home, '.claude', 'conf-watchdog.secret'), 'utf8').trim();
+    } catch (e) { _CONF_WD_SECRET = ''; }
+  }
+  return _CONF_WD_SECRET;
+}
+function confWatchdogRecover(S) {
+  const c = S && S.conf;
+  if (!c) return 'INELIGIBLE';
+  if (c.status === 'superseded') return 'INELIGIBLE';
+  // Definitive false-positive guard: a genuinely in-flight conference turn.
+  if (S.processing && S._confTurnId && S._confTurnId === c.activeTurnId) return 'SKIPPED_LIVE';
+  if (!c.activeTurnId) return 'INELIGIBLE';
+  if (c._afterTurn) return 'INELIGIBLE';                       // a deliberate stop/pause transition is pending
+  // Agreed scope: recover ONLY committed turns (pendingRetry === null). ANY
+  // non-null pendingRetry (scheduled/dispatching/claiming, live or expired) is
+  // owned by the credential-retry reconciler; never take it over here.
+  if (c.pendingRetry) return 'INELIGIBLE';
+  if (c.status === 'running') {
+    try {
+      c.retryGen = (c.retryGen || 0) + 1;                     // invalidate any stale confRetryFire timer
+      confDispatch(S, c.activeTurnId, { isRetry: true });     // reuse the durable turn id; re-emit the prompt
+      console.log('[Bridge] [CONF_WATCHDOG_V1] recovered running-orphan', S.key, c.activeTurnId);
+      return 'RECOVERED';
+    } catch (e) { console.log('[Bridge] [CONF_WATCHDOG_V1] recover failed:', e.message); return 'ERROR'; }
+  }
+  if (c.status === 'paused') {
+    const reason = String(c.pausedReason || '');
+    const safe = /^The active turn was interrupted \(/.test(reason) && !/cancel|reset|\buser\b/i.test(reason);
+    if (!safe) return 'INELIGIBLE';
+    try { confResume(S); console.log('[Bridge] [CONF_WATCHDOG_V1] resumed interrupted-pause', S.key); return 'RECOVERED'; }
+    catch (e) { console.log('[Bridge] [CONF_WATCHDOG_V1] resume failed:', e.message); return 'ERROR'; }
+  }
+  return 'INELIGIBLE';
+}
 function confResumeRetries() {
   let files = [];
   try { files = fs.existsSync(CONF_DIR) ? fs.readdirSync(CONF_DIR).filter(function (f) { return f.endsWith('.json'); }) : []; } catch (e) { return; }
@@ -3995,7 +5639,7 @@ function confStart(S, brief, opts) {
   S.send({ type: 'conf_started', reqId: S.conf.startReqId || null, task: S.conf.task || null, leadEngine: lead, reviewEngine: review, maxRounds, brief: S.conf.brief, taskType: _tt.type,
            stage: 'diagnosis', stageLabel: confStageLabel('diagnosis', _tt.type) });
   try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1] already-real room fast path
-  confDispatch(S);
+  confDispatch(S, null, { firstSpawn: true });   // [ROOM_INSTR_INJECT_V1] append room instructions on the first conference dispatch
 }
 
 function confValidReqId(r) { return typeof r === 'string' && /^[a-zA-Z0-9_-]{8,64}$/.test(r); }
@@ -4143,8 +5787,8 @@ function confResume(S) {
   const c = S.conf; if (!c || c.status !== 'paused') return;
   // [CONF_CRED_RETRY_V1] A deliberate resume grants a fresh credential-attempt budget and
   // re-dispatches the SAME stranded turn (never mints a new one / double-consumes interjections).
-  if (c.activeTurnId && (c.pendingRetry || (c.spawnRetries || 0) > 0)) {
-    c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;
+  if (c.activeTurnId && (c.pendingRetry || (c.spawnRetries || 0) > 0 || c.limitPaused)) {   // [CONF_LIMIT_PAUSE_V1]
+    c.spawnRetries = 0; c.pendingRetry = null; c.limitPaused = false; c.retryGen = (c.retryGen || 0) + 1;
     c.status = 'running'; c.pausedReason = null; c._afterTurn = null;
     let _retract = [];   // [CONF_ROWID_V1] the ONE legal delete: an explicitly retracted conclusion
     if (c.concluded && Array.isArray(c.log) && c.log.length && c.log[c.log.length - 1].role === 'conclusion') { const _p = c.log.pop(); c.concluded = false; if (_p && _p.turnId) _retract = ['conf:' + _p.turnId]; }
@@ -4256,13 +5900,14 @@ function confCompleteLinkedTasks(S) {
 function confComplete(S, finalStatus) {
   const c = S.conf;
   c.status = finalStatus || 'done'; c.finishedAt = Date.now(); c.activeTurnId = null;
+  let genuineFinal = false;   // [CONF_TASK_COMPLETE_V2] true ONLY on a real, non-junk final synthesis
   // [CONFERENCE_CONCLUDE_V1] A GOOD final-stage turn IS the conclusion (no mechanical
   // recap that would duplicate/dilute it). Only fall back to the deterministic summary
   // when there is no usable final response (stopped early, or final produced empty/junk).
   if (c.stage === 'final' && c.status === 'done') {
     const lastFinal = ((c.log || []).slice().reverse()).find(e => e.stage === 'final' && e.role !== 'conclusion');
     const good = lastFinal && String(lastFinal.text || '').trim().length > 0 && !_CONF_JUNK_RE.test(lastFinal.text || '');
-    if (good) c.concluded = true;
+    if (good) { c.concluded = true; genuineFinal = true; }
     else confPushConclusion(S, 'The final synthesis did not produce usable output; summarising automatically.');
   } else {
     confPushConclusion(S, c.pausedReason || 'The conference was stopped before a verified final synthesis.');
@@ -4272,7 +5917,7 @@ function confComplete(S, finalStatus) {
   confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
   confSendStatus(S);
   S.send({ type: 'done', code: 0 });
-  if (c.stage === 'final' && c.status === 'done') { try { confCompleteLinkedTasks(S); } catch (e) {} }   // [CONF_TASK_COMPLETE_V1] success-only, fail-soft
+  if (genuineFinal) { try { confCompleteLinkedTasks(S); } catch (e) {} }   // [CONF_TASK_COMPLETE_V2] auto-complete ONLY on a genuine final synthesis, not the deterministic-summary fallback
   console.log('[Bridge] [CONFERENCE_V2] conference', c.status, 'room', S.key, 'stage', c.stage);
   return true;
 }
@@ -4369,6 +6014,7 @@ function confFinishTurn(S, engine) {
   if (!c || (c.status !== 'running' && c.status !== 'stopping')) return false;
   if (!S._confTurnId || S._confTurnId !== c.activeTurnId) { console.log('[Bridge] [CONFERENCE_V2] stale/duplicate finish ignored', S.key); return false; }
   const raw = String(c._acc || c._accParts || '').trim();
+  if (confIsLimitTurn(raw, S, c.stage)) { confLimitPause(S, engine); return true; }   // [CONF_LIMIT_PAUSE_V1] no verdict, no round, no log entry
   const isFinal = (c.stage === 'final');
   const parsed = isFinal ? { verdict: { verdict: 'approve', stage: 'final', remainingIssues: [] }, visible: raw }
                          : confExtractVerdict(raw, c.stage);
@@ -4380,7 +6026,7 @@ function confFinishTurn(S, engine) {
                text: parsed.visible, verdict: parsed.verdict.verdict, verdictStage: parsed.verdict.stage || null, ts: Date.now(), rowCreatedAt: _rowCreatedAt });
   c.lastByEngine = c.lastByEngine || {}; c.lastByEngine[engine] = parsed.visible;
   c.stageVerdicts = c.stageVerdicts || {}; c.stageVerdicts[engine] = parsed.verdict.verdict;
-  c.activeTurnId = null; S._confTurnId = null; c._acc = ''; c._accParts = '';
+  c.activeTurnId = null; S._confTurnId = null; c._acc = ''; c._accParts = ''; S._confResultErr = null;   // [CONF_LIMIT_PAUSE_V1]
   c.spawnRetries = 0; c.pendingRetry = null; c.retryGen = (c.retryGen || 0) + 1;   // [CONF_CRED_RETRY_V1]
   confSave(S);   // persist response + cleared active turn BEFORE advancing
   confMirrorToChat(S.key, c);   // [CONF_CONTAINED_V1]
@@ -4399,10 +6045,12 @@ function confFinishTurn(S, engine) {
 function confRecover(S) {
   const disk = confLoad(S.key);
   if (!disk) return;
+  let _diskMtime = 0; try { _diskMtime = fs.statSync(confFile(S.key)).mtimeMs; } catch (e) {}   // [CONF_LIMIT_PAUSE_V1]
   // [CONF_SUPERSEDED_IDLE_V1] Tell the client this room has no live conference before returning,
   // otherwise a client that adopted conference mode for the old key keeps tagging its messages.
   if (disk.status === 'superseded') { try { S.send({ type: 'conf_status', status: 'idle', roomId: S.key }); } catch (e) {} return; }   // inert tombstone from an atomic rekey
-  if (!S.conf) S.conf = disk;
+  if (!S.conf) { S.conf = disk; S._confLoadedMtime = _diskMtime; }
+  else if (_diskMtime > (S._confLoadedMtime || 0) && !S.processing) { S.conf = disk; S._confLoadedMtime = _diskMtime; }   // [CONF_LIMIT_PAUSE_V1] out-of-band disk re-arm surfaces without a restart
   const c = S.conf;
   try { confRegisterRoom(S); } catch (e) {}   // [CONF_ROOM_ASSOC_V1]
   confSendStatus(S);
@@ -4444,44 +6092,236 @@ const clientSessions = new Map();   // clientId -> session state (survives recon
 // avoid loops. All three helpers are no-ops when RESUME_TURNS is unset.
 const PENDING_DIR = path.join(process.env.HOME || os.homedir(), '.claude', 'bridge-pending');
 function pendingFile(key) { return path.join(PENDING_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.json'); }
+// [TASK646C] Durable per-room records for exactly-once + recoverable failures.
+const DONE_TTL_MS = timerEnv('DONE_TTL_MS', 7 * 24 * 60 * 60 * 1000);   // [TASK646E] completed reqId stays dedup-able >= max client outbox lifetime (client ages entries to match)
+function pendingDoneFile(key) { return path.join(PENDING_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.done.json'); }
+function pendingFailedFile(key) { return path.join(PENDING_DIR, String(key).replace(/[^A-Za-z0-9_-]/g, '_') + '.failed.json'); }
+function _readJsonSafe(fp, dflt) { try { const v = JSON.parse(fs.readFileSync(fp, 'utf8')); return v == null ? dflt : v; } catch { return dflt; } }
+function recordDone(key, reqIds) {   // remember COMPLETED/aborted reqIds so a later resend converges instead of re-running
+  if (!Array.isArray(reqIds) || !reqIds.length) return true;   // [TASK646F] nothing to persist = success
+  try {
+    fs.mkdirSync(PENDING_DIR, { recursive: true });
+    const now = Date.now(), fp = pendingDoneFile(key);
+    let list = _readJsonSafe(fp, []); if (!Array.isArray(list)) list = [];
+    const have = new Set(list.map(e => e && e.id));
+    for (const id of reqIds) if (id && !have.has(id)) { list.push({ id, ts: now }); have.add(id); }
+    list = list.filter(e => e && (now - (e.ts || 0)) < DONE_TTL_MS);   // [TASK646F] TTL-only retention: cover EVERY identity the 7d client outbox could still resend (no count eviction)
+    if (list.length) fs.writeFileSync(fp, JSON.stringify(list)); else { try { fs.unlinkSync(fp); } catch {} }
+    return true;
+  } catch (e) { return false; }
+}
+function isReqDone(key, reqId) {
+  if (!reqId) return false;
+  const now = Date.now();
+  const list = _readJsonSafe(pendingDoneFile(key), []);
+  return Array.isArray(list) && list.some(e => e && e.id === reqId && (now - (e.ts || 0)) < DONE_TTL_MS);
+}
+let _failRecSeq = 0;   // [TASK646F]
+function recordFailed(key, rec) {   // durable, client-visible failed turn (delivered on attach; removed on failed_ack)
+  try {
+    fs.mkdirSync(PENDING_DIR, { recursive: true });
+    const fp = pendingFailedFile(key);
+    let list = _readJsonSafe(fp, []); if (!Array.isArray(list)) list = [];
+    // [TASK646E] Preserve EACH queued turn independently. Prefer rec.items ({reqId,text}); fall
+    // back to zipping rec.reqIds with a single rec.text (legacy callers) so no queued turn is lost.
+    const _items = (Array.isArray(rec.items) && rec.items.length)
+      ? rec.items.map(it => ({ reqId: (it && it.reqId) || null, text: (it && it.text) || null }))
+      : ((Array.isArray(rec.reqIds) && rec.reqIds.length)
+          ? rec.reqIds.map((r, i) => ({ reqId: r || null, text: i === 0 ? (rec.text || null) : null }))
+          : (rec.text ? [{ reqId: null, text: rec.text }] : []));
+    list.push({ id: 'f-' + Date.now() + '-' + (++_failRecSeq), items: _items, reqIds: _items.map(it => it.reqId).filter(Boolean), reason: String(rec.reason || 'failed'), ts: Date.now() });   // [TASK646F] id enables per-record ack
+    const now = Date.now();
+    list = list.filter(e => e && (now - (e.ts || 0)) < FAIL_TTL_MS).slice(-20);
+    if (list.length) fs.writeFileSync(fp, JSON.stringify(list)); else { try { fs.unlinkSync(fp); } catch {} }
+  } catch (e) {}
+}
+function flushFailed(S, ws) {   // [TASK646F] deliver durable failed records to a socket; KEEP them (replayable) until a failed_ack
+  try {
+    const fp = pendingFailedFile(S.key);
+    const now = Date.now();
+    let list = _readJsonSafe(fp, []);
+    if (!Array.isArray(list)) list = [];
+    const live = list.filter(e => e && (now - (e.ts || 0)) < FAIL_TTL_MS);   // prune only TTL-expired
+    if (live.length !== list.length) { try { if (live.length) fs.writeFileSync(fp, JSON.stringify(live)); else fs.unlinkSync(fp); } catch {} }
+    if (!live.length) return;
+    for (const e of live) {
+      const _items = Array.isArray(e.items) ? e.items : (Array.isArray(e.reqIds) ? e.reqIds.map((r, i) => ({ reqId: r, text: i === 0 ? (e.text || null) : null })) : []);
+      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'turn_failed', roomId: S.key, id: e.id || null, items: _items, reqIds: _items.map(it => it && it.reqId).filter(Boolean), reason: e.reason, text: (_items[0] && _items[0].text) || null, durable: true })); } catch (er) {}
+    }
+  } catch (e) {}
+}
+function ackFailed(key, ids) {   // [TASK646F] client confirmed receipt -> drop those durable failed records
+  if (!Array.isArray(ids) || !ids.length) return;
+  try {
+    const fp = pendingFailedFile(key);
+    let list = _readJsonSafe(fp, []); if (!Array.isArray(list)) return;
+    const keep = list.filter(e => e && !ids.includes(e.id));
+    if (keep.length !== list.length) { if (keep.length) fs.writeFileSync(fp, JSON.stringify(keep)); else { try { fs.unlinkSync(fp); } catch {} } }
+  } catch (e) {}
+}
+// [TASK646D] One-shot scan of live engine processes (used only at startup replay).
+function _scanOrphanProcs() {
+  try {
+    const out = require('child_process').execFileSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 4000, maxBuffer: 8 * 1024 * 1024 });
+    const rows = [];
+    for (const line of out.split('\n')) { const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/); if (m) rows.push({ pid: +m[1], ppid: +m[2], args: m[3] }); }
+    return rows;
+  } catch (e) { return []; }
+}
+// Match a pending journal to a surviving child by its resume identity (session/thread id),
+// requiring an engine token in argv so an incidental id substring can't false-match.
+function _findOrphanFor(j, procs) {
+  const needles = [];
+  if (j && j.sessionId) needles.push(String(j.sessionId));
+  if (j && j.threadId) needles.push(String(j.threadId));
+  if (!needles.length) return null;
+  // [TASK646E] PPID===1 means the process was reparented to init — its real parent (the
+  // previous bridge) is gone, so this is a TRUE orphan, never a live bridge's active worker.
+  return procs.find(p => p.ppid === 1 && /(^|\/|\s)(claude|codex)(\s|$)/.test(p.args) && needles.some(n => n && p.args.includes(n))) || null;
+}
 function journalPending(S) {
-  if (!RESUME_TURNS) return;
+  // [TASK646B] Durability no longer depends on RESUME_TURNS: DURABLE_SEND alone is
+  // enough to journal (so a chat can be ACKed only once it is on disk). Returns
+  // true when persisted/cleared, false on write error (callers nack+rollback),
+  // undefined when gated off (legacy best-effort — no ack, no nack).
+  if (!RESUME_TURNS && !DURABLE_SEND) return;
   try {
     if (S.inFlight && S.inFlight.length) {
       fs.mkdirSync(PENDING_DIR, { recursive: true });
       let _attempts = 0;   // [CODEX_DURABLE_V5] carry the replay-attempt count forward so rewrites don't reset the ceiling
       try { const _p = JSON.parse(fs.readFileSync(pendingFile(S.key), 'utf8')); if (_p && _p.attempts) _attempts = _p.attempts; } catch {}
-      fs.writeFileSync(pendingFile(S.key), JSON.stringify({ key: S.key, sessionId: S.sessionId || null, threadId: S.threadId || null, engine: S.pendingEngine || S.procEngine || S.engineOverride || null, attempts: _attempts, turns: S.inFlight.slice(), ts: Date.now() }));
+      fs.writeFileSync(pendingFile(S.key), JSON.stringify({ key: S.key, sessionId: S.sessionId || null, threadId: S.threadId || null, engine: S.pendingEngine || S.procEngine || S.engineOverride || null, attempts: _attempts, turns: S.inFlight.slice(), reqIds: (Array.isArray(S._inflightReqIds) ? S._inflightReqIds.slice() : []), ts: Date.now() }));   // [TASK646B] persist reqIds so replay + resend converge
     } else {
       try { fs.unlinkSync(pendingFile(S.key)); } catch {}
     }
-  } catch (e) { console.log('[Bridge] journalPending failed:', e.message); }
+    return true;   // [TASK646B]
+  } catch (e) { console.log('[Bridge] journalPending failed:', e.message); return false; }
 }
 function clearPending(key) {
-  if (!RESUME_TURNS) return;
-  try { fs.unlinkSync(pendingFile(key)); } catch {}
+  if (!RESUME_TURNS && !DURABLE_SEND) return;
+  let _S; try { _S = clientSessions.get(key); } catch (e) {}
+  const _rids = (_S && Array.isArray(_S._inflightReqIds)) ? _S._inflightReqIds.slice() : [];
+  // [TASK646F] Persist completion BEFORE removing inflight state. If the .done write fails,
+  // keep a recoverable inflight journal marked status:'done' (replay finishes the transition)
+  // instead of deleting both and opening a resend-reexecution hole.
+  let _cleared = false;
+  if (_rids.length) {
+    if (recordDone(key, _rids)) { try { fs.unlinkSync(pendingFile(key)); } catch {} _cleared = true; }
+    else { try { const j = _readJsonSafe(pendingFile(key), null); if (j) { j.status = 'done'; j.doneReqIds = _rids; j.doneTs = Date.now(); fs.writeFileSync(pendingFile(key), JSON.stringify(j)); _cleared = true; } } catch {} }
+  } else {
+    try { fs.unlinkSync(pendingFile(key)); } catch {}
+    _cleared = true;
+  }
+  // [TASK646G] Drop in-memory identifiers ONLY once completion is durably recorded OR the journal
+  // is durably marked done. If BOTH writes failed, RETAIN them: a later clearPending retries the
+  // transition, and live resend-dedup still works for this process lifetime. (A completed turn is
+  // never silently forgotten.)
+  if (_cleared && _S) { _S._inflightReqIds = []; _S._pendingReqIds = []; }
 }
 function replayPending() {
-  if (!RESUME_TURNS) return;
+  if (!RESUME_TURNS && !DURABLE_SEND) return;
   let files = [];
-  try { files = fs.readdirSync(PENDING_DIR).filter(f => f.endsWith('.json')); } catch { return; }
+  try { files = fs.readdirSync(PENDING_DIR).filter(f => f.endsWith('.json') && !f.endsWith('.done.json') && !f.endsWith('.failed.json')); } catch { return; }   // [TASK646G] exclude dedup/failed sidecars — they are not inflight journals and must survive restart
+  // [TASK646B] Load reaper poison markers once. A marker is correlated to a journal by
+  // session id (claude --resume) OR room id (--mcp-config room:<id>) AND killTs freshness
+  // (the turn was journaled within REAP_FRESH_MS BEFORE the kill) — filenames differ, so
+  // we match on CONTENT, never on name.
+  let markers = [];
+  try {
+    for (const mf of fs.readdirSync(PENDING_DIR).filter(f => f.endsWith('.reaped'))) {
+      const mp = path.join(PENDING_DIR, mf);
+      try { const m = JSON.parse(fs.readFileSync(mp, 'utf8')); if (m) markers.push({ file: mp, m }); } catch { try { fs.unlinkSync(mp); } catch {} }
+    }
+  } catch {}
+  const consumeMarker = (mk) => { if (!mk) return; try { fs.unlinkSync(mk.file); } catch {} markers = markers.filter(x => x !== mk); };
+  const matchMarker = (j) => markers.find(x => x.m
+      && ((j.sessionId && x.m.session && x.m.session === j.sessionId) || (x.m.room && x.m.room === j.key))
+      && Number.isFinite(+x.m.killTs)
+      && (j.ts || 0) <= (+x.m.killTs + 5000)
+      && ((+x.m.killTs) - (j.ts || 0)) <= REAP_FRESH_MS);
+  const _itemsOf = (j) => (Array.isArray(j.turns) ? j.turns : []).map((t, i) => ({ reqId: (Array.isArray(j.reqIds) ? j.reqIds : [])[i] || null, text: (typeof t === 'string' ? t : (t && t.text)) || null }));   // [TASK646E] zip turns<->reqIds by index
+  const surfaceFailed = (j) => {   // [TASK646F] single delivery path: flush the durable record (ack-tracked) to any attached socket; no-op at startup
+    try { const _S = clientSessions.get(j.key); if (_S && _S.sockets) _S.sockets.forEach(w => { try { flushFailed(_S, w); } catch (e) {} }); } catch (e) {}
+  };
+  const orphanProcs = files.length ? _scanOrphanProcs() : [];   // [TASK646D] one authoritative scan per restart
   for (const f of files) {
     const fp = path.join(PENDING_DIR, f);
     let j; try { j = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { try { fs.unlinkSync(fp); } catch {} continue; }
     if (!j || !Array.isArray(j.turns) || !j.turns.length) { try { fs.unlinkSync(fp); } catch {} continue; }
+    // [TASK646F] A completion whose .done write failed last run: finish the transition, never re-dispatch.
+    if (j.status === 'done') { if (recordDone(j.key, Array.isArray(j.doneReqIds) ? j.doneReqIds : (Array.isArray(j.reqIds) ? j.reqIds : []))) { try { fs.unlinkSync(fp); } catch {} } continue; }   // [TASK646G] keep retrying until the .done write confirms
+    // [TASK646B] A turn we already marked failed: never auto-respawn. Surface it (recoverable)
+    // while fresh; drop it once stale so it cannot resurrect much later.
+    if (j.status === 'failed') {
+      if ((Date.now() - (j.failTs || 0)) < FAIL_TTL_MS) { console.log('[Bridge] [TASK646B] blip-replay: skipping failed turn', j.key, '(recoverable)'); recordFailed(j.key, { items: _itemsOf(j), reason: j.failReason || 'failed' }); surfaceFailed(j, j.failReason || 'failed'); }
+      else { try { fs.unlinkSync(fp); } catch {} console.log('[Bridge] [TASK646B] dropping stale failed journal', j.key); }
+      continue;
+    }
+    // [TASK646B] Reaper positively classified this turn's proc as pathological (Rule B): do
+    // NOT respawn it (that is the give-up loop). Mark failed + surface recoverable instead.
+    const mk = matchMarker(j);
+    if (mk) {
+      console.log('[Bridge] [TASK646B] blip-replay: reaper-poisoned turn', j.key, 'reason=' + (mk.m.reason || '?') + ' — marking failed, not respawning');
+      j.status = 'failed'; j.failTs = Date.now(); j.failReason = 'reaped:' + (mk.m.reason || 'runaway');
+      try { fs.writeFileSync(fp, JSON.stringify(j)); } catch {}
+      recordFailed(j.key, { items: _itemsOf(j), reason: j.failReason });   // [TASK646C/E] durable per-turn, client-visible on attach
+      consumeMarker(mk); surfaceFailed(j, j.failReason); continue;
+    }
+    // [TASK646D] A child survived the previous bridge: its stdio is orphaned (output
+    // unrecoverable), so replay would double-run it. Kill it (same-user only; a cross-user
+    // kill throws EPERM and is ignored — the reaper owns those) and fail it recoverably.
+    const orphan = _findOrphanFor(j, orphanProcs);
+    if (orphan) {
+      console.log('[Bridge] [TASK646D] orphan live proc pid=' + orphan.pid + ' matches', j.key, '— killing + failing (stdio unrecoverable; never replay)');
+      try { process.kill(orphan.pid, 'SIGKILL'); } catch (e) {}
+      j.status = 'failed'; j.failTs = Date.now(); j.failReason = 'orphan-killed';
+      try { fs.writeFileSync(fp, JSON.stringify(j)); } catch {}
+      recordFailed(j.key, { items: _itemsOf(j), reason: 'orphan-killed' });
+      surfaceFailed(j, 'orphan-killed'); continue;
+    }
     j.attempts = (j.attempts || 0) + 1;
-    if (j.attempts > 2) { try { fs.unlinkSync(fp); } catch {} console.log('[Bridge] blip-replay: giving up on', j.key); continue; }
+    if (j.attempts > 2) { try { fs.unlinkSync(fp); } catch {} console.log('[Bridge] blip-replay: giving up on', j.key); recordFailed(j.key, { items: _itemsOf(j), reason: 'giveup' }); surfaceFailed(j, 'giveup'); continue; }
     try { fs.writeFileSync(fp, JSON.stringify(j)); } catch {}
     const key = j.key;   // [CODEX_DURABLE_V3] stable room key; never split a named room onto its session id
     if (confExistsRunning(key)) { console.log('[Bridge] [CONFERENCE_V1] blip-replay skipping conference room', key); continue; }
     let S = clientSessions.get(key);
     if (!S) { S = makeSession(key); if (j.sessionId && sessionFileExists(j.sessionId)) S.sessionId = j.sessionId; restoreRoom(S); if (!S.threadId && j.threadId && codexRolloutExists(j.threadId)) S.threadId = j.threadId; clientSessions.set(key, S); }   // [CODEX_DURABLE_V3] do NOT clobber the room's saved engineOverride
     if (S.processing) continue;   // already live (a reconnecting client beat us to it)
+    if (Array.isArray(j.reqIds) && j.reqIds.length) S._inflightReqIds = j.reqIds.slice();   // [TASK646B] re-register so a client RESEND converges (dedup) onto this one replay
     const turns = j.turns.slice();
     console.log(`[Bridge] blip-replay: re-injecting ${turns.length} dropped turn(s) into ${key} (attempt ${j.attempts})`);
-    setTimeout(() => { try { turns.forEach(t => S.sendToEngine(j.engine === 'codex' ? 'codex' : 'claude', t)); } catch (e) { console.log('[Bridge] blip-replay failed:', e.message); } }, 800);   // [CODEX_DURABLE_V4] explicit engine routing, no override change
+    setTimeout(() => { try { turns.forEach(t => { const _n = _instrNormTurn(t); S.sendToEngine(j.engine === 'codex' ? 'codex' : 'claude', _n.text, _n.meta); }); } catch (e) { console.log('[Bridge] blip-replay failed:', e.message); } }, 800);   // [CODEX_DURABLE_V4] explicit engine routing, no override change
   }
+  // [TASK646B] Orphan markers (no matching journal — bridge already finished/cleared the turn)
+  // are harmless; drop the stale ones so the directory does not accumulate.
+  for (const mk of markers.slice()) { try { if ((Date.now() - (+mk.m.killTs || 0)) > REAP_FRESH_MS) consumeMarker(mk); } catch {} }
 }
+
+// [TASK646] Forward-progress stall watchdog. The 50-min silence watchdog (armWatch) and
+// the CPU-ratio reaper both miss a BLOCKED low-CPU turn that emits occasional non-progress
+// chatter. This scans live rooms and, when a turn makes NO meaningful progress for
+// STALL_NOTIFY_MS, notifies once per turn: a UI 'stall' frame AND an out-of-band WhatsApp
+// to Peter (reaches him even with no client attached). Notify-only — never kills.
+setInterval(() => {
+  try {
+    const now = Date.now();
+    for (const S of clientSessions.values()) {
+      if (!S || !S.processing) continue;
+      const lp = S._lastProgressAt || 0;
+      if (!lp || (now - lp) < STALL_NOTIFY_MS) continue;
+      const turnTag = (S._turnSeq || 0) + ':' + (S.procEngine || '-');
+      if (S._stallNotifiedTurn === turnTag) continue;   // once per turn
+      S._stallNotifiedTurn = turnTag;
+      const mins = Math.round((now - lp) / 60000);
+      console.log('[Bridge] [TASK646] stall-notify room=%s engine=%s idleMin=%d lastTool=%s', S.key, S.procEngine || '-', mins, S._lastToolName || '-');
+      try { S.send({ type: 'stall', roomId: S.key, idleMs: now - lp, lastTool: S._lastToolName || null }); } catch (e) {}
+      try {
+        const note = 'Bridge stall: room ' + String(S.key).slice(0, 24) + ' (' + (S.procEngine || '?') + ') no progress ' + mins + 'm; last tool ' + (S._lastToolName || '-') + '. Spinner may be stuck.';
+        const _p = spawn(AUTONOMY_NOTIFY, ['task-646', note], { detached: true, stdio: 'ignore' }); _p.unref(); _p.on('error', () => {});
+      } catch (e) { console.log('[Bridge] [TASK646] stall notify spawn failed:', e.message); }
+    }
+  } catch (e) {}
+}, STALL_SCAN_MS).unref();
 
 function makeSession(key) {
   const S = {
@@ -4494,14 +6334,20 @@ function makeSession(key) {
     threadId: null,         // [CODEX_DURABLE_V2] Codex resume handle (persisted in bridge-rooms.json)
     conf: null,             // [CONFERENCE_V1] live conference orchestration state (mirrored to disk)
     credentialClaudeAccount: null, credentialCodexAccount: null,
+    selClaudeAccount: null, selCodexAccount: null,   // [ACCT_PANE_ISO_V1] durable per-room account selection (persisted in bridge-rooms.json)
     credentialRuntimeDir: null, credentialTimer: null,
     credRetried: false, credResend: null, credDeadToken: null,   // [CLAUDE_CRED_REVOKED_V1] one-shot reissue+replay after a 401
-    pendingCredentialRefresh: false,   // [CONF_ACCT_SWITCH_V1] a live BUSY Claude worker awaits retirement so its next turn re-issues under the newly-selected account
+    pendingClaudeCredentialRefresh: false, pendingCodexCredentialRefresh: false,   // [ACCT_PANE_ISO_V1] per-provider retire-at-boundary flags
+    deferredTurns: [],   // [ACCT_PANE_ISO_V1] turns held during a busy-worker account switch
+    contextOwnerClaudeAccount: null, contextOwnerSessionId: null,   // [COMPACT_ACCT_STABLE_V1] account holding this session context; /compact pins to it
+    _compactPinActive: false,   // [COMPACT_ACCT_STABLE_V1] a /compact turn is pinned to the owner; a held pane-switch resumes on completion
+    _lastProgressAt: 0, _turnSeq: 0, _stallNotifiedTurn: null,   // [TASK646] forward-progress clock + once-per-turn stall-notify guard
+    _pendingReqIds: [], _inflightReqIds: [],   // [TASK646C] durable-send reqId tracking: _pendingReqIds is a FIFO ack queue (also persisted in the journal)
   };
 
   S.engineState = (error = '') => { const _r = resolveRoomEngine(S); return { type: 'room_engine', roomId: S.key,
     mode: _r.mode, engine: _r.engine, rev: _r.rev,
-    engineAccounts: engineAccounts(),   // [ENGINE_GLOBAL_ONLY_V1] selector labels ride along with the authoritative engine
+    engineAccounts: engineAccounts(S),   // [ACCT_PANE_ISO_V1] per-room selector labels
     processing: !!S.processing, error }; };
 
   // Broadcast to all connected sockets. Buffer when nobody is connected so a
@@ -4539,6 +6385,9 @@ function makeSession(key) {
 
   S.killCurrentProc = (reason) => {
     S.clearWatch();
+    const _failRids = (Array.isArray(S._inflightReqIds) ? S._inflightReqIds.slice() : []);   // [TASK646B] capture before clearPending wipes them
+    const _failItems = (Array.isArray(S.inFlight) ? S.inFlight : []).map((t, i) => ({ reqId: _failRids[i] || null, text: (typeof t === 'string' ? t : (t && t.text)) || null }));   // [TASK646E] per-turn {reqId,text}
+    const _failIsHang = /watchdog|timeout/i.test(String(reason || ''));   // only a watchdog/hang kill is a recoverable failure; user cancel/evict is not
     if (S.credentialTimer) { clearTimeout(S.credentialTimer); S.credentialTimer = null; }
     if (S.currentProc) { try { S.currentProc.kill('SIGKILL'); } catch {} S.currentProc = null; }
     const wasProcessing = S.processing;
@@ -4556,6 +6405,7 @@ function makeSession(key) {
     }
     if (S.conf && S.conf.status === 'running') { S.conf.status = 'paused'; S.conf.pausedReason = 'The active turn was interrupted (' + (reason || 'stopped') + '). Resume to continue.'; S.conf.activeTurnId = S.conf.activeTurnId || null; S.conf.pendingRetry = null; S.conf.retryGen = (S.conf.retryGen || 0) + 1; confSave(S); confSendStatus(S); }   // [CONFERENCE_V1] never silently advance on error
     if (wasProcessing) S.send({ type: 'done', code: -1 });
+    if (wasProcessing && _failIsHang && (_failRids.length || _failItems.length)) { const _fi = _failItems.length ? _failItems : _failRids.map(r => ({ reqId: r, text: null })); try { recordFailed(S.key, { items: _fi, reason: String(reason || 'stopped') }); } catch (e) {} try { if (S.sockets) S.sockets.forEach(w => flushFailed(S, w)); } catch (e) {} }   // [TASK646F] durable + ack-tracked delivery (replaces the un-acked direct frame)
     if (reason) console.log('[Bridge] Killed Claude proc:', reason);
   };
 
@@ -4578,7 +6428,8 @@ function makeSession(key) {
   // process and steer it. Spawned lazily; killed on reset / cancel / timeout /
   // grace-expiry.
   S.spawnProc = () => {
-    S.pendingCredentialRefresh = false;   // [CONF_ACCT_SWITCH_V1] a fresh spawn re-reads the active account, satisfying any pending retirement
+    if (S.pendingClaudeCredentialRefresh) S.credentialClaudeAccount = null;   // [ACCT_RETIRE_SPAWN_V1] drop the stale pin so a fresh spawn re-resolves to the selected account even if the old (exhausted) proc already exited
+    S.pendingClaudeCredentialRefresh = false;   // [ACCT_PANE_ISO_V1] a fresh spawn re-reads the selected account, satisfying any pending retirement
     // Drop a stale session id before spawning so we never --resume a missing file.
     if (S.sessionId && !sessionFileExists(S.sessionId)) {
       console.log('[Bridge] Stale session (no transcript), starting fresh:', S.sessionId);
@@ -4587,8 +6438,17 @@ function makeSession(key) {
     const triedResume = !!S.sessionId;
     let resumeMissing = false;
 
+    // [ROOM_INSTR_INJECT_V1] Room instructions (project+room CLAUDE.md + memory pointer) ride in the
+    // SYSTEM PROMPT, not the user message: the model sees them every turn but they are NEVER written
+    // into the CLI transcript, so they add nothing to compaction. Recomputed per spawn (picks up a
+    // CLAUDE.md edit on the next respawn). Codex rooms / instructionsEnabled:false -> persona only.
+    let _sysPrompt = GENERAL_ASSISTANT_PROMPT;
+    try {
+      const _ri = assembleRoomInstructions(S);
+      if (_ri.enabled && _ri.text) { _sysPrompt = GENERAL_ASSISTANT_PROMPT + '\n\n' + _ri.text; console.log('[Bridge] [ROOM_INSTR_INJECT_V1] system-prompt +' + _ri.bytes + 'B room ' + S.key); }
+    } catch (e) { console.log('[Bridge] [ROOM_INSTR_INJECT_V1] sysprompt assemble failed: ' + (e && e.message)); }
     const args = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-      '--model', CLAUDE_MODEL, '--append-system-prompt', GENERAL_ASSISTANT_PROMPT];
+      '--model', CLAUDE_MODEL, '--append-system-prompt', _sysPrompt];
     // [CONFERENCE_V2] Discussion/verification/final stages run Claude READ-ONLY:
     // plan mode + deny mutation-capable built-ins. Browser mutation is blocked centrally
     // at the shim. Implementation stage keeps full tools. Recorded so confDispatch can
@@ -4650,20 +6510,37 @@ function makeSession(key) {
     // Ensure critical env vars are present for Claude to find settings.json and MCP servers
     if (!claudeEnv.HOME) claudeEnv.HOME = process.env.HOME || '/root';
     if (!claudeEnv.PATH) claudeEnv.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+    try { claudeEnv.CCB_ROOM_KEY = S.key; } catch (e) {}   // [ROOM_ATTR_V1]
     if (CREDENTIAL_STEWARD_ENABLED) {
       const _confTurn = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);   // [CONF_CRED_RETRY_V1]
       if (_confTurn) confLeaseBeginAttempt(S, 'claude');   // durable pre-issuance attempt lease
       try {
-        if (!S.credentialClaudeAccount) S.credentialClaudeAccount = stewardText(['active-claude']);
-        const safeRoom = S.key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
-        S.credentialRuntimeDir = path.join(CREDENTIAL_STATE_DIR, 'runtime', 'claude', S.credentialClaudeAccount, safeRoom);
+        if (!S.credentialClaudeAccount) S.credentialClaudeAccount = resolveRoomAccount(S, 'claude') || stewardText(['active-claude']);
+        // [ROOM_RUNTIME_DIR_PIN_V1] Pin the config dir across respawns/rekeys (see header note).
+        { let _pin = null;
+          try { if (S.credentialRuntimeDir && _rmRealDir(S.credentialRuntimeDir) && path.basename(path.dirname(S.credentialRuntimeDir)) === String(S.credentialClaudeAccount)) _pin = S.credentialRuntimeDir; } catch (e) {}
+          if (!_pin) { try { const _r = _loadRoomMap()[S.key]; if (_r && _r.runtimeDir && _rmRealDir(_r.runtimeDir) && path.basename(path.dirname(_r.runtimeDir)) === String(S.credentialClaudeAccount)) _pin = _r.runtimeDir; } catch (e) {} }
+          S.credentialRuntimeDir = _pin || roomClaudeConfigDir(S.credentialClaudeAccount, S.key); }
+        try { mergeRoomFields(S.key, { runtimeDir: S.credentialRuntimeDir }); } catch (e) {}
         const issued = JSON.parse(stewardText(['issue-claude', S.credentialClaudeAccount, S.credentialRuntimeDir]));
         claudeEnv.CLAUDE_CONFIG_DIR = S.credentialRuntimeDir;
-        // Persistent Claude workers are retired before their access-only token expires;
-        // the next turn resumes the transcript with a newly issued generation.
-        const retireIn = Math.max(60000, Number(issued.expiresAt || 0) - Date.now() - 10 * 60000);
+        // [TASK499_ROTATION_RETIRE_V1] Retire persistent workers BEFORE their token becomes
+        // rotation-eligible. The steward refreshes an OWNED family when <4.5h life remains;
+        // Anthropic invalidates the prior access token the instant it rotates, 401-ing every
+        // worker still holding it. Recycling while IDLE at ~(4.5h - 2min)-left forces the next
+        // issue-claude to mint a freshly-rotated, full-life token, so the family rotation lands
+        // BETWEEN turns instead of mid-turn. Idle-aware: never interrupts an active turn.
+        const _retireLead = Number(process.env.CRED_RETIRE_LEAD_MS || (4.5 * 3600e3 - 2 * 60e3));
+        const _retireIn = Math.max(60000, Number(issued.expiresAt || 0) - Date.now() - _retireLead);
         if (S.credentialTimer) clearTimeout(S.credentialTimer);
-        S.credentialTimer = setTimeout(() => S.killCurrentProc('credential generation retirement'), retireIn);
+        const _retireWorker = () => {
+          if (!S.currentProc) return;                                   // already gone
+          if (S.processing || S.pendingTurns > 0) {                     // mid-turn: defer, don't interrupt
+            S.credentialTimer = setTimeout(_retireWorker, 60000); return;
+          }
+          S.killCurrentProc('credential generation retirement (pre-rotation)');
+        };
+        S.credentialTimer = setTimeout(_retireWorker, _retireIn);
       } catch (e) {
         console.error('[Bridge] credential steward Claude issuance failed:', e.message);   // raw detail: LOG ONLY
         const cat = classifyIssueError(e);
@@ -4702,6 +6579,7 @@ function makeSession(key) {
     S.procEngine = 'claude';
     S.lastEngine = 'claude';
     S._lastEvAt = null; S._lastEvType = null; S._lastToolName = null;   // [TASK474] reset diagnostics per spawn
+    S._lastProgressAt = Date.now(); S._turnSeq = (S._turnSeq || 0) + 1; S._stallNotifiedTurn = null;   // [TASK646] fresh turn: reset progress clock + bump turn seq
     // Startup watchdog: must produce first output within 2 min (catches MCP init hangs).
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '⏱ Claude failed to start (MCP/init timeout) — session reset.');
 
@@ -4718,10 +6596,14 @@ function makeSession(key) {
         try { ev = JSON.parse(line); } catch { continue; }   // drop non-JSON debug noise
         if (!ev || typeof ev !== 'object' || !ev.type) continue;   // ignore stray fragments
         S._lastEvAt = Date.now(); S._lastEvType = ev.type;   // [TASK474] watchdog diagnostics
+        if (ev.type === 'assistant' || ev.type === 'result' || ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'turn.completed' || (ev.type === 'user' && ev.message) || (ev.type === 'system' && ev.subtype === 'init')) S._lastProgressAt = Date.now();   // [TASK646] forward-progress clock — meaningful events only, NOT every event
         if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) { for (const _tb of ev.message.content) { if (_tb && _tb.type === 'tool_use' && _tb.name) { S._lastToolName = _tb.name; break; } } }
 
         if (ev.type === 'system' && ev.subtype === 'init' && ev.session_id) {
           S.sessionId = ev.session_id;
+          if (S.credentialClaudeAccount && S.contextOwnerSessionId !== ev.session_id) {   // [COMPACT_ACCT_STABLE_V1] record the context-owner account for this session
+            S.contextOwnerClaudeAccount = S.credentialClaudeAccount; S.contextOwnerSessionId = ev.session_id;
+          }
           confLeaseCommit(S, S.conf ? S.conf.activeTurnId : null);   // [CONF_CRED_RETRY_V1] process started
           // Durable viewer alias: (re)assert shim mount->session on EVERY init, so a
           // promotion whose one-shot POST was lost to a shim flap (or the collision
@@ -4740,6 +6622,7 @@ function makeSession(key) {
             } else {
             clientSessions.delete(S.key);
             S.key = ev.session_id;
+            try { let _wm = false; for (const _w of Object.values(wakes)) { if (_w.roomKey === _oldKey) { _w.roomKey = ev.session_id; _wm = true; } } if (_wm) saveWakes(); } catch (e) {}   // [WAKE_V1] follow draft->session rekey
             clientSessions.set(S.key, S);
             // [CONFERENCE_V2] Atomic conference state migration: persist under the
             // canonical (session) key FIRST, then leave an inert tombstone at the draft
@@ -4803,6 +6686,26 @@ function makeSession(key) {
             }
           }
         }
+        // [WAKE_V1_NATIVE_PREF] capture an unsolicited (native) injected user prompt while idle, so
+        // native attribution can require a POSITIVE prompt match (not mere timing) -> safe dedup.
+        if (ev.type === 'user' && !S.processing && !S.pendingTurns && ev.message && ev.message.content != null) {
+          try {
+            let _t = ''; const _c = ev.message.content;
+            if (typeof _c === 'string') _t = _c;
+            else if (Array.isArray(_c)) _t = _c.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
+            _t = String(_t || '').trim();
+            if (_t) { S._natInText = _t; S._natInAt = Date.now(); }
+          } catch (e) {}
+        }
+        // [WAKE_V1] capture ScheduleWakeup arming + detect (defer) an unsolicited native wake fire
+        if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+          for (const _wb of ev.message.content) {
+            if (_wb && _wb.type === 'tool_use' && _wb.id && String(_wb.name || '') === 'ScheduleWakeup') {
+              try { wakeArm(S, _wb); } catch (e) { console.error('[Bridge] [WAKE_V1] arm failed:', e.message); }
+            }
+          }
+          if (!S.processing && !S.pendingTurns) { try { wakeObserveNative(S); } catch (e) {} }
+        }
         // [CONFERENCE_HISTORY_V1] Tag conference stream chunks with the active turn id
         // so the client can reconcile the live preview bubble by stable identity.
         // [CLAUDE_CRED_REVOKED_V1] A revoked token surfaces as a SYNTHETIC assistant
@@ -4830,6 +6733,9 @@ function makeSession(key) {
         S.send({ type: 'stream', data: ev, confTurnId: (S.conf && S.conf.status === 'running') ? (S.conf.activeTurnId || null) : null });
 
         if (ev.type === 'result') {
+          // [WAKE_V1] resolve a wake correlated to the actual engine-turn queue / native result
+          try { wakeResolveResult(S, ev); } catch (e) {}
+          if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { S._confResultErr = { isError: !!ev.is_error, status: Number(ev.api_error_status) || null, subtype: ev.subtype || null }; }   // [CONF_LIMIT_PAUSE_V1]
           // [CLAUDE_CRED_REVOKED_V1] The owner host rotates this account's family on its
           // own schedule; Anthropic invalidates the PREVIOUS access token the instant it
           // does. A persistent worker reads its credential once at spawn, so it can be
@@ -4890,6 +6796,14 @@ function makeSession(key) {
             S.processing = false;
             S.clearWatch();
             S.send({ type: 'done', code: 0 });
+            if (S._compactPinActive) {   // [COMPACT_ACCT_STABLE_V1] compaction turn finished — release the one-turn owner pin so a pending pane-switch lands next turn
+              S._compactPinActive = false;
+              if (S.selClaudeAccount && S.selClaudeAccount !== S.credentialClaudeAccount) S.pendingClaudeCredentialRefresh = true;
+            }
+            if (S.pendingClaudeCredentialRefresh && S.deferredTurns && S.deferredTurns.length) {   // [ACCT_PANE_ISO_V1] worker idle after a busy switch: replay held turns (next dispatch retires+respawns under the new account)
+              const _dq = S.deferredTurns.filter(d => d.engine === 'claude'); S.deferredTurns = S.deferredTurns.filter(d => d.engine !== 'claude');
+              if (_dq.length) setTimeout(() => _dq.forEach(d => S.sendToClaude(d.text, d.meta)), 50);
+            }
             if (S.conf && S.conf.status === 'running' && S.conf.activeTurnId) { try { confFinishTurn(S, 'claude'); } catch (e) { console.log('[Bridge] [CONFERENCE_V1] finish(claude) failed:', e.message); } }
             if (S.orch && global.__ORCH) { const _t = S._orchAcc || ''; S._orchAcc = ''; try { global.__ORCH.onTurnEnd(S, 'claude', _t); } catch (e) { console.log('[Bridge] [ORCH_V1] claude turn end failed:', e.message); } }
             try { autoNameRoom(S); } catch (e) {}
@@ -4957,7 +6871,7 @@ function makeSession(key) {
         const deadTok = S.credDeadToken; S.credDeadToken = null;
         S.pendingTurns = 0; S.inFlight = [];
         credWaitForFreshToken(S, deadTok,
-          () => credResend.forEach(t => S.sendToClaude(t)),
+          () => credResend.forEach(t => { const _n = _instrNormTurn(t); S.sendToClaude(_n.text, _n.meta); }),
           () => {   // [CRED_401_HEAL_V3] fail closed - never replay onto a credential we know is dead
             S.send({ type: 'error', text: 'Credentials are still rotating \u2014 resend shortly.' });
             S.send({ type: 'done', code: -1 });
@@ -4974,7 +6888,7 @@ function makeSession(key) {
         const resend = S.inFlight.slice();
         S.inFlight = []; S.pendingTurns = 0;
         S.send({ type: 'status', text: 'Previous session expired — starting a fresh conversation.' });
-        setTimeout(() => resend.forEach(t => S.sendToClaude(t)), 150);
+        setTimeout(() => resend.forEach(t => { const _n = _instrNormTurn(t); S.sendToClaude(_n.text, _n.meta); }), 150);
         return;
       }
 
@@ -5006,7 +6920,10 @@ function makeSession(key) {
   // Send one user turn. If the streaming process is already live, the message is
   // written straight into its stdin — queuing/steering the running session.
   // Otherwise a fresh process is spawned (resuming the session id when we have one).
-  S._sendNow = (text) => {
+  S._sendNow = (text, _meta) => {
+    if (S.pendingClaudeCredentialRefresh && S.processing && S.procEngine === 'claude') {   // [ACCT_PANE_ISO_V1] busy worker mid-switch: never steer into the old account; hold for the fresh worker
+      S.deferredTurns.push({ engine: 'claude', text, meta: _meta }); return;
+    }
     S.pendingEngine = 'claude';   // [CODEX_DURABLE_V4] journal tag
     const _seed = maybeSeed(S, 'claude', text);
     // [XENGINE_RESUME_V1] Cross INTO Claude: if this room already has a resumable
@@ -5019,22 +6936,35 @@ function makeSession(key) {
       try { S.currentProc.kill('SIGKILL'); } catch {}
       S.currentProc = null; S.procEngine = null;
     }
-    // [CONF_ACCT_SWITCH_V1] A global account switch flagged this live idle Claude worker
-    // for retirement; drop it so the turn below spawns fresh under the new account.
-    if (S.pendingCredentialRefresh && S.currentProc && S.procEngine === 'claude' && !S.processing) {
+    // [ACCT_PANE_ISO_V1] A pane-local account switch flagged this idle Claude worker for
+    // retirement; drop it AND its credential pin so the turn below spawns under the new account.
+    if (S.pendingClaudeCredentialRefresh && S.currentProc && S.procEngine === 'claude' && !S.processing) {
       try { S.currentProc.kill('SIGKILL'); } catch {}
-      S.currentProc = null; S.procEngine = null; S.pendingCredentialRefresh = false;
+      S.currentProc = null; S.procEngine = null; S.pendingClaudeCredentialRefresh = false; S.credentialClaudeAccount = null;
     }
     const fresh = !S.currentProc;
     const wasProcessing = S.processing;
     if (fresh) { const _r = S.spawnProc(); if (_r && _r.ok === false) return; }   // [CONF_CRED_RETRY_V1]
     if (!S.currentProc) return;
-    S.inFlight.push(text);
+    try { S.send({ type: 'turn_account', engine: 'claude', account: acctMeta('claude', S) }); } catch (e) {}   // [ACCT_PANE_ISO_V1] immutable per-turn attribution
+    S.inFlight.push({ text: text, meta: _meta || {} });   // [ROOM_INSTR_INJECT_V1] store ORIGINAL text + placement meta (block re-derived on replay)
     S.pendingTurns++;
     S.processing = true;
-    journalPending(S);   // persist this turn so a bridge blip can re-inject it
+    const _ackRid = (Array.isArray(S._pendingReqIds) && S._pendingReqIds.length) ? S._pendingReqIds.shift() : null;   // [TASK646C] FIFO: this send's own reqId
+    const _persisted = journalPending(S);   // [TASK646B] persist BEFORE dispatch (stdin write below)
+    if (_persisted === false && DURABLE_SEND) {   // durable write failed — do NOT dispatch; roll back + tell client to retry
+      S.inFlight.pop(); S.pendingTurns = Math.max(0, S.pendingTurns - 1); if (!wasProcessing) S.processing = false;
+      if (_ackRid && Array.isArray(S._inflightReqIds)) { const _i = S._inflightReqIds.indexOf(_ackRid); if (_i >= 0) S._inflightReqIds.splice(_i, 1); }
+      try { S.send({ type: 'chat_nack', roomId: S.key, reqId: _ackRid || null, reason: 'persist_failed' }); } catch (e) {}
+      return;
+    }
+    if (_persisted === true && _ackRid) { try { S.send({ type: 'chat_ack', roomId: S.key, reqId: _ackRid }); } catch (e) {} }   // [TASK646C] ACK only after durable persist
     if (!wasProcessing) S.send({ type: 'thinking' });   // only show the spinner when starting from idle
-    try { S.currentProc.stdin.write(userMsgJSON(text)); }
+    // [ROOM_INSTR_INJECT_V1] Room instructions now ride in the SYSTEM PROMPT (set at spawn), never in
+    // the user message — nothing instruction-related is prepended here and nothing is persisted to the
+    // transcript. The user turn is written verbatim.
+    const _outText = text;
+    try { S.currentProc.stdin.write(userMsgJSON(_outText)); }
     catch (e) { console.error('[Bridge] stdin write failed:', e.message); }
     if (!fresh) S.armWatch(CLAUDE_TIMEOUT_MS, watchMsg(S.procEngine));
   };
@@ -5087,15 +7017,24 @@ function makeSession(key) {
     // Browser parity via shell `browser` CLI (MCP tools are deferred/stranded in
     // codex exec on gpt-5.6-sol). CLI proxies to this room's Playwright shim.
     if (_mcpUrl && !S.orchNoBrowser) { env.CODEX_BROWSER_MCP_URL = _mcpUrl; env.PATH = '/usr/local/bin:' + (env.PATH || ''); }   // [ORCH_V1] codex no-browser: capability withheld at spawn
-    let proc, codexAccount = null;
+    let proc, codexAccount = null, _cxRoomDir = null;
     touchBrowserWanted();
     const _cxConfTurn = !!(S.conf && S.conf.status === 'running' && S.conf.activeTurnId);   // [CONF_CRED_RETRY_V1]
     if (CREDENTIAL_STEWARD_ENABLED) {
       if (_cxConfTurn) confLeaseBeginAttempt(S, 'codex');
       try {
-        if (!S.credentialCodexAccount) S.credentialCodexAccount = stewardText(['active-codex']);
+        if (S.pendingCodexCredentialRefresh) { S.credentialCodexAccount = null; S.pendingCodexCredentialRefresh = false; }   // [ACCT_PANE_ISO_V1] a pane-local switch during the prior turn: adopt the newly-selected Codex account now
+        if (!S.credentialCodexAccount) S.credentialCodexAccount = resolveRoomAccount(S, 'codex') || stewardText(['active-codex']);
         codexAccount = S.credentialCodexAccount;
-        env.CODEX_HOME = stewardText(['prepare-codex', codexAccount]);
+        // [TASK407] Per-room isolated Codex home: two panes on the SAME account run concurrently
+        // (no shared auth.json); refresh material is neutralized in the runtime copy and finalize
+        // NEVER writes canonical back. Room id = sanitized key + full sha256 (injective).
+        const _cxRid = S.key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 80) + '-' + require('crypto').createHash('sha256').update(S.key).digest('hex');
+        _cxRoomDir = path.join(CREDENTIAL_STATE_DIR, 'runtime', 'codex', codexAccount, _cxRid);
+        // Conference turns validate/refresh the canonical credential under the
+        // steward's per-account lock before receiving an access-only room copy.
+        // Ordinary rooms retain the cheaper prepare-only path.
+        env.CODEX_HOME = stewardText([_cxConfTurn ? 'issue-codex' : 'prepare-codex', codexAccount, _cxRoomDir]);
       } catch (e) {
         console.error('[Bridge] credential steward Codex issuance failed:', e.message);   // raw detail: LOG ONLY
         const cat = classifyIssueError(e);
@@ -5107,7 +7046,7 @@ function makeSession(key) {
     }
     try {
       if (CREDENTIAL_STEWARD_ENABLED) {
-        const lock = path.join(CREDENTIAL_STATE_DIR, `codex-${codexAccount}.lock`);
+        const lock = path.join(CREDENTIAL_STATE_DIR, `codex-room-${require('crypto').createHash('sha256').update(String(_cxRoomDir||codexAccount)).digest('hex').slice(0,32)}.lock`);   // [TASK407] per-room lock: uncontended (instant acquire) keeps the sentinel/discriminator intact while allowing same-account cross-room overlap
         // [CONF_CRED_RETRY_V1] Durable lock-contention discriminator: the instant flock
         // holds the lock, the wrapper prints __LOCK_ACQUIRED__ to stderr. A nonzero exit
         // with NO sentinel seen ⇒ flock timed out before acquiring (retryable transient);
@@ -5122,10 +7061,15 @@ function makeSession(key) {
     S.currentProc = proc;
     S.procEngine = 'codex';
     S.lastEngine = 'codex';
+    try { S.send({ type: 'turn_account', engine: 'codex', account: acctMeta('codex', S) }); } catch (e) {}   // [ACCT_PANE_ISO_V1] immutable per-turn attribution
     S._lastEvAt = null; S._lastEvType = null; S._lastToolName = null;   // [TASK474] reset diagnostics per spawn
+    S._lastProgressAt = Date.now(); S._turnSeq = (S._turnSeq || 0) + 1; S._stallNotifiedTurn = null;   // [TASK646] fresh turn: reset progress clock + bump turn seq
     S.armWatch(CLAUDE_STARTUP_TIMEOUT, '\u23F1 Codex failed to start \u2014 session reset.');
     let accountEmail = '';
-    try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {}
+    // Attribute failures to this pane's steward-selected account, not whichever
+    // account happens to be globally active while concurrent turns are running.
+    try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(path.join(CODEX_ACCT_DIR, codexAccount + '.auth.json'), 'utf8'))); } catch {}
+    if (!accountEmail) { try { accountEmail = codexEmail(JSON.parse(fs.readFileSync(CODEX_AUTH, 'utf8'))); } catch {} }
     const errors = createCodexErrorReporter(data => S.send(data), accountEmail);
     let buf = '';
     // [CONF_CRED_RETRY_V1] async-failure discriminators for the terminal handlers:
@@ -5140,6 +7084,7 @@ function makeSession(key) {
         let ev; try { ev = JSON.parse(line); } catch { continue; }
         if (!ev || !ev.type) continue;
         S._lastEvAt = Date.now(); S._lastEvType = ev.type;   // [TASK474] watchdog diagnostics
+        if (ev.type === 'assistant' || ev.type === 'result' || ev.type === 'item.started' || ev.type === 'item.completed' || ev.type === 'turn.completed' || (ev.type === 'user' && ev.message) || (ev.type === 'system' && ev.subtype === 'init')) S._lastProgressAt = Date.now();   // [TASK646] forward-progress clock — meaningful events only, NOT every event
         if (ev.type === 'item.started' && ev.item && ev.item.type === 'command_execution') S._lastToolName = 'command_execution';
         if (ev.type === 'turn.failed' || ev.type === 'error') {
           sawFailure = true;   // [CONF_CRED_RETRY_V1] pre-exit failure signal
@@ -5188,7 +7133,7 @@ function makeSession(key) {
       if (S.currentProc !== proc) return;
       S.currentProc = null;   // [CONF_CRED_RETRY_V1] detach before any routing/scheduling
       if (CREDENTIAL_STEWARD_ENABLED && codexAccount) {
-        try { stewardText(['finalize-codex', codexAccount]); }
+        try { stewardText(['finalize-codex', codexAccount, _cxRoomDir]); }   // [TASK407] status-only: never writes canonical back
         catch (e) { console.error('[Bridge] Codex credential reconciliation failed:', e.message); }
       }
       S.clearWatch(); S.processing = false;
@@ -5222,11 +7167,19 @@ function makeSession(key) {
       }
     });
   };
-  S._sendCodex = (text) => {
+  S._sendCodex = (text, _meta) => {
     S.codexQueue = S.codexQueue || [];
     S.pendingEngine = 'codex';        // [CODEX_DURABLE_V4] journal tag
     S.inFlight.push(text);            // [CODEX_DURABLE_V4] enter the durable queue exactly once (active or queued)
-    journalPending(S);                // persist so a bridge blip can re-inject this Codex turn
+    const _ackRid = (Array.isArray(S._pendingReqIds) && S._pendingReqIds.length) ? S._pendingReqIds.shift() : null;   // [TASK646C] FIFO: this send's own reqId
+    const _persisted = journalPending(S);   // [TASK646B] persist so a bridge blip can re-inject this Codex turn
+    if (_persisted === false && DURABLE_SEND) {   // durable write failed — roll back the queue entry + nack
+      S.inFlight.pop();
+      if (_ackRid && Array.isArray(S._inflightReqIds)) { const _i = S._inflightReqIds.indexOf(_ackRid); if (_i >= 0) S._inflightReqIds.splice(_i, 1); }
+      try { S.send({ type: 'chat_nack', roomId: S.key, reqId: _ackRid || null, reason: 'persist_failed' }); } catch (e) {}
+      return;
+    }
+    if (_persisted === true && _ackRid) { try { S.send({ type: 'chat_ack', roomId: S.key, reqId: _ackRid }); } catch (e) {} }   // [TASK646C] ACK only after durable persist
     // An idle *Claude* persistent proc occupies the slot but isn't a Codex turn
     // in flight. Tear it down so Codex can run; Claude losslessly resumes from
     // its transcript (--resume <sessionId>) on its next turn.
@@ -5250,19 +7203,48 @@ function makeSession(key) {
   // [CODEX_DURABLE_V4] Dispatch to a SPECIFIC engine without touching the room's saved
   // engineOverride, preserving each engine's browser-warming. Used by normal dispatch
   // (via sendToClaude) and by blip-replay recovery.
-  S.sendToEngine = (engine, text) => {
-    if (engine === 'codex') return S._sendCodex(text);
+  S.sendToEngine = (engine, text, meta) => {
+    if (engine === 'codex') return S._sendCodex(text, meta);
     if (roomStack && !S.currentProc) {
       if (!S.processing) S.send({ type: 'thinking' });
       roomStack.ensureRoom(S.key)
         .catch(e => console.log('[Bridge] ensureRoom failed, using fallback MCP:', e.message))
-        .then(() => S._sendNow(text));
+        .then(() => S._sendNow(text, meta));
       return;
     }
-    S._sendNow(text);
+    S._sendNow(text, meta);
   };
-  S.sendToClaude = (text) => S.sendToEngine((S.engineOverride || currentEngine()), text);
+  S.sendToClaude = (text, meta) => S.sendToEngine((S.engineOverride || currentEngine()), text, meta);
 
+  // [COMPACT_ACCT_STABLE_V1] Return {which,resetsAt} if the session context-owner Claude
+  // account is at its session (5h) or weekly (7d) limit, else null. Reuses the usage
+  // snapshot the bridge already scrapes; reset-aware (a rolled-over window reads 0%).
+  S._compactOwnerExhausted = () => {
+    const owner = S.contextOwnerClaudeAccount;
+    if (!owner) return null;
+    let u = null;
+    try { u = normalizeUsage(readAccountUsageByName(owner)); } catch (e) {}
+    if (!u) return null;
+    const cap = Number(process.env.BRIDGE_COMPACT_EXHAUST_PCT || 100);
+    if (u.seven_day_pct != null && u.seven_day_pct >= cap) return { which: '7d', resetsAt: u.seven_day_resets_at || null };
+    if (u.five_hour_pct != null && u.five_hour_pct >= cap) return { which: '5h', resetsAt: u.five_hour_resets_at || null };
+    return null;
+  };
+  // [COMPACT_ACCT_STABLE_V1] Pin the next Claude spawn to the context-owner account so
+  // /compact runs on the account holding this session context — never a rotated-to or
+  // switched-to account. Retires an idle worker on a different account and holds a pending
+  // pane-switch for just this turn (released when the compaction turn completes, see E5).
+  S._pinClaudeCompaction = () => {
+    const owner = S.contextOwnerClaudeAccount;
+    if (!owner) return false;
+    const liveClaude = S.currentProc && S.procEngine === 'claude';
+    if (liveClaude && S.credentialClaudeAccount === owner && !S.pendingClaudeCredentialRefresh) return false;   // already on the owner — /compact steers straight in
+    if (liveClaude && !S.processing) { try { S.currentProc.kill('SIGKILL'); } catch (e) {} S.currentProc = null; S.procEngine = null; }
+    S.pendingClaudeCredentialRefresh = false;   // don't let a pane-switch retire our pin this turn
+    S.credentialClaudeAccount = owner;           // spawnProc keeps a non-null pin
+    S._compactPinActive = true;
+    return true;
+  };
   S.maybeAutoCompact = () => {
     if (S.conf && S.conf.status === 'running') return;   // [CONFERENCE_V1] never inject /compact during a conference
     const tokenBudget = AUTO_COMPACT_TOKENS > 0;
@@ -5274,12 +7256,18 @@ function makeSession(key) {
       : (S.ctxPct != null && S.ctxPct >= AUTO_COMPACT_PCT);
     if (!over) return;
     if (Date.now() - S.lastCompactAt < AUTO_COMPACT_COOLDOWN_MS) return;
+    const _caEng = S.engineOverride || currentEngine();   // [COMPACT_ACCT_STABLE_V1]
+    if (_caEng === 'claude' && S.contextOwnerClaudeAccount) {
+      const _caEx = S._compactOwnerExhausted();
+      if (_caEx) { S.lastCompactAt = Date.now(); console.log('[Bridge] [COMPACT_ACCT_STABLE_V1] auto-compaction deferred — context account ' + S.contextOwnerClaudeAccount + ' at its ' + _caEx.which + ' limit; retry after it resets'); return; }
+    }
     S.compacting = true;
     S.lastCompactAt = Date.now();
     const where = tokenBudget ? `${S.ctxTokens} tokens (threshold ${AUTO_COMPACT_TOKENS})` : `${S.ctxPct}% (threshold ${AUTO_COMPACT_PCT}%)`;
     const human = tokenBudget ? `~${Math.round(S.ctxTokens / 1000)}k tokens` : `${S.ctxPct}%`;
     console.log(`[Bridge] Auto-compacting session ${S.sessionId} at ${where}`);
     S.send({ type: 'status', text: `🗜 Context at ${human} — auto-compacting to free space…` });
+    if (_caEng === 'claude') S._pinClaudeCompaction();   // [COMPACT_ACCT_STABLE_V1]
     S.sendToClaude('/compact');
   };
 
@@ -5326,12 +7314,28 @@ wss.on('connection', (ws) => {
     // Send status/session/state directly to this socket only (others are already up to date).
     ws.send(JSON.stringify({ type: 'status', text: 'Connected to Claude Code bridge. Ready.' }));
     if (S.buffer.length) { const b = S.buffer; S.buffer = []; for (const d of b) { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(d)); } }
+    try { flushFailed(S, ws); } catch (e) {}   // [TASK646C] replay durable failed turns to this socket, then consume
     if (S.sessionId) {
       ws.send(JSON.stringify({ type: 'session_id', id: S.sessionId }));
-      // Push saved history so a second device loads the same conversation.
-      const hist = chatData[S.sessionId];
-      if (hist && Array.isArray(hist.messages) && hist.messages.length) {
-        ws.send(JSON.stringify({ type: 'history_sync', messages: hist.messages }));
+      // [MOBILE_RESYNC_V1] Push saved history so a second device loads the same conversation,
+      // AND so a reconnecting/foregrounded client reconciles to the authoritative transcript.
+      // Tagged with room identity + resync:true, and sent EVEN WHEN EMPTY so a client showing
+      // stale rows for a now-empty room clears them. Skipped for a live/paused conference —
+      // confRecover below re-emits the conference-authoritative conf_sync instead.
+      const _confLiveHere = S.conf && (S.conf.status === 'running' || S.conf.status === 'paused');
+      if (!_confLiveHere) {
+        const hist = chatData[S.sessionId];
+        const _baseMsgs = (hist && Array.isArray(hist.messages)) ? hist.messages : [];
+        if (ROOM_RECOVER) {   // [ROOMVIEW_STALL_V1] reconcile the tail the live stream may have dropped
+          const _capKey = S.key, _capSid = S.sessionId;
+          roomRecoverMerge(_capSid, _capSid, _baseMsgs).then(merged => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            if (!S || S.key !== _capKey) return;   // socket switched rooms mid-read — reject stale result
+            ws.send(JSON.stringify({ type: 'history_sync', roomId: _capKey, sessionId: _capSid, processing: !!S.processing, resync: true, messages: merged, hiddenMids: roomHiddenMids(_capSid) }));
+          }).catch(() => {});
+        } else {
+          ws.send(JSON.stringify({ type: 'history_sync', roomId: S.key, sessionId: S.sessionId, processing: !!S.processing, resync: true, messages: _baseMsgs, hiddenMids: roomHiddenMids(S.sessionId) }));
+        }
       }
     }
     // [ROOMLINK_V1] The link named a room we cannot resolve to any real conversation: tell
@@ -5341,6 +7345,8 @@ wss.on('connection', (ws) => {
       ws.send(JSON.stringify({ type: 'room_unresolved', roomId: key, kind: String(key).startsWith('draft-') ? 'draft' : 'unknown' }));
     }
     ws.send(JSON.stringify(S.engineState()));
+    // [WAKE_V1] push this room's wake states to the joining socket (scoped to the joined room)
+    try { for (const _w of Object.values(wakes)) { if (_w.roomKey === key) ws.send(JSON.stringify({ type: 'wake_state', wake: wakePublic(_w) })); } } catch (e) {}
     if (S.processing) ws.send(JSON.stringify({ type: 'thinking' }));
     try {
       const _cdisk = confLoad(S.key);   // [CONFERENCE_ROOMSWITCH_V1] load inside try so a read failure follows the intended error handling
@@ -5402,6 +7408,8 @@ wss.on('connection', (ws) => {
       // Client stall-watchdog liveness probe: report this room's real turn
       // state so the UI can self-recover a missed 'done' (permanent spinner).
       ws.send(JSON.stringify({ type: 'room_status', processing: !!S.processing, pendingTurns: S.pendingTurns || 0 }));
+    } else if (msg.type === 'failed_ack') {
+      try { ackFailed(S.key, Array.isArray(msg.ids) ? msg.ids : []); } catch (e) {}   // [TASK646F] client confirmed a durable failed record
     } else if (msg.type === 'set_engine') {
       if (msg.roomId !== S.key || !['claude', 'codex', 'global'].includes(msg.mode)) return;
       if (S.processing || S.pendingTurns > 0 || confActive(S)) {
@@ -5444,6 +7452,14 @@ wss.on('connection', (ws) => {
           `(images render visually) before responding:\n${list}\n]`;
       }
       if (!prompt.trim()) return;
+      // [TASK646B] Durable-send dedup. reqId is client-minted and stable across resend/replay.
+      // If it is already in flight (a resend, or a journal replay re-registered it), re-ACK and
+      // return — converge onto the single in-flight dispatch instead of running the turn twice.
+      const _rid = (typeof msg.reqId === 'string' && /^[A-Za-z0-9:_.-]{1,80}$/.test(msg.reqId)) ? msg.reqId : null;
+      if (_rid && ((Array.isArray(S._inflightReqIds) && S._inflightReqIds.includes(_rid)) || isReqDone(S.key, _rid))) {
+        try { S.send({ type: 'chat_ack', roomId: S.key, reqId: _rid, dedup: true }); } catch (e) {}   // [TASK646C] in-flight OR already-completed -> converge, never re-dispatch
+        return;
+      }
       // Broadcast the user's text to all OTHER sockets so every device shows the prompt.
       const displayText = (msg.text || '').trim();
       // [CONF_USERROW_IDENTITY_V1] ONE display rule, three consumers (the sender's optimistic
@@ -5515,6 +7531,11 @@ wss.on('connection', (ws) => {
         }
         S.turnEngine = _captured.engine;
         S.send({ type: 'turn_engine', engine: _captured.engine });
+        if (_rid) {   // [TASK646B] register synchronously (no await before this) so journalPending persists it and the ack fires post-persist
+          if (!Array.isArray(S._inflightReqIds)) S._inflightReqIds = [];
+          if (!Array.isArray(S._pendingReqIds)) S._pendingReqIds = [];
+          S._inflightReqIds.push(_rid); S._pendingReqIds.push(_rid);
+        }
         S.sendToEngine(_captured.engine, prompt);
       }
     } else if (msg.type === 'resume_session') {
@@ -5532,6 +7553,41 @@ wss.on('connection', (ws) => {
         persistRoom(S);   // [CODEX_DURABLE_V3] persist adopted Claude session
         S.send({ type: 'session_id', id });
       }
+    } else if (msg.type === 'request_resync') {
+      // [MOBILE_RESYNC_V1] Targeted, read-only rehydrate for the REQUESTING socket only
+      // (ws.send, never S.send — that would broadcast to every device in the room). Room
+      // identity is authoritative; an empty payload is sent too so a stale client for a
+      // now-empty room clears. A live/paused conference returns its own authoritative
+      // conf_sync projection (running OR paused — a paused conference still owns the room).
+      {
+        const _c = S && S.conf;
+        if (_c && (_c.status === 'running' || _c.status === 'paused')) {
+          try {
+            ws.send(JSON.stringify({ type: 'conf_sync', userRowIdentity: 1, roomId: S.key, task: _c.task || null, startReqId: _c.startReqId || null,
+                                     messages: confDisplayMessages(S.key, _c) || [],
+                                     status: _c.status, stage: _c.stage, stageLabel: confStageLabel(_c.stage, _c.taskType), subphase: _c.subphase,
+                                     round: _c.round, maxRounds: _c.maxRounds, restriction: confRestrictionMode(_c),
+                                     leadEngine: _c.leadEngine, reviewEngine: _c.reviewEngine }));
+          } catch (e) {}
+        } else if (S && S.sessionId) {
+          try {
+            ws.send(JSON.stringify({ type: 'session_id', id: S.sessionId }));
+            const hist = chatData[S.sessionId];
+            const _baseMsgs = (hist && Array.isArray(hist.messages)) ? hist.messages : [];
+            if (ROOM_RECOVER) {   // [ROOMVIEW_STALL_V1] reconcile the tail the live stream may have dropped
+              const _capKey = S.key, _capSid = S.sessionId;
+              roomRecoverMerge(_capSid, _capSid, _baseMsgs).then(merged => {
+                if (ws.readyState !== WebSocket.OPEN) return;
+                if (!S || S.key !== _capKey) return;   // socket switched rooms mid-read — reject stale result
+                ws.send(JSON.stringify({ type: 'history_sync', roomId: _capKey, sessionId: _capSid, processing: !!S.processing, resync: true, messages: merged, hiddenMids: roomHiddenMids(_capSid) }));
+              }).catch(() => {});
+            } else {
+              ws.send(JSON.stringify({ type: 'history_sync', roomId: S.key, sessionId: S.sessionId, processing: !!S.processing, resync: true, messages: _baseMsgs, hiddenMids: roomHiddenMids(S.sessionId) }));
+            }
+          } catch (e) {}
+        }
+        // pure draft (no conf, no session): nothing authoritative to sync — no-op
+      }
     } else if (msg.type === 'conf_start') {   // [CONFERENCE_V1]
       const brief = (msg.brief || '').toString().trim();
       if (!brief) return;
@@ -5539,8 +7595,31 @@ wss.on('connection', (ws) => {
     } else if (msg.type === 'conf_pause') { confPause(S);
     } else if (msg.type === 'conf_resume') { confResume(S);
     } else if (msg.type === 'conf_stop') { confStop(S);
+    } else if (msg.type === 'conf_activate') {   // [CONF_ACTIVATE_UI_V1] restart-to-activate from the room; same gate as POST /__conf/activate
+      const _c = S && S.conf;
+      if (!_c || _c.status !== 'running') { try { S.send({ type: 'status', text: 'No running conference to activate.' }); } catch {} }
+      else if (_c.stage !== 'verification') { try { S.send({ type: 'status', text: 'Restart-to-activate is only available at the verification stage (currently ' + (_c.stage || '?') + ').' }); } catch {} }
+      else { try { confRequestActivation(S, {}); } catch (e) { try { S.send({ type: 'status', text: 'Activation failed: ' + e.message }); } catch {} } }
+    } else if (msg.type === 'conf_watchdog_recover') {   // [CONF_WATCHDOG_V1 · TASK #181]
+      const _wdSecret = confWatchdogSecret();
+      let _wdOutcome;
+      if (!_wdSecret || msg.token !== _wdSecret) _wdOutcome = 'UNAUTHORIZED';
+      else { try { _wdOutcome = confWatchdogRecover(S); } catch (e) { _wdOutcome = 'ERROR'; } }
+      ws.send(JSON.stringify({ type: 'conf_watchdog_result', roomId: S.key, outcome: _wdOutcome }));
+
     } else if (msg.type === 'compact') {
       console.log('[Bridge] Compacting session:', S.sessionId);
+      const _mcEng = S.engineOverride || currentEngine();   // [COMPACT_ACCT_STABLE_V1]
+      if (_mcEng === 'claude' && S.contextOwnerClaudeAccount) {
+        const _mcEx = S._compactOwnerExhausted();
+        if (_mcEx) {
+          let _mcRt = 'later';
+          try { if (_mcEx.resetsAt) _mcRt = new Date(_mcEx.resetsAt * 1000).toLocaleString('en-US', { timeZone: 'America/Argentina/Buenos_Aires', hour: 'numeric', minute: '2-digit' }); } catch (e) {}
+          S.send({ type: 'status', text: 'Compaction deferred \u2014 the context account is at its ' + (_mcEx.which === '7d' ? 'weekly' : 'session') + ' limit (resets ' + _mcRt + '). Try again after it resets.' });
+          return;
+        }
+        S._pinClaudeCompaction();
+      }
       S.sendToClaude('/compact');
     } else if (msg.type === 'cancel') {
       S.killCurrentProc('user cancel');
@@ -5559,6 +7638,22 @@ wss.on('connection', (ws) => {
         detach(ws, S);
         attach(ws._clientId, target);
         console.log('[Bridge] Socket switched to room:', target);
+      }
+    } else if (msg.type === 'hide_message' || msg.type === 'unhide_message') {
+      // [HIDE_BUBBLE_V1] UI-only hide of a single bubble for ALL viewers of the room.
+      // The append-only .jsonl transcript is never modified; fully reversible.
+      const _hbKey = (S && S.key) ? S.key : msg.sessionId;
+      const _hbMid = (typeof msg.mid === 'string') ? msg.mid : '';
+      if (_hbKey && _hbMid && /^[A-Za-z0-9:_.-]{1,120}$/.test(_hbMid)) {
+        let _rec = chatData[_hbKey];
+        if (!_rec) _rec = chatData[_hbKey] = { messages: [], updated_at: Date.now() };
+        if (!Array.isArray(_rec.hiddenMids)) _rec.hiddenMids = [];
+        const _hi = _rec.hiddenMids.indexOf(_hbMid);
+        if (msg.type === 'hide_message' && _hi < 0) _rec.hiddenMids.push(_hbMid);
+        else if (msg.type === 'unhide_message' && _hi >= 0) _rec.hiddenMids.splice(_hi, 1);
+        _rec.updated_at = Date.now();
+        saveChatData();
+        try { S.send({ type: 'hidden_update', roomId: _hbKey, hiddenMids: _rec.hiddenMids.slice() }); } catch (e) {}
       }
     } else if (msg.type === 'save_history') {
       if (Array.isArray(msg.messages)) {
@@ -5586,7 +7681,8 @@ wss.on('connection', (ws) => {
             }
             if (!_skip) upsertRows(_hk, _rows, 'client');
           } else if (msg.sessionId) {
-            chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now() };
+            const _prevH = chatData[msg.sessionId];   // [HIDE_BUBBLE_V1] keep hidden-bubble set across full replace
+            chatData[msg.sessionId] = { messages: msg.messages, updated_at: Date.now(), hiddenMids: (_prevH && Array.isArray(_prevH.hiddenMids)) ? _prevH.hiddenMids : [] };
             saveChatData();
           }
         } catch (e) {
@@ -5691,7 +7787,7 @@ try {
   };
   global.__ORCH = _orchRT.attach({
     app, clientSessions, makeSession, restoreRoom, confStart,
-    sendToEngine: (S, text) => S.sendToClaude(text),
+    sendToEngine: (S, text, meta) => S.sendToClaude(text, meta),
     killRoom: (S, reason) => { try { S.killCurrentProc(reason); } catch (e) {} },
     taskApi: {
       create: (t) => _taskCall('POST', '', { title: t.title, description: t.description }),

@@ -108,6 +108,11 @@ const targetUrl = new Map();            // targetId -> last known url (for order
 // per change (amortised), so index translation self-corrects after the churn that
 // causes drift WITHOUT paying an upstream round-trip on every forwarded call.
 let orderDirty = true;
+// [SHIM_MISMATCH_RECONCILE_V1] Dedicated reconciliation trigger. Set ONLY by repairOrder when
+// a sentinel-proven index differs from the local hint (a real drift). selectTargetProven
+// consumes it with ONE successful resyncOrder(). Routine add/removeTarget churn and reinit do
+// NOT set it — no per-call order re-derivation (the reverted regression).
+let orderMismatch = false;
 let cdpWs = null, cdpReady = null, cdpId = 0;
 const cdpPending = new Map();
 
@@ -396,6 +401,34 @@ function ensureCDP() { if (!cdpReady) cdpReady = connectCDP().catch(e => { cdpRe
 async function cdpCloseTarget(id) {
   try { await fetch(`${CDP_URL}/json/close/${id}`); return true; } catch { return false; }
 }
+// [SHIM_POISON_REAP_V2] Verified CDP close for PROOF-CRITICAL sites only (crash handler,
+// watchdog reap, new stuck-tab reaper): success ONLY on a 2xx /json/close AND confirmed
+// disappearance of that exact id from /json (or Target.targetDestroyed having pruned it),
+// all under ONE absolute deadline. Fire-and-forget logical-eviction sites (LRU evict, admin/
+// room close, stale/bridge reap) keep the fast cdpCloseTarget above ON PURPOSE — they do
+// intentional logical removal and rely on the evictedTabs reaper as backstop, so they must
+// not block on verification. [Codex#6]
+async function cdpCloseVerified(id, until) {
+  if (Date.now() >= until) return false;
+  try {
+    const r = await fetchDL(CDP_URL + '/json/close/' + id, until);
+    if (!r.ok) { log('cdpCloseVerified: /json/close non-2xx', r.status, String(id).slice(0, 12)); return false; }
+  } catch (e) { log('cdpCloseVerified: close request failed', String(e && e.message || e)); return false; }
+  // [Codex#r4] Authoritative proof ONLY: the exact id must be absent from a fresh deadline-
+  // bounded /json. Do NOT treat local pageTargets absence as proof — that can be false after a
+  // CDP ws reconnect (clears pageTargets), a missed targetCreated, or a /json-discovered leak
+  // that was never added to pageTargets. Chrome /json is the only authoritative liveness source.
+  while (Date.now() < until) {
+    let gone = false;
+    try { const list = await fetchJsonDL(CDP_URL + '/json', until); gone = !list.some(t => t.id === id); } catch { gone = false; }
+    if (gone) return true;
+    const remaining = until - Date.now();
+    if (remaining <= 0) break;
+    await new Promise(res => setTimeout(res, Math.min(100, remaining)));
+  }
+  log('cdpCloseVerified: target still present within deadline', String(id).slice(0, 12));
+  return false;
+}
 // [SHIM_CRASH_AUTOCLOSE_V1] A crashed renderer is NOT destroyed — Chrome keeps the
 // page target alive as a zombie, so Playwright's browser_tabs re-attaches to it and
 // blocks for its full 30s timeout on EVERY call (the poisoned-tab wedge). CDP
@@ -406,11 +439,16 @@ async function cdpCloseTarget(id) {
 function onTargetCrashed(id) {
   if (pageTargets.length > 1) {
     log('target crashed', id, '- CDP-closing zombie tab before it wedges browser_tabs');
-    cdpCloseTarget(id).catch(() => {});
+    // [Codex#1] Do NOT removeTarget() optimistically — a local removal would forge
+    // cdpCloseVerified's disappearance proof (a 2xx close on a still-alive target would read
+    // as verified). Let real Target.targetDestroyed / confirmed /json absence drive removal.
+    (async () => { if (await cdpCloseVerified(id, Date.now() + 4000)) removeTarget(id); })().catch(() => {});
   } else {
     log('target crashed', id, '- last page, leaving for watchdog sweep');
+    // [Codex#1] Do NOT removeTarget() the sole crashed page: leaving it locally absent would
+    // later forge cdpCloseVerified's disappearance proof. Keep it tracked; the watchdog restart
+    // is the documented recovery for the sole-page case. Real destroy / /json absence prunes it.
   }
-  removeTarget(id);
 }
 
 // Add-only reconcile of pageTargets against Chrome's authoritative /json list.
@@ -432,10 +470,10 @@ async function refreshTargetsHTTP() {
 
 /* ---------- upstream MCP (Streamable HTTP / SSE) ---------- */
 function parseSSE(t) { let o = null; for (const l of t.split('\n')) { const m = l.match(/^data: (.*)$/); if (m) { try { o = JSON.parse(m[1]); } catch {} } } return o; }
-async function up(body) {
+async function up(body, { signal } = {}) {
   const h = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream' };
   if (upstreamSid) h['Mcp-Session-Id'] = upstreamSid;
-  const r = await fetch(UPSTREAM, { method: 'POST', headers: h, body: JSON.stringify(body) });
+  const r = await fetch(UPSTREAM, { method: 'POST', headers: h, body: JSON.stringify(body), signal });
   if (r.status !== 200 && process.env.SHIM_DEBUG) log('up() status', r.status, 'for', body.method || (body.params && body.params.name));
   if (r.status === 404 && upstreamSid) { closeUpStream(); upstreamSid = null; throw new Error('upstream session expired'); }
   const sid = r.headers.get('mcp-session-id'); if (sid) upstreamSid = sid;
@@ -448,7 +486,112 @@ async function ensureUpstream() {
   await up({ jsonrpc: '2.0', method: 'notifications/initialized' });
   log('upstream MCP session initialised');
 }
-const tool = (name, args) => up({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method: 'tools/call', params: { name, arguments: args || {} } });
+const tool = (name, args, opts) => up({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method: 'tools/call', params: { name, arguments: args || {} } }, opts);
+// [SHIM_TABS_BOUNDED_V1] Bounded upstream browser_tabs helpers + deadline-enforced reaper.
+const TABS_TIMEOUT_MS = parseInt(process.env.SHIM_TABS_TIMEOUT_MS || '6000');
+const REAP_DEADLINE_MS = parseInt(process.env.SHIM_REAP_DEADLINE_MS || '4000');
+// One absolute deadline (a timestamp) threaded through every fetch. Zero/negative budget
+// fails immediately (never grants a fresh budget). [Codex#2]
+async function fetchDL(url, until) {
+  const remaining = until - Date.now();
+  if (remaining <= 0) throw new Error('deadline exceeded');
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), remaining);
+  try { return await fetch(url, { signal: ctrl.signal }); } finally { clearTimeout(t); }
+}
+// Deadline-aware JSON fetch: keeps the abort timer active THROUGH body consumption so a hung
+// response body cannot exceed the deadline. [Codex boundedness note]
+async function fetchJsonDL(url, until) {
+  const remaining = until - Date.now();
+  if (remaining <= 0) throw new Error('deadline exceeded');
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), remaining);
+  try { const r = await fetch(url, { signal: ctrl.signal }); return await r.json(); } finally { clearTimeout(t); }
+}
+// Three-state renderer probe [Codex#2/#5]: correlate the Runtime.evaluate(id:1) reply.
+//  healthy = a matching SUCCESS response; stuck = matching protocol ERROR, OR ws opened then
+//  silent-till-timeout, OR error/close AFTER open before a valid reply (failed renderer);
+//  unknown = failure BEFORE the ws opened (no evidence). Only 'stuck' is closed.
+function probeRendererState(wsUrl, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false, ws, opened = false;
+    const finish = (s) => { if (done) return; done = true; clearTimeout(t); try { ws && ws.close(); } catch {} resolve(s); };
+    const t = setTimeout(() => finish(opened ? 'stuck' : 'unknown'), Math.max(1, timeoutMs));
+    try {
+      ws = new WebSocket(wsUrl, { perMessageDeflate: false });
+      ws.on('open', () => { opened = true; try { ws.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: '0', returnByValue: true } })); } catch { finish('stuck'); } });
+      ws.on('message', (d) => { let m; try { m = JSON.parse(d); } catch { return; } if (m.id !== 1) return; finish(m.error ? 'stuck' : 'healthy'); });
+      ws.on('error', () => finish(opened ? 'stuck' : 'unknown'));
+      ws.on('close', () => finish(opened ? 'stuck' : 'unknown'));
+    } catch { finish('unknown'); }
+  });
+}
+async function reapStuckTargets(deadlineMs) {
+  // Concurrent, deadline-bounded reap of positively-stuck renderers. Works while Playwright
+  // browser_tabs is wedged. Probes EVERY page (incl. last — poison may be last) concurrently
+  // under ONE absolute deadline; verified-closes only stuck ones; preserves >=1 page (keep a
+  // deterministic survivor if closing all stuck would empty the window). Returns targetIds
+  // proven gone. Never restarts the stack. [SHIM_POISON_REAP_V2]
+  const until = Date.now() + Math.max(0, deadlineMs || 0);
+  let pages;
+  try { pages = (await fetchJsonDL(CDP_URL + '/json', until)).filter(t => t.type === 'page'); } catch { return []; }
+  if (pages.length <= 1) return [];                       // sole page: never close (outside guarantee)
+  const results = await Promise.all(pages.map(async p => {
+    if (!p.webSocketDebuggerUrl) return { p, state: 'unknown' };
+    const remaining = until - Date.now();
+    if (remaining <= 0) return { p, state: 'unknown' };
+    // Reserve ~half the remaining budget for the verified-close phase so a positively-stuck
+    // tab is still closable within the SAME absolute deadline (a silent probe must not eat it all).
+    return { p, state: await probeRendererState(p.webSocketDebuggerUrl, Math.min(POISON_PROBE_MS, Math.max(1, Math.floor(remaining / 2)))) };
+  }));
+  let toClose = results.filter(r => r.state === 'stuck').map(r => r.p);
+  if (!toClose.length) return [];
+  if (pages.length - toClose.length < 1) {               // never close the last page
+    const survivor = toClose.map(p => p.id).sort()[0];
+    toClose = toClose.filter(p => p.id !== survivor);
+  }
+  const closed = await Promise.all(toClose.map(async p => {
+    const ok = await cdpCloseVerified(p.id, until);
+    if (ok) { removeTarget(p.id); log('reapStuckTargets closed stuck-renderer tab', p.id, (p.url || '').slice(0, 60)); }
+    return ok ? p.id : null;
+  }));
+  return closed.filter(Boolean);
+}
+async function tabsListBounded(allowRecovery) {
+  // Bounded browser_tabs LIST. On AbortError (wedge signature) reap poisoned targets and retry
+  // the idempotent list ONCE, only if >=1 target was verified-closed; else fail closed. The
+  // abort does not cancel Playwright server-side — the CDP close releases it.
+  if (allowRecovery === undefined) allowRecovery = true;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TABS_TIMEOUT_MS);
+  try { return await tool('browser_tabs', { action: 'list' }, { signal: ctrl.signal }); }
+  catch (e) {
+    if (!(e && e.name === 'AbortError') || !allowRecovery) throw e;
+    log('tabsListBounded: list hung — reaping stuck renderer(s)');
+    const closed = await reapStuckTargets(REAP_DEADLINE_MS);
+    if (!closed.length) throw new Error('browser_tabs list wedged; no stuck target verified-closed (fail-closed; watchdog backstop)');
+    const ctrl2 = new AbortController();
+    const t2 = setTimeout(() => ctrl2.abort(), TABS_TIMEOUT_MS);
+    try { return await tool('browser_tabs', { action: 'list' }, { signal: ctrl2.signal }); }
+    finally { clearTimeout(t2); }
+  } finally { clearTimeout(t); }
+}
+async function tabsSelectBounded(index) {
+  // Bounded browser_tabs SELECT. On AbortError reap; if a target was verified-closed the caller
+  // must RELOCATE by sentinel (indices shifted) — signalled by a tagged error. NEVER retries
+  // the stale numeric index.
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TABS_TIMEOUT_MS);
+  try { return await tool('browser_tabs', { action: 'select', index: index }, { signal: ctrl.signal }); }
+  catch (e) {
+    if (!(e && e.name === 'AbortError')) throw e;
+    log('tabsSelectBounded: select hung — reaping stuck renderer(s)');
+    const closed = await reapStuckTargets(REAP_DEADLINE_MS);
+    const err = new Error(closed.length ? 'SELECT_RELOCATE' : 'browser_tabs select wedged; no stuck target verified-closed (fail-closed)');
+    err.relocate = closed.length > 0;
+    throw err;
+  } finally { clearTimeout(t); }
+}
 
 // A poisoned upstream session (404) or a Playwright "page closed" error is
 // recoverable: drop the session, re-initialise, and re-run the operation once.
@@ -461,7 +604,7 @@ const isTransient = (s) => /session expired|has been closed|Target page|Session 
 // index translation in selectCurrent stays correct. Order-independent, self-healing.
 async function resyncOrder() {
   try {
-    const r = await up({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'browser_tabs', arguments: { action: 'list' } } });
+    const r = await tabsListBounded();   // [SHIM_TABS_BOUNDED_V1] self-heals a wedge during resync
     const text = ((r && r.result && r.result.content) || []).map(x => x.text).join('\n');
     const urls = [];
     for (const l of text.split('\n')) { const m = l.match(/^\s*-\s*\d+:.*\(([^)]*)\)\s*$/); if (m) urls.push(m[1]); }
@@ -514,7 +657,7 @@ function _noteReinit() {
     setTimeout(() => process.exit(0), 200);              // let the log flush
   }
 }
-async function reinit() { _noteReinit(); closeUpStream(); upstreamSid = null; toolsCache = null; orderDirty = true; await ensureUpstream(); await resyncOrder(); }
+async function reinit() { _noteReinit(); closeUpStream(); upstreamSid = null; toolsCache = null; orderDirty = true; await ensureUpstream(); /* [Codex#3] no eager resync: sentinel selection detects real drift, then arms orderMismatch for ONE deferred resyncOrder */ }
 async function withRetry(fn) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let r;
@@ -531,7 +674,7 @@ async function withRetry(fn) {
 // turns" 404 BEFORE any non-idempotent tab mutation runs.
 async function ensureSession() {
   await ensureUpstream();
-  const r = await tool('browser_tabs', { action: 'list' });
+  const r = await tabsListBounded();
   if (r && r.error && isTransient(JSON.stringify(r.error))) throw new Error('session probe: ' + JSON.stringify(r.error));
   return r;
 }
@@ -695,7 +838,9 @@ async function setPageTitle(ws, t) {
 }
 function repairOrder(tid, idx) {
   const at = pageTargets.indexOf(tid);
-  if (at !== idx) { if (at >= 0) pageTargets.splice(at, 1); pageTargets.splice(Math.min(idx, pageTargets.length), 0, tid); orderDirty = true; }
+  // A candidate/observed index divergence IS the observed mismatch: fix this tid now AND arm
+  // exactly one full resyncOrder() on the next select. [SHIM_MISMATCH_RECONCILE_V1]
+  if (at !== idx) { if (at >= 0) pageTargets.splice(at, 1); pageTargets.splice(Math.min(idx, pageTargets.length), 0, tid); orderMismatch = true; }
 }
 // [SHIM_SELECT_VERIFY_V4] The sentinel's lifecycle is owned by the OUTER locked dispatch
 // transaction (see tools/call). `_txnCleanups` is the per-transaction list of installed
@@ -760,23 +905,32 @@ async function proveSelect(tid, candidateIdx) {
       _armed.delete(activeRoom + ':forceWrongCandidate'); _forceWrong = true;
       log('[TESTHOOK] forcing Attempt-1 onto a WRONG tab for', activeRoom, '(must trigger Attempt-2 relocation)');
     }
-    // Attempt 1 — cheap candidate index (hint). Proof = selected current bears our sentinel.
-    let sel;
-    if (_forceWrong) {
-      const rows0 = parseTabsFull(await tool('browser_tabs', { action: 'list' }));
-      const wrong = rows0.find(r => r.title !== sentinel) || rows0[0];
-      sel = await tool('browser_tabs', { action: 'select', index: wrong ? wrong.index : 0 });
-    } else {
-      sel = (candidateIdx != null && candidateIdx >= 0) ? await tool('browser_tabs', { action: 'select', index: candidateIdx }) : null;
+    // Attempt 1 — cheap candidate index (hint). BOUNDED: a wedged select reaps the poisoned
+    // tab and signals relocation (indices shifted); it never retries the stale index.
+    let sel = null;
+    try {
+      if (_forceWrong) {
+        const rows0 = parseTabsFull(await tabsListBounded());
+        const wrong = rows0.find(r => r.title !== sentinel) || rows0[0];
+        sel = await tabsSelectBounded(wrong ? wrong.index : 0);
+      } else if (candidateIdx != null && candidateIdx >= 0) {
+        sel = await tabsSelectBounded(candidateIdx);
+      }
+    } catch (e) {
+      if (!e || (e.message !== 'SELECT_RELOCATE' && e.name !== 'AbortError')) throw e;
+      // [Codex#3] Do NOT arm orderMismatch here: a reaped target already updated pageTargets via
+      // removeTarget, so this is not an OBSERVED index mismatch. Relocate by sentinel; repairOrder
+      // arms reconciliation ONLY if the local index differs from the proven Playwright index.
+      sel = null;
     }
     let cur = sel ? parseTabsFull(sel).find(r => r.current) : null;
     if (!(cur && cur.title === sentinel)) {
-      // Attempt 2 — locate the sentinel's true index and select THAT, then re-verify.
+      // Attempt 2 — locate the sentinel's true index in the CURRENT topology and select THAT.
       let rows = sel ? parseTabsFull(sel) : [];
       let hit = rows.find(r => r.title === sentinel);
-      if (!hit) { rows = parseTabsFull(await tool('browser_tabs', { action: 'list' })); hit = rows.find(r => r.title === sentinel); }
+      if (!hit) { rows = parseTabsFull(await tabsListBounded()); hit = rows.find(r => r.title === sentinel); }
       if (!hit) throw new Error('sentinel not visible in MCP tab list for ' + String(tid).slice(0, 12) + ' — cannot prove identity (fail-closed)');
-      sel = await tool('browser_tabs', { action: 'select', index: hit.index });
+      sel = await tabsSelectBounded(hit.index);
       cur = parseTabsFull(sel).find(r => r.current);
       if (!cur || cur.title !== sentinel) throw new Error('select did not land on the sentinel-proven tab ' + String(tid).slice(0, 12) + ' (fail-closed)');
     }
@@ -795,10 +949,16 @@ async function proveSelect(tid, candidateIdx) {
 // Returns the proven select-list result. Throws (fail-closed) if unprovable.
 async function selectTargetProven(tid) {
   if (!tid) throw new Error('selectTargetProven: no target');
-  if (orderDirty) await resyncOrder();
+  // [SHIM_MISMATCH_RECONCILE_V1] Reconcile the FULL order ONLY when a prior sentinel/index
+  // mismatch was observed (repairOrder armed orderMismatch), and clear it ONLY once resyncOrder
+  // actually succeeds [Codex#4] — the sentinel proof in proveSelect is the fail-closed guard
+  // while reconciliation is still pending. Routine churn does NOT force a resync.
+  if (orderMismatch && await resyncOrder()) orderMismatch = false;
   let idx = pageTargets.indexOf(tid);
-  if (idx < 0) { await resyncOrder(); idx = pageTargets.indexOf(tid); }
-  const sel = await proveSelect(tid, idx);   // sentinel-proven identity, fail-closed
+  // Missing locally = a membership gap (a targetCreated the CDP ws dropped), NOT an ordering
+  // problem: restore membership from /json (add-only), do not re-derive Playwright ordering.
+  if (idx < 0) { await refreshTargetsHTTP(); idx = pageTargets.indexOf(tid); }
+  const sel = await proveSelect(tid, idx);   // sentinel-proven identity, bounded, self-heals a wedge
   tabTouch.set(tid, Date.now());
   return sel;
 }
@@ -822,7 +982,7 @@ async function roomTabList(rt) {
   // session makes this raw read 404 ('session expired') and return empty, which
   // would silently render a live room as having NO tabs. Retry heals it (a list
   // read is idempotent, so re-running after reinit is safe).
-  const listRes = await withRetry(() => tool('browser_tabs', { action: 'list' }));
+  const listRes = await withRetry(() => tabsListBounded());
   const full = ((listRes && listRes.result) || {}).content || [];
   const map = parseTabList(full.map(x => x.text).join('\n'));
   const lines = rt.tabs.map((tid, i) => `- ${i}:${tid === rt.current ? ' (current)' : ''} ${map.get(pageTargets.indexOf(tid)) || '(tab)'}`);
@@ -1241,7 +1401,7 @@ async function reapPoisonedTabs() {
     if (remaining <= 1) break;                       // never close the last page
     if (!p.webSocketDebuggerUrl) continue;
     if (await probeRenderer(p.webSocketDebuggerUrl, POISON_PROBE_MS)) continue;   // healthy, keep
-    if (await cdpCloseTarget(p.id)) {
+    if (await cdpCloseVerified(p.id, Date.now() + POISON_PROBE_MS)) {
       remaining--; closed++;
       removeTarget(p.id);                            // drop tracking + detach from its room (re-creates on next use)
       log('WATCHDOG closed poisoned tab', p.id, (p.url||'').slice(0,60));

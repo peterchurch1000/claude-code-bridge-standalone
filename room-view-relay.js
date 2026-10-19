@@ -536,7 +536,7 @@ async function handleInput(room, ev) {
     if (ev.k === 'mouse') {
       await send('Input.dispatchMouseEvent', {
         type: ev.type, x: ev.x, y: ev.y,
-        button: ev.button || 'none', clickCount: ev.clickCount || 0,
+        button: ev.button || 'none', buttons: ev.buttons || 0, clickCount: ev.clickCount || 0,
         modifiers: ev.modifiers || 0,
       }, sid);
     } else if (ev.k === 'wheel') {

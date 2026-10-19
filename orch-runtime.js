@@ -263,7 +263,7 @@ function attach(deps) {
       const task = c.taskFile ? { id: c.taskShortId, file: c.taskFile, title: c.title } : null;
       confStart(S, text + '\n\n' + CHILD_REPORT_CONTRACT, { task });
     } else {
-      sendToEngine(S, text);
+      sendToEngine(S, text, { instructionPlacement: 'append' });   // [ROOM_INSTR_INJECT_V1] room instructions after the task scaffold at spawn
     }
     log('[ORCH_V1] spawned child ' + c.cid + ' (' + c.mode + ') room=' + c.roomKey);
   }
