@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>cauth modal harness</title>
+<!-- [CAUTH_MODAL_BOUNDED_V1] TEMPORARY verification harness — delete after verification.
+     Reproduces the exact DOM that app.js openAccountSwitcher() builds (.cauth-overlay >
+     .cauth-modal > .cauth-head + .cauth-body > .cauth-intro + #acct-list + #acct-msg) with
+     N fabricated account rows, and loads the REAL deployed stylesheet.
+       ?n=20   how many account rows to fabricate (default 8)
+       ?css=…  which stylesheet to test (default style.css); fetched as text and injected
+               into a <style> so a .bak file's MIME type can't block the negative control.
+     No app.js, no WebSocket, no room — this page has no effect on the bridge. -->
+<style id="css-under-test"></style>
+</head>
+<body>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var ROWS = Math.max(0, parseInt(q.get('n') || '8', 10) || 0);
+  var CSS  = q.get('css') || 'style.css';
+
+  var esc = function (s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); };
+
+  // One account row, mirroring app.js render(): .acct-top (name + active badge + ✎ ↻ 🗑),
+  // .acct-email, then the [CODEX_ACCT_USAGE_V1] 5h/7d meter + "as of" line.
+  function row(i, isCodex, isActive) {
+    var bars =
+      '<span class="acct-usage acct-usage-bars">' +
+        '<span class="acct-ubar-row"><span class="acct-ubar-label">5h</span>' +
+          '<span class="acct-ubar-track"><span class="acct-ubar-fill" style="width:42%;background:#4caf7d"></span></span>' +
+          '<span class="acct-ubar-pct">42%</span><span class="acct-ubar-time">resets 19:30</span></span>' +
+        '<span class="acct-ubar-row"><span class="acct-ubar-label">7d</span>' +
+          '<span class="acct-ubar-track"><span class="acct-ubar-fill" style="width:71%;background:#e09a20"></span></span>' +
+          '<span class="acct-ubar-pct">71%</span><span class="acct-ubar-time">resets Tue 09:00</span></span>' +
+        '<span class="acct-ubar-asof">as of 3m ago</span>' +
+      '</span>';
+    return '<button class="acct-item' + (isActive ? ' acct-active acct-current' : '') + (isCodex ? ' acct-codex' : '') + '">' +
+        '<span class="acct-top">' +
+          '<span class="acct-name">' + esc((isCodex ? 'codex-' : 'claude-') + i) + '</span>' +
+          (isActive ? '<span class="acct-badge">active</span>' : '') +
+          '<span class="acct-edit">✎</span>' +
+          '<span class="acct-edit acct-reauth">↻</span>' +
+          '<span class="acct-edit acct-del">🗑</span>' +
+        '</span>' +
+        '<span class="acct-email">' + esc('account' + i + '@example.com') + '</span>' +
+        bars +
+      '</button>';
+  }
+  function addRow(label, sub) {
+    return '<button class="acct-item acct-add"><span class="acct-name">' + esc(label) +
+           '</span><span class="acct-email">' + esc(sub) + '</span></button>';
+  }
+
+  var claudeN = Math.ceil(ROWS / 2), codexN = ROWS - claudeN, html = '';
+  if (ROWS) {
+    html += '<div class="acct-group-label">Code accounts</div>';
+    for (var i = 1; i <= claudeN; i++) html += row(i, false, i === 1);
+    html += addRow('➕ Add Claude account', 'sign in to a new Claude account');
+    if (codexN > 0) {
+      html += '<div class="acct-group-label">Codex accounts</div>';
+      for (var j = 1; j <= codexN; j++) html += row(j, true, j === 1);
+    }
+    html += addRow('➕ Add Codex account', 'sign in to a new ChatGPT (Codex) account');
+  } else {
+    html += '<p class="cauth-intro">No saved accounts yet — add one below.</p>' +
+            addRow('➕ Add Claude account', 'sign in to a new Claude account') +
+            addRow('➕ Add Codex account', 'sign in to a new ChatGPT (Codex) account');
+  }
+
+  document.body.innerHTML =
+    '<div class="cauth-overlay">' +
+      '<div class="cauth-modal">' +
+        '<div class="cauth-head"><span>👤 Switch Claude account</span>' +
+          '<button class="cauth-x" title="Close">✕</button></div>' +
+        '<div class="cauth-body">' +
+          '<p class="cauth-intro">Pick which saved Claude account this pane runs on. Switching starts a fresh chat on that account — no sign-in needed.</p>' +
+          '<div id="acct-list" class="acct-list">' + html + '</div>' +
+          '<div id="acct-msg" class="cauth-msg"></div>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+
+  // The single invariant reporter both Playwright and raw CDP call.
+  function report() {
+    var xEl = document.querySelector('.cauth-x');
+    var mEl = document.querySelector('.cauth-modal');
+    var bEl = document.querySelector('.cauth-body');
+    var x = xEl.getBoundingClientRect(), m = mEl.getBoundingClientRect();
+    var hit = document.elementFromPoint(x.left + x.width / 2, x.top + x.height / 2);
+    return {
+      css: CSS, rows: ROWS, vw: innerWidth, vh: innerHeight,
+      xRect: { top: +x.top.toFixed(1), bottom: +x.bottom.toFixed(1), left: +x.left.toFixed(1), right: +x.right.toFixed(1) },
+      xInViewport: x.top >= 0 && x.bottom <= innerHeight && x.left >= 0 && x.right <= innerWidth,
+      xHittable: !!hit && (hit === xEl || xEl.contains(hit)),
+      modalH: +m.height.toFixed(1), modalTop: +m.top.toFixed(1),
+      modalFitsViewport: m.height <= innerHeight + 0.5,
+      bodyIsScroller: bEl.scrollHeight > bEl.clientHeight + 1,
+      verticallyCentred: Math.abs(m.top - (innerHeight - m.height) / 2) < 2,
+      bodyScrollTop: bEl.scrollTop
+    };
+  }
+  window.report = report;
+  window.scrollBodyToEnd = function () {
+    var b = document.querySelector('.cauth-body');
+    b.scrollTop = b.scrollHeight;
+    return report();
+  };
+
+  // Inject the stylesheet under test as text (MIME-agnostic, so a .bak works too),
+  // then flag readiness for the test driver.
+  fetch(CSS, { cache: 'no-store' })
+    .then(function (r) { return r.text(); })
+    .then(function (t) { document.getElementById('css-under-test').textContent = t; })
+    .catch(function (e) { document.title = 'CSS LOAD FAILED: ' + e.message; })
+    .then(function () {
+      window.__harnessReady = true;
+      document.documentElement.setAttribute('data-harness-ready', '1');
+      // ?auto=1 — print the invariants into the DOM so a plain
+      // `chrome --headless --dump-dom` run can assert without any CDP client.
+      // Synchronous, not rAF: headless --dump-dom snapshots without necessarily
+      // running animation frames. Reading getBoundingClientRect forces layout anyway.
+      if (q.get('auto') === '1') {
+        var before = report(), after = window.scrollBodyToEnd();
+        var pre = document.createElement('pre');
+        pre.id = 'harness-out';
+        pre.textContent = 'HARNESS_JSON ' + JSON.stringify({ before: before, afterScrollToEnd: after });
+        document.body.appendChild(pre);
+      }
+    });
+})();
+</script>
+</body>
+</html>

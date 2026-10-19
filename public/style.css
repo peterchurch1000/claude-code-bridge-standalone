@@ -84,7 +84,12 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 #session-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 #session-list::-webkit-scrollbar { width: 4px; }
 #session-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-#session-footer { flex: 0 0 auto; max-height: 40vh; overflow-y: auto; }
+/* [ROOMSEARCH_MAINFLOOR_V1] While a search has >=1 matching active/open room, reserve a floor
+   for the primary list so the (now shrinkable) Task/Archived footer can't squeeze it out of
+   view. Gated on the .dd-has-main-results class (set in applySessionFilter) so the compact
+   non-search and Task/Archived-only layouts keep their natural height. */
+#session-dropdown.dd-has-main-results #session-list { min-height: 33vh; }
+#session-footer { flex: 0 1 auto; max-height: 40vh; overflow-y: auto; }
 #session-footer .sess-new { border-bottom: none; border-top: 1px solid var(--border); }
 #task-rooms-box { max-height: 200px; overflow-y: auto; }
 #archived-rooms-box { max-height: 200px; overflow-y: auto; }
@@ -135,7 +140,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 
 #status-bar {
   padding: 5px 12px; font-size: 11px; color: var(--text-dim);
-  border-bottom: 1px solid var(--border); min-height: 24px;
+  border-bottom: 1px solid var(--border); min-height: 21px;
   flex-shrink: 0; background: #0f1620;
 }
 #status-bar:empty { min-height: 0; border: none; }
@@ -569,7 +574,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
      render as identical rounded rects (31 wide × 21 tall) with their icon centred. */
   #btn-menu, #btn-status, #btn-search, #btn-tasks, #btn-settings, #btn-browser-toggle {
     display: inline-flex; align-items: center; justify-content: center;
-    width: 31px; height: 21px; padding: 0; gap: 0;
+    width: 23px; height: 21px; padding: 0; gap: 0;
     background: none; border: 1px solid var(--border); color: var(--text-dim);
     border-radius: 6px; font-size: 15px; line-height: 1;
     cursor: pointer; font-family: inherit; box-sizing: border-box; flex-shrink: 0;
@@ -585,6 +590,8 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
     background: var(--bg-header); border: 1px solid var(--border); border-radius: 6px;
     box-shadow: 0 6px 20px rgba(0,0,0,0.5);
     width: min(340px, 92vw); padding: 4px 0;
+    /* [TASK221_STATUS_STACK_SCROLL_V1] cap height + scroll so a tall nav dropdown never overflows the viewport unreachably */
+    max-height: 85dvh; overflow-y: auto; overscroll-behavior: contain;
   }
   #status-stack:not(.open) { display: none; }
   #status-stack #conn-bar,
@@ -668,6 +675,7 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
 /* Markdown in assistant messages */
 .msg-assistant p  { margin: 0 0 0px; }
 .msg-assistant p:last-child { margin-bottom: 0; }
+.msg-assistant > p + p { margin-top: 0.75em; }  /* half-line gap between adjacent paragraphs */
 .msg-assistant strong { color: #e0e8ff; font-weight: 700; }
 .msg-assistant em  { font-style: italic; color: #c8d4f0; }
 .msg-assistant code { background: var(--bg-code); border: 1px solid var(--border); border-radius: 3px; padding: 2px 9px; font-family: monospace; font-size: 12px; color: #a0d0ff; }
@@ -765,6 +773,20 @@ html, body { height: 100%; overflow: hidden; background: var(--bg-dark); color: 
   transition: color 0.2s, border-color 0.2s;
 }
 #btn-attach:hover { color: var(--text); border-color: var(--accent); }
+/* Visible keyboard focus for the role="button" label (task #321). */
+#btn-attach:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+  color: var(--text); border-color: var(--accent);
+}
+
+/* Off-screen-but-rendered file input: kept in the layout/render tree (NOT
+   display:none) so the native <label for> picker activation and keyboard focus
+   both work on mobile; display:none inputs don't reliably open the picker. Mirrors
+   the #kbd-capture rationale elsewhere in this file. (task #321) */
+.sr-file-input {
+  position: fixed; left: -9999px; top: 0;
+  width: 1px; height: 1px; opacity: 0;
+}
 
 /* ── Pending-attachment chips ── */
 #attach-bar {
@@ -1190,7 +1212,7 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
   background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 6px 20px rgba(0,0,0,.5); }
 #color-pop.hidden { display: none; }
-#color-pop .sw { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--border);
+#color-pop .sw { width: 23px; height: 26px; border-radius: 6px; border: 1px solid var(--border);
   cursor: pointer; color: var(--text-dim); font-size: 14px; line-height: 24px; text-align: center; padding: 0; }
 #color-pop .sw.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
 #color-pop .sw-sep { flex: 0 0 100%; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; margin: 4px 0 -2px; }
@@ -1291,3 +1313,40 @@ mark.search-mark-active { background: #f59e0b; box-shadow: 0 0 0 2px rgba(245,15
   font-size: 10px; opacity: 0.45; font-variant-numeric: tabular-nums;
   white-space: nowrap; user-select: none; -webkit-user-select: none;
 }
+
+/* [NEWTAB_TOPBAR_V1] New-room-in-new-tab button in the header title bar */
+#btn-newtab-top {
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text-dim); text-decoration: none; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 4px; padding: 2px 5px;
+  line-height: 0; transition: color 0.2s, border-color 0.2s;
+}
+#btn-newtab-top:hover { color: var(--text); border-color: var(--accent); }
+
+/* BTN_UNIFORM_V1 */
+/* Make every header icon-button render at the exact same pixel size */
+#btn-tasks,
+#btn-newtab-top,
+#btn-menu,
+#btn-search,
+#btn-browser-toggle,
+#btn-settings {
+  box-sizing: border-box;
+  width: 23px;
+  height: 21px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+/* keep glyph buttons visually consistent inside the fixed box */
+#btn-menu { font-size: 15px; }
+#btn-settings { font-size: 14px; }
+
+/* [ROOMEDIT_FULLWIDTH_V3] focused rename input overlays the full row, overflowing other controls */
+#session-titlebar.st-editing .st-rename-input{ position:absolute; left:12px; right:12px; top:50%; transform:translateY(-50%); z-index:30; max-width:none; box-sizing:border-box; }
+
+/* Delegated (person assigned) — subtle tint [PERSON_DELEGATED_V1] */
+.task-row.delegated { background: color-mix(in srgb, var(--purple) 14%, var(--bg-msg)); }
+.task-row.delegated:hover { background: color-mix(in srgb, var(--purple) 22%, var(--bg-hover)); }
