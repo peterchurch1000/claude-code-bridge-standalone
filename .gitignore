@@ -142,3 +142,20 @@ init-auth.js
 
 # ...but committed test suites under tests/ are source, not stray root scripts
 !tests/**/test-*.cjs
+
+# Per-worker staging & pre-activate editing backups (kept on disk, out of git)
+*.preactivate-*
+*.staged-*
+*.stg-*
+*.new-*
+*.instr
+*.dsw-w*
+.dsw-w*/
+
+# AppleDouble / resource-fork junk
+._*
+
+# One-off deploy patchers and their captured output
+patch-*.cjs
+*-out.txt
+verification-results/
