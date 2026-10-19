@@ -1452,7 +1452,7 @@
       b.onclick = function () { _confInheritStart(t); };   // [CONF_TITLE_PARALLEL_V1]
     });
     p.querySelector('#conf-t-find').onclick = _confModalFindView;
-    p.querySelector('#conf-t-new').onclick = _confModalGeneratingView;   // TASK_TITLE_HAIKU_V1
+    p.querySelector('#conf-t-new').onclick = _confCreateDeferred;   // [RS_CREATE_DEFER_V1]
     p.querySelector('#conf-t-none').onclick = _confNoneStart;   // [CONF_TITLE_PARALLEL_V1]
     p.querySelector('#conf-t-cancel').onclick = function () { closeConfTaskModal(true); };
   }
@@ -2651,19 +2651,26 @@
         // idle but our UI is still busy, we missed the 'done' — recover the UI.
         if (msg.processing) {
           lastStreamAt = Date.now();   // genuinely alive; reset the stall clock
-        } else if (busy) {
-          removeThinking();
-          setBusy(false);
-          currentAssistantEl   = null;
-          currentAssistantText = '';
-          lastToolEl = null;
-          updateLastQuestion();
-          showToast('Recovered — the reply had already finished', 'info');
-          // [ROOMVIEW_STALL_V1] The turn finished but the live stream dropped its tail
-          // (the trailing tool calls + closing summary are in the transcript, not the
-          // pane). Pull the server-reconciled history so the dropped tail renders now,
-          // rather than leaving the pane frozen on the last tool call until a reload.
-          try { requestResync(); } catch (_) {}
+        } else {
+          if (busy) {
+            removeThinking();
+            setBusy(false);
+            currentAssistantEl   = null;
+            currentAssistantText = '';
+            lastToolEl = null;
+            updateLastQuestion();
+            showToast('Recovered — the reply had already finished', 'info');
+            // [ROOMVIEW_STALL_V1] The turn finished but the live stream dropped its tail
+            // (the trailing tool calls + closing summary are in the transcript, not the
+            // pane). Pull the server-reconciled history so the dropped tail renders now,
+            // rather than leaving the pane frozen on the last tool call until a reload.
+            try { requestResync(); } catch (_) {}
+          }
+          // [GSD_ROOM_SPIN_RECONCILE_V1] Server confirms this room is idle: drop any stale
+          // live-turn flag at once so the room-button spinner clears immediately -- even if
+          // `busy` already desynced to false while _liveTurnRoom lingered. Faster than waiting
+          // for the next 15s room-monitor poll.
+          if (_liveTurnRoom) { _liveTurnRoom = null; try { _updateRoomDots(); } catch (e) {} }
         }
         break;
 
@@ -4968,7 +4975,8 @@
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rt-back" style="cursor:pointer;padding:4px 8px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">←</button><div style="font-size:15px;font-weight:600">Create task & link this room</div></div>' +
       '<div id="rt-note" style="display:none;font-size:12px;opacity:.75;margin:0 0 10px"></div>' +
       '<label style="font-size:12px;opacity:.7">Title</label>' +
-      '<input id="rt-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 10px">' +
+      '<input id="rt-title" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 6px">' +
+      '<div id="rt-title-choices" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 10px"></div>' +   /* [RS_CREATE_DEFER_V1] */
       '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
       '<textarea id="rt-desc" rows="4" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb;margin:4px 0 12px;resize:vertical"></textarea>' +
       '<div id="rt-fields" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 12px"></div>' +
@@ -4979,6 +4987,26 @@
     const titleEl = p.querySelector('#rt-title'), descEl = p.querySelector('#rt-desc'), cb = p.querySelector('#rt-create'), errEl = p.querySelector('#rt-err');
     titleEl.value = String((seed && seed.title) || '').replace(/\s+/g, ' ').trim().slice(0, 120);   // TASK_TITLE_HAIKU_V1
     descEl.value = String((seed && seed.description) || '');
+    // [RS_CREATE_DEFER_V1] One-tap fills: the Haiku title or the original typed text; the
+    // input stays freely editable for a custom title.
+    (function () {
+      const box = p.querySelector('#rt-title-choices'); if (!box) return;
+      const _haiku = String((seed && seed.title) || '').replace(/\s+/g, ' ').trim();
+      const _origT = String((seed && seed.originalTitle) || '').replace(/\s+/g, ' ').trim();
+      const chip = function (label, val) {
+        if (!val) return;
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = label; b.title = val;
+        b.style.cssText = 'cursor:pointer;font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid #4b5563;background:#1f2937;color:#cbd5e1;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        b.onclick = function () { titleEl.value = val.slice(0, 120); try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch (e) {} };
+        box.appendChild(b);
+      };
+      if (_haiku || _origT) {
+        const lab = document.createElement('span'); lab.textContent = 'Use:'; lab.style.cssText = 'font-size:11px;opacity:.6'; box.appendChild(lab);
+        chip('\u2728 ' + _haiku, _haiku);
+        chip('\u21a9 Original', _origT);
+      }
+    })();
     // [ROOMTASK_HAIKU_V3] Area + Project, identical to the conference create form:
     // same picker widget, same option source (distinct values across all tasks), same
     // blank default and "New..." escape hatch.
@@ -5054,6 +5082,67 @@
     if (pendingTaskLink) return true;
     try { return _rtLinkedTasks().length > 0; } catch (e) { return false; }
   }
+  // >>> RS_CREATE_DEFER_V1 — "Create a new task" without a spinner: send now, create later.
+  // Poll until the room id is durable (server-confirmed, non-draft) so the task_rooms link
+  // persists across the draft->session promotion; then run cb(rid). Bails if the user has
+  // navigated to a different existing room. Fires anyway after ~20s as a last resort.
+  function _afterRoomConfirmed(startRid, cb, tries) {
+    tries = tries || 0;
+    const rid = String(currentRoomId || '');
+    if (!startRid.startsWith('draft-') && rid !== startRid) return;   // navigated away
+    if ((roomServerConfirmed && rid && !rid.startsWith('draft-')) || tries > 40) { cb(rid); return; }
+    setTimeout(function () { _afterRoomConfirmed(startRid, cb, tries + 1); }, 500);
+  }
+  // Build the roomtask modal straight into the create form, pre-seeded (no task list, no
+  // spinner). Reuses _rtCreateView, whose Create & link calls _rtPost + _trApply.
+  function openRoomTaskCreate(seed) {
+    if (!roomTaskEnabled()) { showToast('Send a message first to link this room', 'info'); return; }
+    _rtClose();
+    const wrap = document.createElement('div');
+    wrap.id = 'roomtask-modal';
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    wrap.innerHTML = '<div id="roomtask-panel" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:18px"></div>';
+    wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) _rtClose(); });
+    document.body.appendChild(wrap);
+    document.addEventListener('keydown', _rtEsc, true);
+    _rtCreateView(seed);
+  }
+  // Shared: name the room provisionally now, fetch the Haiku title in the background, then
+  // open the pre-seeded create form once the room is confirmed. Used by both the normal and
+  // conference "Create a new task" choices after the message / conference has been dispatched.
+  function _deferredCreateTask(o) {
+    const srcText = String((o && o.text) || '');
+    const startRid = String((o && o.startRid) || currentRoomId || '');
+    try { _rsApplyRoomName(_ttFallback(srcText)); } catch (e) {}   // instant provisional name
+    _ttFetch({ text: srcText, roomId: startRid }).then(function (d) {
+      const haiku = (d && (d.title || d.fallback)) || (d && d.authFailed ? '' : _ttFallback(srcText));
+      const description = (d && d.source) || srcText;
+      if (haiku) {
+        const now = String(currentRoomId || '');
+        if (startRid.startsWith('draft-') || now === startRid) { try { _rsApplyRoomName(haiku); } catch (e) {} }
+      }
+      _afterRoomConfirmed(startRid, function () {
+        if (roomAlreadyLinked()) return;   // user linked via the 🗂 button meanwhile
+        openRoomTaskCreate({ title: haiku, originalTitle: srcText, description: description });
+      });
+    });
+  }
+  // Normal room: dispatch the held first message now (task-less), then create + link later.
+  function _rsCreateDeferred() {
+    const snap = _roomStartPending;
+    const srcText = (snap && snap.text) ? String(snap.text) : '';
+    const startRid = String(currentRoomId || '');
+    submitRoomStart('none', null, null);   // sends the message + closes the modal NOW
+    _deferredCreateTask({ text: srcText, startRid: startRid });
+  }
+  // Conference: start the conference now (task-less), then create + link the task later.
+  function _confCreateDeferred() {
+    const srcText = (pendingConfStart && pendingConfStart.text) ? String(pendingConfStart.text) : '';
+    const startRid = String(currentRoomId || '');
+    submitConfStart('none', null);   // starts the conference + closes the modal NOW
+    _deferredCreateTask({ text: srcText, startRid: startRid });
+  }
+  // <<< RS_CREATE_DEFER_V1
 
   // Dispatch a captured normal-room message snapshot exactly once. Mirrors the non-conference
   // path of sendMessage without ever re-reading mutable composer state. Returns the row mid.
@@ -5162,7 +5251,7 @@
       b.onclick = function () { _rsInheritStart(t); };   // [RS_NONE_TITLE_PARALLEL_V1]
     });
     p.querySelector('#rs-find').onclick = _rsFindView;
-    p.querySelector('#rs-new').onclick = _rsCreateGeneratingView;
+    p.querySelector('#rs-new').onclick = _rsCreateDeferred;   // [RS_CREATE_DEFER_V1]
     p.querySelector('#rs-none').onclick = _rsNoneStart;   // [RS_NONE_TITLE_PARALLEL_V1]
     p.querySelector('#rs-cancel').onclick = _rsCancel;
   }
@@ -5576,7 +5665,7 @@
         sub.textContent = s.snippet;
         btn.appendChild(sub);
       }
-      btn.onclick = () => { sessionDropdown.classList.add('hidden'); enterRoom(s.id, s.id); };
+      btn.onclick = () => { sessionDropdown.classList.add('hidden'); collapseAllTasks(); enterRoom(s.id, s.id); };
       row.appendChild(btn);
       fbox.appendChild(row);
     }
@@ -5723,7 +5812,7 @@
           sub.textContent = subText;
           btn.appendChild(sub);
         }
-        btn.onclick = () => enterRoom(s.id, s.id);
+        btn.onclick = () => { collapseAllTasks(); enterRoom(s.id, s.id); };
         row.dataset.label = ((s.name || '') + ' ' + _taskLabel + ' ' + (s.preview || '') + ' ' + (s.lastMessage || '')).toLowerCase();
         row.dataset.id = s.id || '';   // [ROOMSEARCH_CONTENT_V1] identity for remote-hit reveal
         row.dataset.title = (s.name || _taskLabel || s.preview || '').toLowerCase();   // [ROOMSEARCH_TITLEFIRST_V1] title-only key
@@ -6981,6 +7070,12 @@
   const tasksCountEl    = $('tasks-count');
   const btnTasksRefresh = $('btn-tasks-refresh');
   const openTasks       = new Set();
+  function collapseAllTasks() {   // [TASK_CONCERTINA_V1] fold every expanded task row shut on room open
+    try {
+      openTasks.clear();
+      document.querySelectorAll('.task-row.open').forEach(function (r) { r.classList.remove('open'); });
+    } catch (e) {}
+  }
 
   const statusClass  = s => 's-' + String(s || 'new').replace(/[^a-z-]/g, '');
   const prettyStatus = s => String(s || 'new').replace(/-/g, ' ');
@@ -7623,7 +7718,27 @@
     try { document.querySelectorAll("[data-ccb-agg]").forEach(_applyAggDot); } catch (e) {}   /* [AGG_LIVE_TURN_V1] re-render task dots instantly too */
   }
   async function refreshRoomMonitor() {
-    try { const r = await fetch(API_BASE + "/room-monitor", { cache: "no-store" }); const j = await r.json(); _roomMonitorStatus = (j && j.rooms) || {}; _updateRoomDots(); } catch (e) {}
+    try {
+      const r = await fetch(API_BASE + "/room-monitor", { cache: "no-store" });
+      const j = await r.json();
+      _roomMonitorStatus = (j && j.rooms) || {};
+      // [GSD_ROOM_SPIN_RECONCILE_V1] Self-heal a stuck spinner. _liveTurnRoom is pinned to the
+      // open room only while this tab is busy; a missed "done" (socket blip / mid-turn restart)
+      // leaves it stuck spinning. If the authoritative room-monitor reports that room in a settled
+      // (non-"working") state, the turn really ended -> clear the stale live-turn flag / busy.
+      try {
+        if (_liveTurnRoom) {
+          const _srv = (_roomMonitorStatus[_liveTurnRoom] || {}).status || "";
+          const _settled = _srv && _srv !== "working";
+          if (String(_liveTurnRoom) !== String(currentRoomId)) {
+            if (_settled) { _liveTurnRoom = null; }   // navigated away: clear only on a positive settled signal
+          } else if (_settled && (Date.now() - lastStreamAt) > STALL_MS) {
+            setBusy(false);   // same room, server settled AND no stream for STALL_MS => the done event was missed
+          }
+        }
+      } catch (e) {}
+      _updateRoomDots();
+    } catch (e) {}
   }
   function _startRoomMonitorPolling() {
     if (window._ccbRoomMonitorStarted) return; window._ccbRoomMonitorStarted = true;
@@ -7684,6 +7799,7 @@
     _closeRoomPopover();
     var sid = k.indexOf("draft-") === 0 ? null : k;
     try { window.__ccbT0 = performance.now(); window.__ccbSrc = "dotmenu"; } catch (e0) {}
+    collapseAllTasks();
     enterRoom(k, sid, { keepLayout: true });
     if (window.innerWidth <= LAYOUT_MOBILE_BP) {
       var tp = document.getElementById("tasks-panel");
@@ -7737,7 +7853,7 @@
     const el = document.createElement("span");
     el.setAttribute("data-ccb-agg", JSON.stringify({ rooms: (Array.isArray(t.rooms) ? t.rooms.map(function (r) { return { room_key: r.room_key }; }) : []), oq: (Number(t.open_questions) || 0) }));
     _applyAggDot(el);
-    el.setAttribute("data-ccb-agg-click", "1"); el.addEventListener("click", function (e) { e.stopPropagation(); try { var rooms = Array.isArray(t.rooms) ? t.rooms : []; if (rooms.length > 1) { _showRoomPopover(t, el); return; } /* [Q_CLICK_ANYDOT_V1] single room */ var order = ["question", "stalled", "working", "waiting", "idle", "completed"]; var pick = null; for (var oi = 0; oi < order.length && !pick; oi++) { rooms.forEach(function (r) { var k = String((r && r.room_key) || ""); if (!pick && k && (_roomMonitorStatus[k] || {}).status === order[oi]) pick = k; }); } if (!pick && rooms.length) pick = String((rooms[0] && rooms[0].room_key) || ""); if (pick) { var sid = pick.indexOf("draft-") === 0 ? null : pick; try { window.__ccbT0 = performance.now(); window.__ccbSrc = "dot"; } catch (e0) {} enterRoom(pick, sid, { keepLayout: true }); if (window.innerWidth <= LAYOUT_MOBILE_BP) { var tp = document.getElementById("tasks-panel"); if (tp) { tp.classList.remove("tasks-panel-visible"); tp.classList.add("tasks-panel-hidden"); } var bt = document.getElementById("btn-tasks"); if (bt) bt.classList.remove("active"); try { writeLayout({ t: 0 }); } catch (err2) {} } return; } openTaskDetails(t); } catch (err) { try { openTaskDetails(t); } catch (e2) {} } });
+    el.setAttribute("data-ccb-agg-click", "1"); el.addEventListener("click", function (e) { e.stopPropagation(); try { var rooms = Array.isArray(t.rooms) ? t.rooms : []; if (rooms.length > 1) { _showRoomPopover(t, el); return; } /* [Q_CLICK_ANYDOT_V1] single room */ var order = ["question", "stalled", "working", "waiting", "idle", "completed"]; var pick = null; for (var oi = 0; oi < order.length && !pick; oi++) { rooms.forEach(function (r) { var k = String((r && r.room_key) || ""); if (!pick && k && (_roomMonitorStatus[k] || {}).status === order[oi]) pick = k; }); } if (!pick && rooms.length) pick = String((rooms[0] && rooms[0].room_key) || ""); if (pick) { var sid = pick.indexOf("draft-") === 0 ? null : pick; try { window.__ccbT0 = performance.now(); window.__ccbSrc = "dot"; } catch (e0) {} collapseAllTasks(); enterRoom(pick, sid, { keepLayout: true }); if (window.innerWidth <= LAYOUT_MOBILE_BP) { var tp = document.getElementById("tasks-panel"); if (tp) { tp.classList.remove("tasks-panel-visible"); tp.classList.add("tasks-panel-hidden"); } var bt = document.getElementById("btn-tasks"); if (bt) bt.classList.remove("active"); try { writeLayout({ t: 0 }); } catch (err2) {} } return; } openTaskDetails(t); } catch (err) { try { openTaskDetails(t); } catch (e2) {} } });
     return el;
   }
   function renderInlineRooms(detail, t) {
@@ -7775,6 +7891,7 @@
         if (ic.contains(e.target)) { window.open(buildShareUrl(rm.room_key), '_blank', 'noopener'); return; }
         const sid = String(rm.room_key || '').startsWith('draft-') ? null : rm.room_key;
         try { window.__ccbT0 = performance.now(); window.__ccbSrc = 'link'; } catch (e0) {}
+        collapseAllTasks();
         enterRoom(rm.room_key, sid, { keepLayout: true });
         // [ROOM_INPLACE_OPEN_V3] On mobile the Tasks panel overlays the chat, so after opening the
         // room in this tab, collapse it so the room is actually visible (mirrors the btn-tasks close).
@@ -8330,7 +8447,7 @@
         let keys = [];
         try { keys = JSON.parse(row.dataset.roomKeys || '[]'); } catch (e) { keys = []; }
         const on = (cur && keys.indexOf(cur) !== -1) || (sid && keys.indexOf(sid) !== -1);
-        row.style.background = on ? 'rgba(255,255,255,0.09)' : '';
+        row.classList.toggle('room-current', !!on);   // [ROOM_CURRENT_HL_ROW_V3] clear accent highlight via CSS class
       });
     } catch (e) {}
   }
