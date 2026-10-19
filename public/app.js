@@ -262,7 +262,7 @@
   // CDP-screencast canvas client instead of noVNC — one live window per room.
   const _RV = !!(window.BRIDGE_CONFIG && window.BRIDGE_CONFIG.roomViewer);
   function vncSrcFor(room) {
-    if (_RV) return `${API_BASE}/room-view-client.html?v=10&room=` + encodeURIComponent(room || 'default');
+    if (_RV) return `${API_BASE}/room-view-client.html?v=12&room=` + encodeURIComponent(room || 'default');
     return `${API_BASE}/vnc_clean.html?v=4` + (_PRB && room ? '&room=' + encodeURIComponent(room) : '');
   }
   function setVncRoom(room) {
@@ -777,6 +777,7 @@
   }
 
   let globalEngine = 'claude', codexEnabled = false, roomEngineSync = false;
+  let pendingEngineFork = null;   // [TASK201_SWITCH_ROOM_GATE_V1] a genuine engine change forked a fresh room; awaits room_engine ack to confirm or roll back
   // [ENGINE_GLOBAL_ONLY_V1] The ACTIVE account of each engine, used for the selector's
   // "Claude (email)" labels. `available` is a CREDENTIAL fact from the server (a registered
   // login with a healthy refresh path) — never usage/quota, so an exhausted account still
@@ -802,11 +803,14 @@
   // to dispatch under an engine the user was not shown. currentTurnEngine = engine of the live turn.
   let displayedEngine = null;
   let currentTurnEngine = null;
+  let currentTurnAccount = null;   // [ACCT_PANE_ISO_V1] account snapshot for the live turn (stamped onto its assistant row)
   try {
     const _chipStyle = document.createElement('style');
     _chipStyle.textContent = '.msg-assistant[data-engine]::before{content:"";display:block;width:max-content;font-size:10px;font-weight:600;opacity:.6;margin:0 0 4px;padding:1px 6px;border-radius:4px;letter-spacing:.02em}'
       + '.msg-assistant[data-engine="claude"]::before{content:"🟦 Claude";background:rgba(80,120,255,.16)}'
-      + '.msg-assistant[data-engine="codex"]::before{content:"🟩 Codex";background:rgba(80,200,120,.16)}';
+      + '.msg-assistant[data-engine="codex"]::before{content:"🟩 Codex";background:rgba(80,200,120,.16)}'
+      + '.msg-assistant[data-engine="claude"][data-account]::before{content:"🟦 Claude · " attr(data-account);background:rgba(80,120,255,.16)}'
+      + '.msg-assistant[data-engine="codex"][data-account]::before{content:"🟩 Codex · " attr(data-account);background:rgba(80,200,120,.16)}';
     document.head.appendChild(_chipStyle);
   } catch (e) {}
 
@@ -814,6 +818,44 @@
   let confStreamEngine = null;        // engine whose turn is currently streaming
   let confState = null;               // last known conference state for the current room
   let activeConf = false;             // true while the conference is actively orchestrating
+  let confUsage = { claude: null, codex: null };   // [CONF_USAGE_PANEL_V1] per-engine 5h usage % for the conference status panel
+  let _confUsageKicked = false;                     // [CONF_USAGE_PANEL_V1] one-shot first-paint poll guard
+  // [CONF_USAGE_PANEL_V1] Resolve each engine's active/selected account from a /accounts response and
+  // cache its 5-hour usage %, then repaint the banner. engineAccts is refreshed from the same
+  // poll before this runs, so account resolution uses current selection metadata.
+  function deriveConfUsage(d) {
+    if (!d || !Array.isArray(d.accounts)) return;
+    const claudeEmail = ((engineAccts.claude || {}).email) || d.active || '';
+    const codexEmail  = (engineAccts.codex || {}).email || '';
+    const cAcct = d.accounts.find(a => a.type !== 'codex' && a.email && a.email === claudeEmail)
+               || d.accounts.find(a => a.type !== 'codex' && a.email && a.email === d.active);
+    const xAcct = (codexEmail && d.accounts.find(a => a.type === 'codex' && a.email === codexEmail))
+               || d.accounts.find(a => a.type === 'codex' && a.active);
+    confUsage = { claude: cAcct ? acctUsagePct(cAcct.usage) : null,
+                  codex:  xAcct ? acctUsagePct(xAcct.usage) : null };
+    try { renderConfBanner(); } catch (e) {}
+  }
+  // [CONF_USAGE_PANEL_V1] Paint the two usage clusters flanking the banner: Codex/review left, Claude/lead
+  // right. Hidden unless a conference is running/paused. Compact 5h-only, coloured via usageColor.
+  function paintConfUsage(b) {
+    const active = !!(confState && (confState.status === 'running' || confState.status === 'paused'));
+    const L = b.querySelector('#conf-usage-left');    // Codex / review
+    const R = b.querySelector('#conf-usage-right');   // Claude / lead
+    const cell = (engine, pct) => {
+      const s = document.createElement('span');
+      const lab = document.createElement('span');
+      lab.textContent = (confEngineIcon(engine) + ' ' + confEngineLabel(engine) + ' 5h ');
+      const v = document.createElement('span');
+      if (pct == null) { v.textContent = '\u2014'; v.style.opacity = '.6'; }
+      else { v.textContent = Math.round(pct) + '%'; v.style.color = usageColor(pct); v.style.fontWeight = '600'; }
+      s.appendChild(lab); s.appendChild(v); return s;
+    };
+    if (L) { L.style.display = active ? '' : 'none'; if (active) { L.textContent = ''; L.title = 'Codex (review) \u00B7 5-hour usage'; L.appendChild(cell('codex', confUsage.codex)); } }
+    if (R) { R.style.display = active ? '' : 'none'; if (active) { R.textContent = ''; R.title = 'Claude (lead) \u00B7 5-hour usage'; R.appendChild(cell('claude', confUsage.claude)); } }
+    if (active && !_confUsageKicked && confUsage.claude == null && confUsage.codex == null) {
+      _confUsageKicked = true; try { pollUsage(); } catch (e) {}   // fill promptly on the first paint after a conference starts
+    }
+  }
   let pendingConfStart = null;        // [CONF_TASK_ASSOC_V1] held first-message payload during task-association
   let confStartGuard = false;         // armed from send until accept/cancel; blocks a competing fresh start
   let confAwaitingAck = false;        // sent; waiting for conf_started / conf_need_task
@@ -858,6 +900,8 @@
   let confStreamTurnId = null;
   let _suppressSave = false;
   let _pendingConfSync = null;
+  let _needResyncAfterTurn = false;   // [MOBILE_RESYNC_V1] a tagged frame arrived mid-stream; re-pull a FRESH authoritative frame at 'done' (never replay a stale snapshot)
+  let _resyncInFlight = false;        // [MOBILE_RESYNC_V1] debounce request_resync until a frame lands (or 8s safety)
   function confModeKey(rid) { return 'confmode:' + (rid || currentRoomId); }
   // [ENGINE_GLOBAL_ONLY_V1] Which engine LEADS the conference armed in this room —
   // "Claude Lead Conference Room" vs "Codex Lead Conference Room". The reviewer is always
@@ -1058,21 +1102,29 @@
     b.id = 'conf-banner';
     b.className = 'conf-banner';
     b.style.cssText = 'display:none;position:sticky;top:0;z-index:20;padding:8px 12px;margin:0 0 6px;border-radius:8px;background:#1f2937;color:#e5e7eb;font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 1px 4px rgba(0,0,0,.3)';
-    b.innerHTML = '<span id="conf-banner-text" style="flex:1 1 auto">Conference</span>' +
+    b.innerHTML = '<span id="conf-usage-left" class="conf-usage" style="display:none;white-space:nowrap;font-size:12px;opacity:.95"></span>' +   /* [CONF_USAGE_PANEL_V1] */
+      '<span id="conf-banner-text" style="flex:1 1 auto">Conference</span>' +
       '<span id="conf-banner-task" style="display:none;padding:2px 8px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px" title="Associated task"></span>' +
       '<button id="conf-btn-pause" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Pause</button>' +
       '<button id="conf-btn-resume" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb;display:none">Resume</button>' +
-      '<button id="conf-btn-stop" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#991b1b;color:#fee2e2">Stop</button>';
+      '<button id="conf-btn-activate" class="conf-btn" title="[CONF_ACTIVATE_UI_V1] Restart the bridge to load the verified fix, then auto-resume verification against the live code" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#d1fae5;display:none">\u23FB Restart &amp; activate</button>' +
+      '<button id="conf-btn-stop" class="conf-btn" style="cursor:pointer;padding:3px 10px;border-radius:6px;border:1px solid #7f1d1d;background:#991b1b;color:#fee2e2">Stop</button>' +
+      '<span id="conf-usage-right" class="conf-usage" style="display:none;white-space:nowrap;font-size:12px;opacity:.95"></span>';   /* [CONF_USAGE_PANEL_V1] */
     if (messagesEl && messagesEl.parentNode) messagesEl.parentNode.insertBefore(b, messagesEl);
     else document.body.appendChild(b);
     b.querySelector('#conf-btn-pause').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_pause' })); } catch {} };
     b.querySelector('#conf-btn-resume').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_resume' })); } catch {} };
     b.querySelector('#conf-btn-stop').onclick = () => { try { ws.send(JSON.stringify({ type: 'conf_stop' })); } catch {} };
+    b.querySelector('#conf-btn-activate').onclick = () => {   // [CONF_ACTIVATE_UI_V1]
+      if (!confirm('Restart the bridge now to activate the verified build? The conference will pause and auto-resume verification against the live code after ~3s.')) return;
+      try { ws.send(JSON.stringify({ type: 'conf_activate' })); } catch {}
+    };
     return b;
   }
   function renderConfBanner() {
     const b = ensureConfBanner();
     const c = confState;
+    paintConfUsage(b);   // [CONF_USAGE_PANEL_V1]
     if (!c || c.status === 'stopped' || c.status === 'done' || c.status === 'idle') {
       if (c && (c.status === 'done' || c.status === 'stopped')) {
         b.style.display = '';
@@ -1080,6 +1132,7 @@
         b.querySelector('#conf-btn-pause').style.display = 'none';
         b.querySelector('#conf-btn-resume').style.display = 'none';
         b.querySelector('#conf-btn-stop').style.display = 'none';
+        b.querySelector('#conf-btn-activate') && (b.querySelector('#conf-btn-activate').style.display = 'none');   // [CONF_ACTIVATE_UI_V1]
       } else { b.style.display = 'none'; }
       return;
     }
@@ -1095,6 +1148,7 @@
     b.querySelector('#conf-btn-pause').style.display = c.status === 'running' ? '' : 'none';
     b.querySelector('#conf-btn-resume').style.display = c.status === 'paused' ? '' : 'none';
     b.querySelector('#conf-btn-stop').style.display = '';
+    const _act = b.querySelector('#conf-btn-activate'); if (_act) _act.style.display = (c.status === 'running' && c.stage === 'verification') ? '' : 'none';   // [CONF_ACTIVATE_UI_V1] restart-to-activate only when a fix is ready to prove live
   }
   function confDivider(engine, role, round, stageLabel, ts) {   /* [CONFERENCE_V2] [BUBBLE_TS_V1] */
     const d = document.createElement('div');
@@ -1108,6 +1162,7 @@
   // Render the full server-authoritative conference log (reload / second device).
   function renderConfSync(msg) {
     if (!Array.isArray(msg.messages)) return;
+    if (msg.roomId && msg.roomId !== currentRoomId) return;   // [MOBILE_RESYNC_V1] a delayed conf_sync for a room we no longer show must never clear resync state or repaint the current room
     // [CONFERENCE_HISTORY_V1] Never DROP a sync that lands mid-stream — defer it and
     // apply on the next 'done' so the authoritative log always wins eventually.
     // [CONF_USERROW_IDENTITY_V1] Authoritative arrival IS acknowledgement. This runs BEFORE
@@ -1116,6 +1171,7 @@
     // opens a FRESH grace window, so a frame sent before a disconnect and processed after the
     // sync is never failed on the age of its original send.
     confIdentNote(msg);   // [CONF_USERROW_IDENTITY_V1]
+    _needResyncAfterTurn = false; _resyncInFlight = false;   // [MOBILE_RESYNC_V1] conference frame is authoritative for this room; drop any deferred/inflight ordinary resync
     try {
       const _prid = msg.roomId || currentRoomId;
       for (const _m of msg.messages) if (_m && _m.mid) confPendResolveMid(_prid, _m.mid);
@@ -1181,6 +1237,7 @@
   // NOT touch confmode:<rid> (the per-room engine-selector choice).
   function resetConfUI() {
     confState = null; activeConf = false; confStreamEngine = null;
+    confUsage = { claude: null, codex: null }; _confUsageKicked = false;   // [CONF_USAGE_PANEL_V1]
     confBubbleByTurn = {}; confDividerByTurn = {}; confStreamTurnId = null; _pendingConfSync = null;   // [CONFERENCE_HISTORY_V1]
     const b = document.getElementById('conf-banner');
     if (b) { b.style.display = 'none'; const t = b.querySelector('#conf-banner-text'); if (t) t.textContent = ''; }
@@ -1219,9 +1276,9 @@
   function _ttInvalidate() { _ttGen++; }
   // [TASK_TITLE_HAIKU_V2] Last resort when the server is unreachable. Mirrors the
   // server heuristic so the Title is never the raw typed sentence (defect #1).
-  const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new').split(' '));
+  const _TT_STOP = new Set(('a an the of to in on at for and or but if so then than that this those these it its is are was were be been being am do does did done can could would should will shall may might must i we you he she they them us our your my his her their me him not no yes just really very quite some any all with as from by about into over under out up down want wants wanted need needs needed like likes liked make makes made get gets got go goes went let lets please kind sort way ways thing things able new one two three something somehow whether add adds added adding investigate investigating look looking also maybe perhaps actually basically anything everything someone somebody trying try consider figure id ive im ill dont cant wont didnt doesnt isnt arent wasnt werent youre theyre weve hes shes thats whats heres').split(' '));
   function _ttFallback(s) {
-    const raw = String(s || '').replace(/https?:\/\/\S+/g, ' ').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(Boolean);
+    const raw = String(s || '').replace(/https?:\/\/\S+/g, ' ').replace(/['\u2019]/g, '').replace(/[^A-Za-z0-9\s-]/g, ' ').split(/\s+/).filter(function (w) { return w.length > 1; });
     if (!raw.length) return '';
     const content = raw.filter(w => !_TT_STOP.has(w.toLowerCase()));
     const picked = (content.length ? content : raw).slice(0, 7);
@@ -1231,8 +1288,8 @@
     const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     let timer = null;
     // [ROOMTASK_HAIKU_V3] the describe call generates two fields, so it gets the longer
-    // client budget; it must always outlive the server's own kill timer (18s).
-    if (ctl) timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, (body && body.describe) ? 22000 : 15000);
+    // client budget; it must always outlive the server's own kill timer (25s).
+    if (ctl) timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, 28000);
     const done = function (v) { if (timer) { clearTimeout(timer); timer = null; } return v; };
     return fetch(API_BASE + '/task-title', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1267,7 +1324,7 @@
       if (myGen !== _ttGen) return;        // superseded by a teardown / navigation
       if (!_confPanel()) return;           // modal is gone
       _confModalCreateView({
-        title: (d.title || d.fallback || _ttFallback(srcText)),
+        title: (d.title || d.fallback || (d && d.authFailed ? '' : _ttFallback(srcText))),
         description: (d.source || srcText)
       });
     });
@@ -1313,8 +1370,9 @@
   }
   function _confModalEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeConfTaskModal(true); } }
   function submitConfStart(taskDecision, task) {
+    try { _consumeInheritTaskSeed(String(currentRoomId || '')); } catch (e) {}   // [ROOM_TASK_INHERIT_V1] spend the seed once a conference start decision is made
     if (!pendingConfStart) return;
-    if (ws && ws.readyState !== WebSocket.OPEN) { showToast('Sin conexi\u00f3n \u2014 reintenta', 'warning'); return; }
+    if (ws && ws.readyState !== WebSocket.OPEN) { showToast('No connection — retry', 'warning'); return; }
     const p = pendingConfStart;
     p.reqId = confUuid(); p.taskDecision = taskDecision; p.task = task || null;
     p.snapText = inputEl.value; p.snapAtt = pendingAttachments.map(a => a.path).join('|');
@@ -1337,20 +1395,65 @@
     document.addEventListener('keydown', _confModalEsc, true);
     _confModalRootView();
   }
+  // >>> CONF_TITLE_PARALLEL_V1 — non-blocking title generation for the conference modal.
+  // Dispatch the opening message immediately; name the room in the background. The name is
+  // cosmetic and never gates the conference. the task-creation path stays blocking by design.
+  function _confNoneStart() {
+    const srcText = (pendingConfStart && pendingConfStart.text) ? String(pendingConfStart.text) : '';
+    const startRid = String(currentRoomId || '');
+    submitConfStart('none', null);   // starts the conference + dispatches NOW
+    _ttFetch({ text: srcText, roomId: startRid }).then(function (d) {
+      const nm = (d && (d.title || d.fallback)) || (d && d.authFailed ? '' : _ttFallback(srcText));
+      if (!nm) return;
+      const now = String(currentRoomId || '');
+      if (!startRid.startsWith('draft-') && now !== startRid) return;   // navigated away
+      _rsApplyRoomName(nm);
+    });
+  }
+  function _confInheritStart(t) {
+    const _t = { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') };
+    const openingText = (pendingConfStart && pendingConfStart.text) ? String(pendingConfStart.text) : '';
+    const startRid = String(currentRoomId || '');
+    // Link + start the conference immediately (server does the task_rooms link from
+    // taskDecision:'linked'); name provisionally from the parent title with NO confirm.
+    submitConfStart('linked', _t);
+    _rsRefineInheritName(startRid, _t, _t.title);
+    // ...then refine to a short Haiku subtitle in the background so sibling conferences
+    // off the same parent task stay distinguishable.
+    _ttFetch({ text: openingText }).then(function (d) {
+      const sub = (d && (d.title || d.fallback)) || (d && d.authFailed ? '' : _ttFallback(openingText));
+      if (!sub) return;
+      _rsRefineInheritName(startRid, _t, sub);
+    });
+  }
+  // <<< CONF_TITLE_PARALLEL_V1
   function _confModalRootView() {
     const p = _confPanel(); if (!p) return;
+    if (!(_inheritedParentTask && _inheritedParentTask.length)) {   // [ROOM_TASK_INHERIT_V1] pop-out new-tab path: hydrate from the persisted seed
+      _inheritedParentTask = _readInheritTaskSeed(currentRoomId);
+    }
+    var _confInheritHtml = (_inheritedParentTask || []).map(function (t, i) {   // [ROOM_TASK_INHERIT_V1]
+      return '<button id="conf-inherit-' + i + '" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb"></button>';
+    }).join('');
     p.innerHTML =
       '<div style="font-size:15px;font-weight:600;margin-bottom:4px">\uD83E\uDD1D Associate this conference with a task?</div>' +
       '<div style="font-size:12px;opacity:.7;margin-bottom:14px">Choose an option to continue. The conference will start after your choice.</div>' +
       '<div style="display:flex;flex-direction:column;gap:8px">' +
+      _confInheritHtml +
       '<button id="conf-t-find" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\uD83D\uDD0D Find an existing task</button>' +
       '<button id="conf-t-new" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2795 Create a new task</button>' +
       '<button id="conf-t-none" style="text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb">\u2014 Continue without a task</button>' +
       '</div>' +
       '<div style="margin-top:14px;text-align:right"><button id="conf-t-cancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
+    (_inheritedParentTask || []).forEach(function (t, i) {   // [ROOM_TASK_INHERIT_V1] TASKROOM_PARENT_PREFIX_V2: one button -> generate -> naming step
+      var b = p.querySelector('#conf-inherit-' + i);
+      if (!b) return;
+      b.textContent = '↳ Continue with parent\'s task';
+      b.onclick = function () { _confInheritStart(t); };   // [CONF_TITLE_PARALLEL_V1]
+    });
     p.querySelector('#conf-t-find').onclick = _confModalFindView;
     p.querySelector('#conf-t-new').onclick = _confModalGeneratingView;   // TASK_TITLE_HAIKU_V1
-    p.querySelector('#conf-t-none').onclick = function () { submitConfStart('none', null); };
+    p.querySelector('#conf-t-none').onclick = _confNoneStart;   // [CONF_TITLE_PARALLEL_V1]
     p.querySelector('#conf-t-cancel').onclick = function () { closeConfTaskModal(true); };
   }
   function _confModalFindView() {
@@ -1371,7 +1474,7 @@
       rows.slice(0, 200).forEach(function (t) {
         const row = document.createElement('button');
         row.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
-        row.textContent = 'task-' + (t.id || '?') + ' \u00b7 ' + (t.title || '(sin t\u00edtulo)');
+        row.textContent = 'task-' + (t.id || '?') + ' \u00b7 ' + (t.title || '(untitled)');
         row.onclick = function () {   // [TASKROOM_TITLE_V1] existing task -> always ask
           const _t = { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') };
           closeConfTaskModalUI();
@@ -1433,6 +1536,13 @@
       sel.appendChild(new Option(blankLabel, ''));
       values.forEach(function (v) { sel.appendChild(new Option(v, v)); });
       sel.appendChild(new Option('\u2795 New\u2026', NEW));
+      // [TASK_DEFAULTS_INSTANT_V1] Keep a real, currently-selected value alive across a
+      // repopulate: if the rebuilt list no longer holds it, re-insert it (before the
+      // trailing "New" sentinel) so a synchronously-applied default is never blanked by
+      // the later /tasks refresh.
+      if (want && want !== NEW && !Array.prototype.some.call(sel.options, function (o) { return o.value === want; })) {
+        sel.insertBefore(new Option(want, want), sel.lastChild);
+      }
       sel.value = want;
       if (sel.value !== want) sel.value = '';   // prior value vanished -> blank
       inp.style.display = (sel.value === NEW) ? '' : 'none';
@@ -1460,6 +1570,13 @@
         if (touched || sel.value !== '') return;
         const want = String(v == null ? '' : v);
         if (!want) return;
+        // [TASK_DEFAULTS_INSTANT_V1] Make the remembered value selectable in THIS tick
+        // even when the option list does not hold it yet (e.g. Tasks panel never opened
+        // so lastTasks was empty): insert it before the trailing "New" sentinel, then
+        // assign. This is what lets the last-used value be present at first paint.
+        if (want !== NEW && !Array.prototype.some.call(sel.options, function (o) { return o.value === want; })) {
+          sel.insertBefore(new Option(want, want), sel.lastChild);
+        }
         sel.value = want;
         inp.style.display = 'none';
       },
@@ -1473,6 +1590,32 @@
   // Read once per page load from GET /tasks/task-defaults (proxied to the Laravel
   // bridge API). Any failure — offline, 404 on a pane still using the file-based
   // task store — resolves to blanks, which is exactly the pre-feature behaviour.
+  // [TASK_DEFAULTS_INSTANT_V1] Synchronous, per-pane localStorage mirror of the
+  // remembered Area/Project so the create-task pickers can be pre-selected in the SAME
+  // tick the modal is built — no post-open async update. Scoped by API_BASE so two
+  // users sharing one browser origin never see each other's pair. The server register
+  // (bridge_task_defaults) stays the cross-device source of truth; this cache is only a
+  // fast path, refreshed whenever the server value is read (_fetchTaskDefaults) or a new
+  // task is created (_noteTaskDefaults).
+  const _TD_LS_KEY = 'bridge.taskDefaults.v1::' + API_BASE;
+  function _cachedTaskDefaults() {
+    try {
+      const o = JSON.parse(localStorage.getItem(_TD_LS_KEY) || '{}');
+      if (!o || typeof o !== 'object') return { area: '', project: '' };
+      return { area: String(o.area || ''), project: String(o.project || '') };
+    } catch (e) { return { area: '', project: '' }; }
+  }
+  function _writeTaskDefaultsCache(area, project) {
+    try { localStorage.setItem(_TD_LS_KEY, JSON.stringify({ area: String(area || ''), project: String(project || '') })); } catch (e) {}
+  }
+  // Prefill BOTH pickers synchronously from the cache. Safe to call before any fetch:
+  // setDefault no-ops once a value is set or the user has touched the field, so the
+  // later server refresh never overrides what is already shown.
+  function _applyCachedTaskDefaults(areaField, projField) {
+    const d = _cachedTaskDefaults();
+    areaField.setDefault(d.area);
+    projField.setDefault(d.project);
+  }
   let _taskDefaultsPromise = null;
   function _fetchTaskDefaults() {
     if (!_taskDefaultsPromise) {
@@ -1480,7 +1623,9 @@
         .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
         .then(function (d) {
           const x = (d && d.defaults) || {};
-          return { area: String(x.area || ''), project: String(x.project || '') };
+          const out = { area: String(x.area || ''), project: String(x.project || '') };
+          _writeTaskDefaultsCache(out.area, out.project);   // [TASK_DEFAULTS_INSTANT_V1] hydrate cache for the next open
+          return out;
         })
         .catch(function () { return { area: '', project: '' }; });
     }
@@ -1490,6 +1635,7 @@
   // second modal opened in the same page load prefills without a refetch.
   function _noteTaskDefaults(area, project) {
     _taskDefaultsPromise = Promise.resolve({ area: String(area || ''), project: String(project || '') });
+    _writeTaskDefaultsCache(area, project);   // [TASK_DEFAULTS_INSTANT_V1] persist across reloads
   }
   // guardEl: the fields row. If it is gone the user navigated away mid-fetch.
   function _applyTaskDefaults(areaField, projField, guardEl) {
@@ -1536,8 +1682,22 @@
   async function _trApply(o) {
     try {
       o = o || {};
-      const name = _trTitle(o.taskId, o.taskTitle);
-      if (!name) return false;
+      var _psfx = (o.parentInherit || o.parentSubtitle) ? '\u2800\u2800\u2800- ' : '';   /* TASKROOM_PARENT_SUBTITLE_V1 */
+      var name;
+      if (o.parentInherit) {   /* TASKROOM_PARENT_PREFIX_V2: <id>[ <prefix>] - <body>, no "task-" literal */
+        var _id = String(o.taskId == null ? '' : o.taskId).trim();
+        var _pfx = (o.prefix === 'Build' || o.prefix === 'Res') ? (' ' + o.prefix) : '';
+        var _body = o.useOriginal
+          ? String(o.taskTitle == null ? '' : o.taskTitle).trim()
+          : String(o.subtitle == null ? '' : o.subtitle).trim();
+        var _psCombo = _id + _pfx + ' - ' + _body;
+        if (_psCombo.length > TR_MAX) _psCombo = _psCombo.slice(0, TR_MAX - 1) + '…';
+        name = _psfx + _psCombo;
+      } else {
+        var _base = _trTitle(o.taskId, o.taskTitle);  /* TASKROOM_PARENT_PREFIX_V1 */
+        if (!_base) return false;
+        name = _psfx + _base;
+      }
       const sid = o.sessionId ? String(o.sessionId) : '';
       const roomKey = String(o.roomKey || '');
       const cur = sid ? (sessionNameById[sid] || '') : _trDraftName(roomKey);
@@ -1592,6 +1752,7 @@
     let _seed = []; try { _seed = lastTasks || []; } catch (e) { _seed = []; }
     areaField.populate(_confDistinctValues(_seed, 'area'));
     projField.populate(_confDistinctValues(_seed, 'project'));
+    _applyCachedTaskDefaults(areaField, projField);   // [TASK_DEFAULTS_INSTANT_V1] present at first paint, before any fetch
     _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
@@ -1609,7 +1770,7 @@
     createBtn.onclick = function () {
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
       const errEl = p.querySelector('#conf-t-err');
-      if (title.length < 3) { if (errEl) errEl.textContent = 'El t\u00edtulo debe tener al menos 3 caracteres.'; return; }
+      if (title.length < 3) { if (errEl) errEl.textContent = 'The title must be at least 3 characters.'; return; }
       createBtn.disabled = true; createBtn.textContent = 'Creating\u2026';
       const _area = areaField.getValue(), _project = projField.getValue();   // [TASK_DEFAULTS_PREFILL_V1]
       fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
@@ -1642,14 +1803,107 @@
     applyEngineAccounts(d.engineAccounts);
     if (typeof updateTitlebar === 'function') updateTitlebar();
   }
-  (async () => { try { const _d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
+  (async () => { try { const _d = await (await fetch(API_BASE + '/accounts?roomId=' + encodeURIComponent(currentRoomId || ''), { cache: 'no-store' })).json(); if (_d && _d.ok) applyEngineMeta(_d); } catch {} })();
   if (_PRB || _RV) setVncRoom(currentRoomId);   // point the live panel at this room's own browser
   let storedMsgData        = [];
+  // ── [HIDE_BUBBLE_V1] Per-bubble hide (UI-only, all viewers, reversible) ──────
+  let _hiddenMids = new Set();
+  let _showHidden = false;
+  function setHiddenMids(list) { _hiddenMids = new Set(Array.isArray(list) ? list : []); applyHiddenBubbles(); updateHiddenBar(); }
+  function _hbSend(mid, hide) {
+    try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: hide ? 'hide_message' : 'unhide_message', sessionId: currentSessionId, roomId: currentRoomId, mid: mid })); } catch (e) {}
+  }
+  var _HB_SEL = '.msg-user,.msg-assistant,.msg-tool,.msg-question';
+  function _hbHash(s) { var h = 0; for (var i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; } return (h >>> 0).toString(36); }
+  function _hbKey(el) {
+    var role = el.classList.contains('msg-user') ? 'u' : el.classList.contains('msg-assistant') ? 'a' : el.classList.contains('msg-tool') ? 't' : el.classList.contains('msg-question') ? 'q' : 'x';
+    var c = el.cloneNode(true); var d = c.querySelector('.ccb-del'); if (d && d.parentNode) d.parentNode.removeChild(d);
+    var txt = (c.textContent || '').replace(/\s+/g, ' ').trim();
+    return role + ':' + txt.length + ':' + _hbHash(txt);
+  }
+  function applyHiddenBubbles() {
+    try {
+      messagesEl.querySelectorAll(_HB_SEL).forEach(function (el) {
+        if (el.dataset.role === 'thinking' || el.dataset.role === 'activity') return;
+        var hidden = _hiddenMids.has(_hbKey(el));
+        el.classList.toggle('ccb-hidden', hidden);
+        el.classList.toggle('ccb-reveal', hidden && _showHidden);
+        var btn = el.querySelector(':scope > .ccb-del');
+        if (btn) btn.textContent = hidden ? '\u21A9' : '\u2715';
+      });
+    } catch (e) {}
+  }
+  function decorateBubbles() {
+    try {
+      messagesEl.querySelectorAll(_HB_SEL).forEach(function (el) {
+        if (el.dataset.role === 'thinking' || el.dataset.role === 'activity') return;
+        if (el.querySelector(':scope > .ccb-del')) return;
+        var b = document.createElement('span');
+        b.className = 'ccb-del';
+        b.title = 'Hide this message for everyone (reversible)';
+        b.textContent = '\u2715';
+        el.appendChild(b);
+      });
+    } catch (e) {}
+  }
+  function updateHiddenBar() {
+    try {
+      var bar = document.getElementById('ccbHiddenBar');
+      var n = _hiddenMids.size;
+      if (!n) { if (bar) bar.style.display = 'none'; return; }
+      if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'ccbHiddenBar';
+        bar.addEventListener('click', function () { _showHidden = !_showHidden; applyHiddenBubbles(); updateHiddenBar(); });
+        (messagesEl.parentNode || document.body).insertBefore(bar, messagesEl);
+      }
+      bar.style.display = '';
+      bar.textContent = (_showHidden ? '\uD83D\uDE48 Hiding ' : '\uD83D\uDC41 Showing ') + n + ' hidden message' + (n === 1 ? '' : 's') + ' \u2014 click to ' + (_showHidden ? 'hide' : 'reveal');
+    } catch (e) {}
+  }
+  var _hbObserver = null, _hbTimer = null;
+  function ensureHideObserver() {
+    if (_hbObserver || !messagesEl) return;
+    if (!document.getElementById('ccbHideStyle')) {
+      var st = document.createElement('style');
+      st.id = 'ccbHideStyle';
+      st.textContent = '.msg,.msg-tool,.msg-question{position:relative}'
+        + '.ccb-del{position:absolute;top:3px;right:5px;width:18px;height:18px;line-height:18px;text-align:center;border-radius:4px;font-size:12px;color:#9ca3af;background:rgba(0,0,0,.28);opacity:0;cursor:pointer;user-select:none;transition:opacity .12s;z-index:4}'
+        + '.msg:hover>.ccb-del,.msg-tool:hover>.ccb-del,.msg-question:hover>.ccb-del{opacity:.85}'
+        + '.ccb-del:hover{color:#f87171;background:rgba(0,0,0,.5)}'
+        + '.ccb-hidden{display:none !important}'
+        + '.ccb-hidden.ccb-reveal{display:block !important;opacity:.45;outline:1px dashed #f87171}'
+        + '#ccbHiddenBar{font-size:11px;color:#9ca3af;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:6px;padding:3px 8px;margin:4px 8px;cursor:pointer;text-align:center;user-select:none}';
+      document.head.appendChild(st);
+    }
+    _hbObserver = new MutationObserver(function () {
+      clearTimeout(_hbTimer);
+      _hbTimer = setTimeout(function () { decorateBubbles(); applyHiddenBubbles(); }, 30);
+    });
+    _hbObserver.observe(messagesEl, { childList: true, subtree: true });
+    messagesEl.addEventListener('click', function (ev) {
+      var btn = ev.target.closest && ev.target.closest('.ccb-del');
+      if (!btn) return;
+      ev.preventDefault(); ev.stopPropagation();
+      var host = btn.closest(_HB_SEL);
+      if (!host) return;
+      var key = _hbKey(host);
+      _hbSend(key, !_hiddenMids.has(key));
+    });
+    decorateBubbles(); applyHiddenBubbles(); updateHiddenBar();
+  }
   let lastAssistantDataIdx = -1;
   let lastToolDataIdx      = -1;
   let _restoring           = false;
 
   let pendingTaskLink = null;   // task file awaiting its new session id (see openTaskChat)
+
+  // [ROOM_TASK_ASSOC_V1] First-message task association for NORMAL rooms (conference parity).
+  let _roomStartGuard = false;     // a room-start modal is open / its async choice is in flight
+  let _roomStartPending = null;    // captured first-message snapshot {text, echo, attachments}; dispatched EXACTLY once
+  let pendingRoomTaskLink = null;  // deferred link record, identity-bound to the originating draft room
+  let _applyingRoomLink = false;   // _rtPost in flight (makes Retry double-clicks safe)
+  let _inheritedParentTask = [];   // [ROOM_TASK_INHERIT_V1] parent room's task(s) to offer inheriting in the room-start modal
 
   let _saveTimer = null;
   function saveToStorage() {
@@ -1688,6 +1942,7 @@
       const data = await res.json();
       if (roomEpoch !== epoch) return;   // user opened/switched another room mid-fetch — do not repaint stale history
       if (data.messages && data.messages.length > 0) {
+        if (Array.isArray(data.hiddenMids)) setHiddenMids(data.hiddenMids);
         renderStoredDisplay(data.messages);
         roomServerConfirmed = true;   // [ROOMLINK_V1] server has real history for this room
         if (pendingLinkRoomId && (sessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
@@ -1780,6 +2035,7 @@
 
   // ── DOM helpers ────────────────────────────────────────────────────────────
   function appendMsg(role, text, opts) {   // [CONF_ROWID_V1] opts.mid pins a server-owned id
+    try { ensureHideObserver(); } catch (e) {}   // [HIDE_BUBBLE_V2] start decorating as soon as any bubble exists
     removeThinking();
     const div = document.createElement('div');
 
@@ -1797,6 +2053,7 @@
     if (role === 'assistant') {
       div.style.whiteSpace = 'normal';
       if (currentTurnEngine) div.dataset.engine = currentTurnEngine;
+      if (currentTurnAccount && currentTurnAccount.label) div.dataset.account = currentTurnAccount.label;   // [ACCT_PANE_ISO_V1]
       renderMd(div, text || '');
     } else {
       div.textContent = text || '';
@@ -1808,6 +2065,7 @@
     if (!_restoring) {
       const rec = stampRow({ type: role, text: text || '' }, opts);   // [CONF_ROWID_V1]
       if (role === 'assistant' && currentTurnEngine) rec.engine = currentTurnEngine;
+      if (role === 'assistant' && currentTurnAccount) rec.account = currentTurnAccount;   // [ACCT_PANE_ISO_V1] immutable per-turn attribution
       storedMsgData.push(rec);
       if (role === 'assistant') lastAssistantDataIdx = storedMsgData.length - 1;
       saveToStorage();
@@ -1821,6 +2079,45 @@
 
     return div;
   }
+
+  // [WAKE_V1] scheduled-wakeup card lifecycle rendering
+  const _pendingWakeStates = {};
+  function _wakeRel(ts) {
+    if (!ts) return '';
+    const d = Math.round((ts - Date.now()) / 1000);
+    const a = Math.abs(d);
+    let s; if (a < 90) s = a + 's'; else if (a < 5400) s = Math.round(a / 60) + ' min'; else s = Math.round(a / 3600) + ' h';
+    return d >= 0 ? ('in ' + s) : (s + ' ago');
+  }
+  function _wakeLabel(w) {
+    switch (w.state) {
+      case 'scheduled':    return '\u23F0 Wake-up scheduled \u2014 fires ' + _wakeRel(w.expectedFireAt || w.dueAt);
+      case 'firing':       return '\u23F0 Wake-up firing\u2026';
+      case 'completed':    return '\u2713 Wake-up fired' + (w.native ? ' (native)' : '');
+      case 'rate_limited': return '\u23F3 Wake-up delayed (usage limit) \u2014 retry ' + _wakeRel(w.nextRetryAt);
+      case 'failed':       return '\u26A0 Wake-up failed: ' + (w.lastError || 'unknown');
+      case 'canceled':     return 'Wake-up canceled';
+      case 'superseded':   return 'Wake-up superseded';
+      default:             return 'Wake-up: ' + w.state;
+    }
+  }
+  function applyWakeState(w) {
+    if (!w || !w.toolUseId) return;
+    _pendingWakeStates[w.toolUseId] = w;
+    let card = null;
+    try { card = document.querySelector('.msg-tool[data-tool-id="' + (window.CSS && CSS.escape ? CSS.escape(w.toolUseId) : w.toolUseId) + '"]'); } catch (e) { card = null; }
+    if (!card) return;   // card not rendered yet; _drainWakeStates retries
+    const res = card.querySelector('[data-role="tool-result"]');
+    if (res) {
+      card.querySelector('.tool-spin') && card.querySelector('.tool-spin').remove();
+      res.classList.remove('pending');
+      res.className = 'tool-result';
+      res.textContent = _wakeLabel(w);
+    }
+    delete _pendingWakeStates[w.toolUseId];
+  }
+  function _drainWakeStates() { for (const k of Object.keys(_pendingWakeStates)) applyWakeState(_pendingWakeStates[k]); }
+  if (!window.__wakeDrainTimer) window.__wakeDrainTimer = setInterval(_drainWakeStates, 2000);
 
   function appendToolMsg(name, args, id, opts) {
     removeThinking();
@@ -1845,6 +2142,7 @@
 
     const wrap = document.createElement('div');
     wrap.className = 'msg-tool';
+    if (id) wrap.dataset.toolId = id;   // [WAKE_V1] locate ScheduleWakeup cards by tool_use id
 
     const header = document.createElement('div');
     header.className = 'tool-header';
@@ -1993,6 +2291,7 @@
 
   function setBusy(b) {
     busy = b;
+    try { _liveTurnRoom = b ? currentRoomId : null; if (typeof _updateRoomDots === "function") _updateRoomDots(); } catch (e) {}   // [GSD_ROOM_SPIN_V1]
     if (busySpin) busySpin.classList.toggle('busy-hidden', !b);
     if (b) { if (statusText) statusText.textContent = 'Working…'; }
     else {
@@ -2053,6 +2352,7 @@
       case 'pong': break;
 
       // [ASK_QUESTION_V1] Answer acknowledged / expired for an AskUserQuestion widget.
+      case 'wake_state': { try { applyWakeState(msg.wake); } catch (e) {} return; }   // [WAKE_V1]
       case 'question_ack': {
         const w = _questionWidgets[msg.tool_use_id];
         const map = w ? w.getMap() : null;
@@ -2177,18 +2477,41 @@
         break;
       }
 
-      // Full history pushed by server when a second device joins mid-session.
-      case 'history_sync':
-        // Only honour a pushed history when we are actually on a real session. A
-        // brand-new/draft room has currentSessionId===null, so a late history_sync
-        // for the room we just left cannot repaint the empty new room.
-        if (currentSessionId && Array.isArray(msg.messages) && msg.messages.length && !storedMsgData.length) {
-          renderStoredDisplay(msg.messages);
+      // Full history pushed by server: a second device joining mid-session, OR an
+      // authoritative resync after a mobile reconnect/foreground. [MOBILE_RESYNC_V1]
+      case 'history_sync': {
+        if (!Array.isArray(msg.messages)) break;
+        const _tagged = (typeof msg.roomId === 'string' && !!msg.roomId);
+        if (_tagged) {
+          // [MOBILE_RESYNC_V1] Room identity is the SOLE acceptance gate; sessionId is metadata
+          // only (a pinned room may legitimately keep a different currentSessionId). Do NOT
+          // acknowledge the room's resync until the frame passes that gate.
+          if (msg.roomId !== currentRoomId) break;                 // frame for a room we no longer show — never acks our resync
+          _resyncInFlight = false;                                 // accepted for THIS room: the resync request is answered
+          // An identity-matched frame is applied even when empty (clears stale rows) and even
+          // over a non-empty transcript — this is the cure for mobile stale rehydration.
+          if (!msg.messages.length && !msg.resync) break;          // an incidental empty push never clears; only an explicit resync does
+          if (_pendingConfSync) break;                             // a conference frame is pending — conference wins
+          if (busy || msg.processing) { _needResyncAfterTurn = true; break; }   // [MOBILE_RESYNC_V1] mid-stream (busy may be stale-false after ws.onclose reset — trust the server's processing flag): never clobber a live turn, reconcile with a FRESH pull at 'done'
+          if (Array.isArray(msg.hiddenMids)) setHiddenMids(msg.hiddenMids); renderStoredDisplay(msg.messages);
+          roomServerConfirmed = true;   // [ROOMLINK_V1] a tagged resync (server had S.sessionId) proves the room is real — confirm even when history is empty
+          if (pendingLinkRoomId && (currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
+          hideRoomUnresolved();
+          if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
+        } else if (currentSessionId && msg.messages.length && !storedMsgData.length) {
+          // Legacy (untagged) frame from an older server: original empty-view-only behaviour.
+          if (Array.isArray(msg.hiddenMids)) setHiddenMids(msg.hiddenMids); renderStoredDisplay(msg.messages);
           roomServerConfirmed = true;   // [ROOMLINK_V1]
           if (pendingLinkRoomId && (currentSessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
           hideRoomUnresolved();
           if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
         }
+        break;
+      }
+
+      case 'hidden_update':
+        if (msg.roomId && msg.roomId !== currentRoomId) break;
+        setHiddenMids(msg.hiddenMids || []);
         break;
 
       case 'thinking':
@@ -2218,6 +2541,8 @@
         break;
 
       case 'done':
+        // [TASK646C] Do NOT wipe the room's outbox here — that could erase a second, still-unACKed
+        // send. The server now dedups completed reqIds, so a resend-after-completion simply re-ACKs.
         removeThinking();
         setBusy(false);
         currentAssistantEl   = null;
@@ -2227,7 +2552,37 @@
         updateLastQuestion();
         // [CONFERENCE_HISTORY_V1] Apply a conf_sync that arrived mid-stream (deferred,
         // not dropped) now that the view is idle.
-        if (_pendingConfSync) { const _m = _pendingConfSync; _pendingConfSync = null; renderConfSync(_m); }
+        if (_pendingConfSync) { const _m = _pendingConfSync; _pendingConfSync = null; _needResyncAfterTurn = false; renderConfSync(_m); }   // [MOBILE_RESYNC_V1] conference wins over a deferred ordinary resync
+        else if (_needResyncAfterTurn) { _needResyncAfterTurn = false; requestResync(); }   // [MOBILE_RESYNC_V1] pull FRESH authoritative state now the turn is idle
+        break;
+
+      case 'chat_ack':   // [TASK646] durably accepted (or deduped as a resend/replay) — stop tracking
+        outboxRemove(msg.reqId);
+        break;
+      case 'chat_nack':  // [TASK646] server could not persist — safe to retry; keep the entry and resend shortly
+        showToast('Message not saved yet — retrying…', 'warning');
+        setTimeout(() => { try { outboxFlush(); } catch (e) {} }, 1500);
+        break;
+      case 'turn_failed': {   // [TASK646] turn killed abnormally (hang/reaper) — surface; do NOT auto-resend a possible runaway
+        const _items = (Array.isArray(msg.items) && msg.items.length) ? msg.items
+                      : (Array.isArray(msg.reqIds) ? msg.reqIds.map((r, i) => ({ reqId: r, text: i === 0 ? (msg.text || null) : null })) : []);
+        _items.forEach(it => { if (it && it.reqId) outboxRemove(it.reqId); });
+        (Array.isArray(msg.reqIds) ? msg.reqIds : []).forEach(outboxRemove);
+        if (!msg.roomId || msg.roomId === currentRoomId) {
+          removeThinking(); setBusy(false);
+          const _texts = _items.map(it => it && it.text).filter(Boolean);
+          const _first = _texts.length ? _texts[0] : (msg.text || null);
+          if (_first && !inputEl.value.trim()) { inputEl.value = _first; try { autoGrowInput(); } catch (e) {} }   // [TASK646C/E] restore the first message as a retry affordance
+          let _m = '⚠ Turn failed (' + (msg.reason || 'stopped') + '). ';
+          if (_texts.length <= 1) _m += 'Your message was restored to the box — press Enter to retry.';
+          else _m += _texts.length + ' queued messages were not completed. The first is restored to the box; the rest are below so none are lost:\n' + _texts.slice(1).map((t, i) => (i + 2) + '. ' + String(t).slice(0, 300)).join('\n');   // [TASK646E] no silent loss of queued turns
+          appendMsg('error', _m, { ts: Date.now() });
+          if (msg.id) { try { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'failed_ack', roomId: msg.roomId || currentRoomId, ids: [msg.id] })); } catch (e) {} }   // [TASK646F] confirm receipt so the server stops replaying this durable failed record
+        }
+        break;
+      }
+      case 'stall':   // [TASK646] no forward progress for a while — soft, non-destructive hint
+        showToast('Still working (no progress for ' + Math.round((msg.idleMs || 0) / 60000) + 'm)…', 'info');
         break;
 
       case 'session_named':
@@ -2253,10 +2608,27 @@
           setBusy(!!msg.processing);
           if (!msg.processing) removeThinking();
         }
+        // [TASK201_SWITCH_ROOM_GATE_V1] Resolve a pending engine-change fork against this ack.
+        if (pendingEngineFork && msg.roomId === currentRoomId) {
+          const pf = pendingEngineFork;
+          if (msg.engine === pf.want) {
+            pendingEngineFork = null;   // the change took effect in the fresh room
+          } else if (msg.error) {
+            // Server refused / engine did not change: undo the fork, return to the source room.
+            pendingEngineFork = null;
+            try { enterRoom(pf.src, pf.srcSession); } catch (e) {}
+            renderEngineOptions();   // selector snaps back to the authoritative engine
+          }
+        }
         break;
 
       case 'turn_engine':
         currentTurnEngine = msg.engine === 'codex' ? 'codex' : 'claude';
+        break;
+
+      case 'turn_account':
+        currentTurnAccount = (msg.account && msg.account.label) ? msg.account : null;   // [ACCT_PANE_ISO_V1]
+        if (msg.engine) currentTurnEngine = msg.engine === 'codex' ? 'codex' : 'claude';
         break;
 
       case 'engine_resync':
@@ -2287,6 +2659,11 @@
           lastToolEl = null;
           updateLastQuestion();
           showToast('Recovered — the reply had already finished', 'info');
+          // [ROOMVIEW_STALL_V1] The turn finished but the live stream dropped its tail
+          // (the trailing tool calls + closing summary are in the transcript, not the
+          // pane). Pull the server-reconciled history so the dropped tail renders now,
+          // rather than leaving the pane frozen on the last tool call until a reload.
+          try { requestResync(); } catch (_) {}
         }
         break;
 
@@ -2295,6 +2672,10 @@
         break;
 
       case 'session_id':
+        // [ROOM_TASK_ASSOC_V1] Capture the room id BEFORE any draft->session promotion below,
+        // so a deferred task link is applied only to the room it was created for (never a room
+        // we've since switched to). Uniquely named to avoid colliding with other switch cases.
+        var _preLinkDraftId = currentRoomId;
         // [XENGINE_ROOMKEY_V1] Persist history under the STABLE room id, not the
         // per-engine session id. A secondary engine (Codex) reports its own thread
         // id here; adopting it as currentSessionId made saveToStorage() write a
@@ -2309,6 +2690,7 @@
         // to that durable id so a reload rejoins THIS exact room/conversation.
         if (PINNED_ROOM && PINNED_ROOM.startsWith('draft-')) {
           roomServerConfirmed = false;   // [ROOMLINK_V1] id is changing; re-confirm after currentRoomId is final
+          try { outboxRekeyRoom(_preLinkDraftId, msg.id); } catch {}   // [TASK646H] carry un-ACKed sends onto the promoted key
           // [ENGINE_GLOBAL_ONLY_V1] nothing engine-related to carry: the engine is global.
           try { const _bg = getRoomBg(currentRoomId); if (_bg) { setRoomBg(_bg, msg.id); setRoomBg('', currentRoomId); } applyRoomBg(msg.id); } catch {}
           try { migrateLayout(currentRoomId, msg.id); } catch {}   // [ROOM_LAYOUT_V1]
@@ -2340,6 +2722,7 @@
           // so switching engines forked a 2nd room (Claude session id -> Codex thread
           // id). Mirror the draft-promote branch: one stable room across engines.
           confMigrateMode(currentRoomId, msg.id);   // [CONF_MODE_MIGRATE_V4]
+          try { outboxRekeyRoom(_preLinkDraftId, msg.id); } catch {}   // [TASK646H] carry un-ACKed sends onto the promoted key
           try { migrateLayout(currentRoomId, msg.id); } catch {}   // [ROOM_LAYOUT_V1]
           PINNED_ROOM = msg.id;
           currentRoomId = msg.id;
@@ -2368,6 +2751,23 @@
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session: msg.id }),
           }).then(() => loadTasks()).catch(() => {});
+        }
+        // [ROOM_TASK_ASSOC_V1] A first-message room-task link was deferred until the draft
+        // received its confirmed session id. Apply it ONLY when this confirmation is for the
+        // exact draft that created it (and the promotion made msg.id the current room). Transition
+        // the pending record to the confirmed id; applyRoomTaskLink clears it only on success.
+        if (pendingRoomTaskLink && pendingRoomTaskLink.draftRoomId === _preLinkDraftId && msg.id === currentRoomId) {
+          pendingRoomTaskLink = {
+            confirmedRoomId: msg.id,
+            file: pendingRoomTaskLink.file,
+            taskId: pendingRoomTaskLink.taskId,
+            taskTitle: pendingRoomTaskLink.taskTitle,
+            existingTask: pendingRoomTaskLink.existingTask,
+            parentInherit: pendingRoomTaskLink.parentInherit,  /* TASKROOM_PARENT_PREFIX_V1 */
+            parentSubtitle: pendingRoomTaskLink.parentSubtitle, subtitle: pendingRoomTaskLink.subtitle,  /* TASKROOM_PARENT_SUBTITLE_V1 */
+            prefix: pendingRoomTaskLink.prefix, useOriginal: pendingRoomTaskLink.useOriginal,  /* TASKROOM_PARENT_PREFIX_V2 */
+          };
+          applyRoomTaskLink(pendingRoomTaskLink);
         }
         break;
 
@@ -2485,6 +2885,24 @@
     return p > 80 ? 'var(--red)' : p > 50 ? 'var(--orange)' : 'var(--green)';
   }
 
+  // [7D_PACE_COLOR_V1] The 7-day bulb is colored by position vs the weekly PACE mark
+  // (fraction of the 7-day window elapsed), not by absolute utilization. Ahead of pace
+  // -> red; within 5 points -> orange; else green. Missing/invalid pct or reset ts means
+  // no valid pace mark -> stay green (never fall back to the absolute thresholds).
+  function sevenDayColor(pct, resetsAt) {
+    const usage = Number(pct);
+    const reset = Number(resetsAt);
+    if (
+      pct == null || resetsAt == null || resetsAt === '' ||
+      !Number.isFinite(usage) || !Number.isFinite(reset) || reset <= 0
+    ) return 'var(--green)';
+    const now  = Date.now() / 1000;
+    const pace = Math.min(100, Math.max(0, (1 - (reset - now) / (7 * 24 * 3600)) * 100));
+    if (usage > pace)      return 'var(--red)';
+    if (usage >= pace - 5) return 'var(--orange)';
+    return 'var(--green)';
+  }
+
   function setBar(fill, pctEl, pct) {
     const p = Math.min(100, Math.max(0, pct || 0));
     fill.style.width = p + '%';
@@ -2543,11 +2961,24 @@
       displayedEngine = engine;
       globalEngine = engine;                       // [ENGINE_GLOBAL_ONLY_V1] one engine, server-authoritative
       applyEngineAccounts(data.engineAccounts);    // keeps the selector's emails live on every poll
+      // [CONF_USAGE_PANEL_V1] While a conference is live, read /accounts ONCE per tick and derive both
+      // engines' 5h usage. Cached in _accSnap489 so the codex branch below reuses it (no dup fetch).
+      // Gate on the SAME running-or-paused predicate paintConfUsage uses (activeConf is running-only,
+      // so a paused conference would otherwise stop refreshing and the first-paint kick would no-op).
+      let _accSnap489 = null;
+      const _acc489 = async () => {
+        if (_accSnap489) return _accSnap489;
+        try { _accSnap489 = await (await fetch(API_BASE + '/accounts?roomId=' + encodeURIComponent(currentRoomId || ''), { cache: 'no-store' })).json(); }
+        catch (e) { _accSnap489 = null; }
+        return _accSnap489;
+      };
+      const _confActive489 = !!(confState && (confState.status === 'running' || confState.status === 'paused'));
+      if (_confActive489) { const _cd = await _acc489(); if (!isCurrent()) return; if (_cd && _cd.ok) deriveConfUsage(_cd); }
       if (btnUsageRefresh) btnUsageRefresh.style.display = engine === 'codex' ? 'none' : '';
 
       let selectedEmail = '';
       if (engine === 'codex') {
-        const accounts = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json();
+        const accounts = await _acc489();   // [CONF_USAGE_PANEL_V1] reuse the per-tick snapshot
         if (!isCurrent()) return;
         if (accounts && accounts.ok) {
           const active = (accounts.accounts || []).find(a => a.type === 'codex' && a.active);
@@ -2582,6 +3013,7 @@
       else {
         const sevenPct = rl.seven_day_pct != null ? rl.seven_day_pct : (w.pct || 0);
         setBar(fill7d, pct7d, sevenPct);
+        fill7d.style.background = sevenDayColor(sevenPct, rl.seven_day_resets_at);   // [7D_PACE_COLOR_V1]
         if (time7d) time7d.textContent = formatResetTime(rl.seven_day_resets_at, true) + (rl.stale ? ' ~' : '');
       }
 
@@ -2609,7 +3041,7 @@
       btnUsageRefresh.disabled = true;
       btnUsageRefresh.classList.add('spinning');
       try {
-        const res = await fetch(API_BASE + '/usage/refresh', { method: 'POST' });
+        const res = await fetch(API_BASE + '/usage/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ roomId: currentRoomId }) });   // [ACCT_RUNTIME_IDENTITY_V1] refresh the pane account
         const data = await res.json().catch(() => ({}));
         await pollUsage();
         if (data.ok) showToast(data.updated ? 'Usage refreshed' : 'Usage unchanged (already current)', 'success');
@@ -2644,7 +3076,7 @@
       const r = await fetch(API_BASE + '/accounts/switch', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         // [ENGINE_GLOBAL_ONLY_V1] switch within the RUNNING engine's own account family
-        body: JSON.stringify({ name, type: (type === 'codex' ? 'codex' : 'code') })
+        body: JSON.stringify({ name, type: (type === 'codex' ? 'codex' : 'code'), roomId: currentRoomId })
       });
       const d = await r.json();
       if (r.ok && d.ok) {
@@ -2693,6 +3125,10 @@
   }
 
   async function maybeSuggestSwitch(rl) {
+    // [REMOVE_5H_SWITCH_V1] 5-hour auto-switch/suggest removed per Peter (obsolete).
+    // Manual account switching (doSwitch) is unaffected; nothing auto-reverts a switch.
+    hideSwitchPrompt();
+    return;
     const pct = rl ? rl.five_hour_pct : null;
     const resetsAt = rl ? rl.five_hour_resets_at : null;
     if (pct == null || pct < SWITCH_THRESHOLD) { hideSwitchPrompt(); return; }
@@ -2700,7 +3136,7 @@
     // Respect a "Not now" dismissal (manual mode) for the current 5h window.
     if (!auto && resetsAt && localStorage.getItem(SNOOZE_KEY) === String(resetsAt)) return;
     try {
-      const d = await (await fetch(API_BASE + '/accounts', { cache: 'no-store' })).json();
+      const d = await (await fetch(API_BASE + '/accounts?roomId=' + encodeURIComponent(currentRoomId || ''), { cache: 'no-store' })).json();
       if (!d.ok) return;
       applyEngineAccounts(d.engineAccounts);
       // [ENGINE_GLOBAL_ONLY_V1] Only ever offer an account of the engine that is actually
@@ -2802,6 +3238,20 @@
   // freezes with no auto-recovery. When the page becomes visible again after being
   // hidden for more than a few seconds, proactively reload the VNC and nudge the
   // chat socket. (pageshow handles bfcache restores from mobile back/forward.)
+  // [MOBILE_RESYNC_V1] Force the client to reconcile against the room-authoritative transcript
+  // on resume. When the socket is still OPEN we ask the server to re-push (targeted, no teardown);
+  // otherwise we (re)connect and attach() re-pushes. Debounced so a flurry of resumes sends once.
+  function requestResync() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      if (_resyncInFlight) return;
+      _resyncInFlight = true;
+      try { ws.send(JSON.stringify({ type: 'request_resync', roomId: currentRoomId })); }
+      catch (_) { _resyncInFlight = false; return; }
+      setTimeout(() => { _resyncInFlight = false; }, 8000);   // safety: clear if no frame lands
+    } else {
+      try { connect(); } catch (_) {}
+    }
+  }
   let _hiddenSince = 0;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
@@ -2812,13 +3262,13 @@
     _hiddenSince = 0;
     if (away > 5000) {
       reconnectVnc();
-      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+      requestResync();   // [MOBILE_RESYNC_V1] reconcile even when the socket still reports OPEN
     }
   });
   window.addEventListener('pageshow', (e) => {
     if (e.persisted) {                       // restored from bfcache → sockets are dead
       reconnectVnc();
-      if (!ws || ws.readyState !== WebSocket.OPEN) { try { connect(); } catch (_) {} }
+      requestResync();   // [MOBILE_RESYNC_V1]
     }
   });
 
@@ -2958,7 +3408,7 @@
       if (m.type === 'assistant' && m.role && m.role !== 'conclusion') { confDivider(m.engine, m.role, m.round, m.stageLabel, m.ts); if (m.turnId) confDividerByTurn[m.turnId] = true; }
       const _el = appendMsg(m.type, m.text || '', { mid: m.mid || null, ts: m.ts, replay: true });   // [BUBBLE_TS_V1]
       if (_el) { if (m.mid) _el.dataset.mid = m.mid; }   // [CONF_ROWID_V1]
-      if (_el && m.type === 'assistant') { if (m.engine) _el.dataset.engine = m.engine; if (m.turnId) { _el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = _el; } }
+      if (_el && m.type === 'assistant') { if (m.engine) _el.dataset.engine = m.engine; if (m.account && m.account.label) _el.dataset.account = m.account.label; if (m.turnId) { _el.dataset.turnId = m.turnId; confBubbleByTurn[m.turnId] = _el; } }
     }
   }
 
@@ -3024,7 +3474,7 @@
     questions.forEach((q, qi) => {
       const qb = document.createElement('div'); qb.className = 'q-block';
       if (q.header) { const h = document.createElement('span'); h.className = 'q-header'; h.textContent = q.header; qb.appendChild(h); }
-      const qt = document.createElement('div'); qt.className = 'q-question'; qt.textContent = q.question || ''; qb.appendChild(qt);
+      const qt = document.createElement('div'); /* [Q_RENDER_V1] */ qt.className = 'q-question'; qt.style.whiteSpace = 'pre-wrap'; try { renderMd(qt, q.question || ''); } catch (e) { qt.textContent = q.question || ''; } qb.appendChild(qt);
       const multi = !!q.multiSelect;
       if (multi) selections[qi] = new Set();
       const opts = document.createElement('div'); opts.className = 'q-options';
@@ -3176,6 +3626,7 @@
     // scroll-to-load-older handler cannot fire and drag the view far back.
     pinToBottomAfterRestore();
     updateLastQuestion();
+    ensureHideObserver(); decorateBubbles(); applyHiddenBubbles(); updateHiddenBar();
   }
 
   function pinToBottomAfterRestore() {
@@ -3241,6 +3692,7 @@
         if (hasConnectedBefore) showToast('Reconnected', 'success');
       }
       hasConnectedBefore = true;
+      setTimeout(() => { try { outboxFlush(); } catch (e) {} }, 1000);   // [TASK646] recover any un-ACKed sends (server dedups by reqId)
       // [CONF_USERROW_IDENTITY_V1] Until the first conf_sync after this connect lands, no
       // pending send may be failed on age. The fallback re-arm covers a room that never
       // sends a sync at all (no conference), so an entry can't hang in-flight forever.
@@ -3319,15 +3771,29 @@
     }
   }
 
+  // Reject files above a safe margin under the 30 MiB nginx / express.raw ceiling
+  // so a too-large mobile capture fails loudly with a clear message instead of
+  // silently 413-ing at the proxy. (task #321)
+  const MAX_UPLOAD_BYTES = 28 * 1024 * 1024;   // 28 MiB
+
   async function uploadFile(file) {
     if (!file) return;
+    if (file.size > MAX_UPLOAD_BYTES) {
+      showToast(`"${file.name || 'file'}" is too large (max 28 MB)`, 'error');
+      return;
+    }
     uploadsInFlight++;
     renderAttachBar();
     try {
       const res = await fetch(API_BASE + '/upload', {
         method: 'POST',
         headers: {
-          'Content-Type': file.type || 'application/octet-stream',
+          // Always octet-stream: the global express.json() (bridge-server.js) runs
+          // before the raw /upload route and would consume an application/json body
+          // (e.g. a .json document) into an object, making req.body a non-Buffer and
+          // failing the upload. octet-stream sidesteps it; the server derives the
+          // name from X-Filename and never reads this content-type. (task #321)
+          'Content-Type': 'application/octet-stream',
           'X-Filename': encodeURIComponent(file.name || 'file'),
         },
         body: file,
@@ -3355,7 +3821,17 @@
     renderAttachBar();
   }
 
-  btnAttach.onclick = () => fileInput.click();
+  // #btn-attach is a <label for="file-input">: pointer/touch taps open the picker
+  // via NATIVE label activation (no JS click — the reliable path on mobile). We add
+  // ONLY a keyboard path here so the role="button" label is operable via Enter/Space
+  // (labels aren't in the tab order / don't self-activate on keys). No pointer click
+  // handler exists, so there is no double activation. (task #321)
+  btnAttach.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();          // stop Space from scrolling the page
+      fileInput.click();
+    }
+  });
   fileInput.addEventListener('change', () => {
     Array.from(fileInput.files || []).forEach(uploadFile);
     fileInput.value = '';   // allow re-selecting the same file
@@ -3401,11 +3877,47 @@
   }
 
   // ── Send ──────────────────────────────────────────────────────────────────
+  // [TASK646] Durable-send client outbox. A non-conference chat is held in localStorage
+  // until the server ACKs it (chat_ack) or its row completes; on reconnect any un-ACKed
+  // entry is resent with its ORIGINAL reqId so the server dedups (no double-run) and a
+  // silently-lost message is recovered rather than vanishing.
+  const OUTBOX_KEY = 'bridge_outbox::v1';
+  function _outboxAll() { try { const v = JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]'); return Array.isArray(v) ? v.filter(Boolean) : []; } catch { return []; } }
+  function _outboxSave(list) { try { if (list && list.length) localStorage.setItem(OUTBOX_KEY, JSON.stringify(list)); else localStorage.removeItem(OUTBOX_KEY); return true; } catch { return false; } }   // [TASK646C/E] never discard an unacked send; report persist success
+  function outboxAdd(e) { const l = _outboxAll().filter(x => x.reqId !== e.reqId); l.push(e); return _outboxSave(l); }   // [TASK646E] true iff durably persisted
+  function outboxRemove(reqId) { if (!reqId) return; _outboxSave(_outboxAll().filter(x => x.reqId !== reqId)); }
+  function outboxRemoveRoom(roomId) { if (!roomId) return; _outboxSave(_outboxAll().filter(x => x.roomId !== roomId)); }
+  // [TASK646H] Follow a draft->session room promotion: rekey any un-ACKed outbox entry from the
+  // old (draft) room id onto the canonical session id. Without this, outboxFlush() — which only
+  // resends entries whose roomId === currentRoomId — can never resend a message queued under the
+  // draft id after currentRoomId is repointed, silently losing it. The resend keeps its reqId, and
+  // the server records completion under the promoted key, so it dedups rather than re-running.
+  function outboxRekeyRoom(oldId, newId) { if (!oldId || !newId || oldId === newId) return; _outboxSave(_outboxAll().map(x => (x && x.roomId === oldId) ? { ...x, roomId: newId } : x)); }
+  function mintReqId() { return 'c-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8); }
+  const OUTBOX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;   // [TASK646E] mirror server DONE_TTL: older than this, the server may have forgotten the reqId
+  function outboxFlush() {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    for (const e of _outboxAll().filter(x => x.roomId === currentRoomId)) {
+      if ((now - (e.ts || 0)) >= OUTBOX_MAX_AGE_MS) {   // [TASK646E] too old to dedup safely — resolve WITHOUT dispatch (never a silent dup, never a silent loss)
+        outboxRemove(e.reqId);
+        try { appendMsg('error', '⚠ A message from ' + new Date(e.ts).toLocaleString() + ' could not be confirmed delivered (it may have run and only lost its acknowledgement). Auto-resend was suppressed to avoid a duplicate — resend manually only if you are sure it did not take effect:\n' + String(e.text || '').slice(0, 300), { ts: now }); } catch (er) {}   // [TASK646F] cannot assert not-sent
+        continue;
+      }
+      try { ws.send(JSON.stringify({ type: 'chat', text: e.text, attachments: e.attachments || [], engineMode: e.engineMode || 'global', displayedEngine: e.displayedEngine, roomId: e.roomId, reqId: e.reqId, rowTs: e.rowTs, rowMid: e.rowMid, resend: true })); } catch (err) {}
+    }
+  }
+
   function sendMessage() {
     const text = inputEl.value.trim();
     if (!text && !pendingAttachments.length) return;
     if (uploadsInFlight > 0) { showToast('Wait for the upload to finish', 'warning'); return; }
-    if (ws?.readyState !== WebSocket.OPEN) return;
+    const _wsOpen = ws?.readyState === WebSocket.OPEN;   // [TASK646C]
+    // [TASK646C] A plain non-conference send to an established/linked room is durably queued
+    // even offline (flushed on reconnect). Conference, fresh-room association, and engine-unknown
+    // paths need a live round-trip, so they still bail when the socket is down.
+    const _plainEstablished = !confModeOn(currentRoomId) && displayedEngine && (storedMsgData.length > 0 || roomAlreadyLinked());
+    if (!_wsOpen && !_plainEstablished) { if (text) showToast('Not connected — reconnecting…', 'warning'); return; }
     // [ENGINE_AUTHORITATIVE_V1] For a global-mode room, don't send until the bar's engine is known
     // (the server fails closed otherwise). Fetch it, then the user resends.
     if (!confModeOn(currentRoomId) && !displayedEngine) { pollUsage(); showToast('Confirming engine… please resend in a moment', 'info'); return; }
@@ -3420,6 +3932,19 @@
       openConfTaskModal({ text: text, echo: echo, attachments: attachments });
       return;
     }
+    // [ROOM_TASK_ASSOC_V1] While the room-start modal is open (or its async choice is in
+    // flight), a repeated Enter/Send must NEVER fall through to the ordinary send path —
+    // that would dispatch the first message without completing the association workflow.
+    // Block it here, exactly like the conference guard does with confStartGuard.
+    if (_roomStartGuard || _roomStartPending) { showToast('Finish the task-association step first', 'info'); return; }
+    // Fresh NORMAL room: before the FIRST message is dispatched, offer the same task-
+    // association workflow the conference uses. Fires only when this room has no messages
+    // yet and is not already linked to a task. Cancel dispatches nothing and leaves the
+    // composer intact, so the prompt re-appears on the next send attempt.
+    if (!confModeOn(currentRoomId) && storedMsgData.length === 0 && !roomAlreadyLinked()) {
+      openRoomStartTaskModal({ text: text, echo: echo, attachments: attachments });
+      return;
+    }
     // [CONF_USERROW_IDENTITY_V1] A live conference owns this room's chat, so this message
     // becomes a server-logged interjection. Mint its row id HERE and paint the optimistic
     // bubble under it, so the authoritative row reconciles onto this bubble instead of
@@ -3428,7 +3953,7 @@
     const _confLive = confModeOn(currentRoomId) && confIdentReady(currentRoomId);
     const _iid = _confLive ? String(confUuid()).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) : '';
     const _useIid = !!(_iid && _iid.length >= 8);
-    appendMsg('user', echo, _useIid ? { mid: 'conf:interject-' + _iid } : null);
+    const _userBubble = appendMsg('user', echo, _useIid ? { mid: 'conf:interject-' + _iid } : null);
     // [BUBBLE_TS_V1] One canonical creation instant per row: minted HERE, declared to the
     // server, ratified there, then broadcast unchanged to every device (and to the stored
     // row), so the optimistic bubble and every other view show the same number immediately.
@@ -3443,8 +3968,17 @@
     } else {
       // [ENGINE_GLOBAL_ONLY_V1] One global engine: the mode is always 'global' and
       // displayedEngine is what the selector/bar is showing, which the server verifies.
-      ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'global', displayedEngine, roomId: currentRoomId, rowTs: _rowTs, rowMid: _rowMid }));   // [BUBBLE_TS_V1]
+      const _reqId = mintReqId();   // [TASK646] durable-send identity, stable across resend/replay
+      const _persistOk = outboxAdd({ reqId: _reqId, roomId: currentRoomId, text, attachments, engineMode: 'global', displayedEngine, rowTs: _rowTs, rowMid: _rowMid, ts: Date.now() });
+      if (!_persistOk) {   // [TASK646E] no durable client copy -> keep composer/attachments, undo the optimistic bubble, do NOT dispatch
+        try { if (_userBubble && _userBubble.remove) _userBubble.remove(); } catch (e) {}
+        showToast('Could not save your message locally — not sent. Free up browser storage and resend.', 'error');
+        return;
+      }
+      if (_wsOpen) { try { ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'global', displayedEngine, roomId: currentRoomId, reqId: _reqId, rowTs: _rowTs, rowMid: _rowMid })); } catch (e) {} }   // [BUBBLE_TS_V1]
+      else showToast('Offline — your message is saved and will send when reconnected', 'info');   // [TASK646C] durable offline queue; outboxFlush() resends on reconnect
     }
+    try { _liveTurnRoom = currentRoomId; if (typeof _updateRoomDots === "function") _updateRoomDots(); } catch (e) {}   // [GSD_ROOM_SPIN_V1]
     setCurrentTask(text.replace(/\s+/g, ' ').trim().slice(0, 140));
     if (text && inputHistory[inputHistory.length - 1] !== text) {
       inputHistory.push(text);
@@ -3547,7 +4081,7 @@
       const nm = (id && sessionNameById[id]) || pendingRoomName || 'New room';
       nameEl.textContent = nm; nameEl.title = nm;
       nameEl.style.minWidth = Math.min(20, (nm||'').length) + 'ch';
-      try { document.title = (nm && nm !== 'New room') ? (nm + ' \u2014 Claude Code Bridge') : 'Claude Code Bridge'; } catch (e) {} /* TASK335_TAB_TITLE */
+      try { document.title = (nm && nm !== 'New room') ? (nm + ' \u2014 Code Bridge') : 'Code Bridge'; } catch (e) {} /* TASK335_TAB_TITLE */
     }
     if (idEl) {
       idEl.textContent = id ? id.slice(0, 8) : '\u2014';
@@ -3628,8 +4162,9 @@
     // [ENGINE_ACCT_COUNT_V1] "N of M" \u2014 accounts selected of accounts registered for this LLM.
     const count = (typeof a.count === 'number' && a.count > 0)
       ? ' \u00B7 ' + (a.selected || 0) + ' of ' + a.count : '';
-    if (!a.available) return name + ' (' + (a.email ? a.email + ' \u00B7 re-auth needed' : (a.reason || 'not signed in')) + count + ')';
-    if (a.email) return name + ' (' + a.email + count + ')';
+    const acct = a.name || a.email;   // [ENGINE_LABEL_NAME_V1] show the short account tag ("Procyss"), fall back to email
+    if (!a.available) return name + ' (' + (acct ? acct + ' \u00B7 re-auth needed' : (a.reason || 'not signed in')) + count + ')';
+    if (acct) return name + ' (' + acct + count + ')';
     return name + (count ? ' (' + count.replace(/^ \u00B7 /, '') + ')' : '');
   }
   function renderEngineOptions() {
@@ -3670,6 +4205,9 @@
       engSel._wired = true;
       engSel.addEventListener('change', () => {
         const v = engSel.value;
+        // [TASK201_SWITCH_ROOM_GATE_V1] Capture conference state BEFORE setConfMode clears it,
+        // so the engine-change gate below can tell "leaving conference" from a genuine change.
+        const wasInConf = confModeOn(currentRoomId);
         if (v === 'conf-claude' || v === 'conf-codex') {   // [CONFERENCE_V1]
           const lead = v === 'conf-codex' ? 'codex' : 'claude';
           setConfLead(currentRoomId, lead);
@@ -3679,6 +4217,8 @@
           return;
         }
         const mode = v === 'codex' ? 'codex' : 'claude';
+        const prevEngine = displayedEngine || globalEngine;   // [TASK201_SWITCH_ROOM_GATE_V1] engine before this change
+        const engineChanged = mode !== prevEngine;
         setConfMode(currentRoomId, false);
         if (!roomEngineSync) {   // older server: nothing authoritative to talk to
           updateTitlebar(); pollUsage();
@@ -3687,6 +4227,24 @@
         updateTitlebar();   // keep the acknowledged value until the server accepts
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           showToast('Not connected. Reconnect before changing the LLM.', 'error');
+          return;
+        }
+        // [TASK201_SWITCH_ROOM_GATE_V1] A conversation can only be resumed by the engine that
+        // created it, so a GENUINE Claude<->Codex change (made from outside conference) starts a
+        // fresh room. Leaving conference, or re-asserting the same engine, keeps the room as before.
+        if (!wasInConf && engineChanged) {
+          if (!engineAvailable(mode)) {   // target engine unusable \u2014 don't fork; revert the selector
+            showToast((mode === 'codex' ? 'Codex' : 'Claude') + ' is unavailable \u2014 sign in in Settings \u25b8 Accounts', 'warning');
+            renderEngineOptions();
+            return;
+          }
+          if (busy) {   // mid-turn: no local fork \u2014 let the server's authoritative refusal path decide
+            ws.send(JSON.stringify({ type: 'set_engine', roomId: currentRoomId, mode, scope: 'global' }));
+            return;
+          }
+          pendingEngineFork = { src: currentRoomId, srcSession: currentSessionId, want: mode };
+          newSession();   // enter a fresh room for the new engine (currentRoomId updated synchronously)
+          ws.send(JSON.stringify({ type: 'set_engine', roomId: currentRoomId, mode, scope: 'global' }));
           return;
         }
         // scope:'global' is explicit for new servers; older ones treat it as a room pin.
@@ -3698,6 +4256,18 @@
   // Retained as an alias so existing callers (delete flow, usage overlays) keep
   // working; a "new session" now means "new room".
   // Inline rename of the CURRENT room straight from the titlebar pencil.
+  // [ROOMNAME_NBSP_V1] Chrome trims/collapses normal spaces in a tab title but
+  // keeps non-breaking spaces (U+00A0). Convert the leading/trailing regular
+  // spaces a user types into U+00A0 so the padding survives; strip other stray
+  // whitespace. Already-pasted U+00A0 is left untouched.
+  function normRoomName(v) { // [ROOMNAME_BRAILLE_V1]
+    if (v == null) return '';
+    let s = String(v).replace(/[\r\n\t]+/g, ' ');
+    s = s.replace(/^[ \u00A0\u2800]+/, m => '\u2800'.repeat(m.length))
+         .replace(/[ \u00A0\u2800]+$/, m => '\u2800'.repeat(m.length));
+    return /[^\s\u2800]/.test(s) ? s : '';
+  }
+
   function startTitlebarRename() {
     const id = currentSessionId;
     const nameEl = $('st-name');
@@ -3705,17 +4275,19 @@
     const cur = (id && sessionNameById[id]) || pendingRoomName || (nameEl.textContent === 'New room' ? '' : nameEl.textContent);
     const inp = document.createElement('input');
     inp.className = 'st-rename-input';
-    inp.value = cur; inp.maxLength = 60;   // [TASKROOM_TITLE_V1] task-derived names are up to 60
+    inp.value = cur; inp.maxLength = 200;   // [ROOMTITLE_MAXLEN_V1] allow long auto-titles to stay editable
     nameEl.dataset.editing = '1';
+    nameEl.parentElement.classList.add('st-editing'); // [ROOMEDIT_FULLWIDTH_V1]
     nameEl.style.display = 'none';
     nameEl.after(inp);
     inp.focus(); inp.select();
     let done = false;
     const finish = async (save) => {
       if (done) return; done = true;
-      const to = inp.value.trim();
+      const to = normRoomName(inp.value);
       inp.remove();
       nameEl.style.display = '';
+      nameEl.parentElement.classList.remove('st-editing'); // [ROOMEDIT_FULLWIDTH_V1]
       delete nameEl.dataset.editing;
       if (save && to && to !== cur) {
         if (!id) {
@@ -3751,8 +4323,9 @@
   // or a temporary 'draft-…' id for a brand-new room. Entering a room pins THIS
   // tab to it (writes ?room= to the URL) so a reload rejoins the same room and two
   // browser tabs never cross over; two tabs on the same room mirror each other.
-  async function enterRoom(roomKey, sessionId) {
+  async function enterRoom(roomKey, sessionId, opts) {
     sessionDropdown.classList.add('hidden');
+    _inheritedParentTask = [];   // [ROOM_TASK_INHERIT_V1] never leak inheritance into an entered room
     roomEpoch++;
     roomServerConfirmed = false;   // [ROOMLINK_V1] new room until the server confirms a session
     pendingLinkRoomId = null;      // [ROOMLINK_V1] user-driven switch clears inbound-link intent
@@ -3760,7 +4333,7 @@
     PINNED_ROOM   = roomKey;
     currentRoomId = roomKey;
     applyRoomBg(roomKey);
-    applyLayout(roomKey);   // [ROOM_LAYOUT_V1] restore this room's panes (sets OR clears every slot)
+    if (!(opts && opts.keepLayout)) applyLayout(roomKey);   // [ROOM_LAYOUT_V1] restore this room's panes (sets OR clears every slot); [ROOM_INPLACE_OPEN_V1] keepLayout skips so an in-tab open from the task list leaves panes/tasks/sort untouched
     SESSION_KEY   = 'bridge_session_id::' + roomKey;
     setRoomUrl(roomKey);   // [ROOMLINK_V1] reflect into ?room= AND #room=
     if (_PRB || _RV) setVncRoom(roomKey);   // switch the live panel to this room's browser
@@ -3785,9 +4358,11 @@
       if (sessionId) ws.send(JSON.stringify({ type: 'adopt_session', id: sessionId }));
     }
     if (sessionId) await fetchAndRestoreHistory(sessionId);
+    try { if (window.__ccbT0) { var _ms = Math.round(performance.now() - window.__ccbT0); console.log("[ccb-open]", window.__ccbSrc, _ms + "ms"); if (typeof showToast === "function") showToast("open " + window.__ccbSrc + " " + _ms + "ms", "info"); window.__ccbT0 = 0; } } catch (eT) {}
     updateTitlebar();
     if (typeof refreshRoomBtn === 'function') refreshRoomBtn();
     if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
+    try { if (typeof renderTasks === 'function' && Array.isArray(lastTasks)) renderTasks(lastTasks); } catch (e) {}   // [ROOM_CURRENT_HL_ROW_V1] refresh task-row highlight on room switch
   }
 
   // Start a brand-new room from zero and enter it. It rides a temporary draft key
@@ -3797,6 +4372,7 @@
     const _id  = newDraftRoomId();
     seedAppearanceFrom(_src, _id);              // copy colour + panes so the new room matches this one
     enterRoom(_id, null);
+    _inheritedParentTask = _rtLinkedTasksFor(_src);   // [ROOM_TASK_INHERIT_V1] offer to inherit the spawning room's task (set AFTER enterRoom, which clears it)
     setMcpDot('unknown');
     showToast('New room started', 'info');
   }
@@ -3813,6 +4389,7 @@
     if (b) b.textContent = '🚪 Room: ' + (PINNED_ROOM ? PINNED_ROOM.slice(0, 8) : 'none');
   }
   function switchRoom(rawName) {
+    _inheritedParentTask = [];   // [ROOM_TASK_INHERIT_V1] never leak inheritance into a switched room
     const name = (rawName || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60);
     if (!name) return;
     if (name === PINNED_ROOM) { showToast('Already on room: ' + name, 'info'); return; }
@@ -3841,6 +4418,7 @@
     if (typeof updateTitlebar === 'function') updateTitlebar();
     refreshRoomBtn();
     if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
+    try { if (typeof renderTasks === 'function' && Array.isArray(lastTasks)) renderTasks(lastTasks); } catch (e) {}   // [ROOM_CURRENT_HL_ROW_V1] refresh task-row highlight on room switch
     showToast('Room: ' + name + (prev ? '' : ' (new)'), 'success');
   }
   (function wireRoomBtn() {
@@ -3878,12 +4456,8 @@
     return u.href;
   }
   function refreshCopyLinkBtn() {
-    if (!_copyLinkBtn) return;
-    const on = !!(roomServerConfirmed && currentRoomId && !String(currentRoomId).startsWith('draft-'));
-    _copyLinkBtn.disabled = !on;
-    _copyLinkBtn.title = on ? 'Copy a shareable link to this room'
-                            : 'Send a message first to get a shareable link for this room';
-    try { if (typeof refreshRoomTaskChip === 'function') refreshRoomTaskChip(); } catch (e) {}   // [ROOMTASK_BTN_V1]
+    // [ROOMLINK_DELETE_V1] Shareable-link button removed; retained as the chip-refresh hook.
+    try { if (typeof refreshRoomTaskChip === 'function') refreshRoomTaskChip(); } catch (e) {}
   }
   (function wireCopyLinkBtn() {   // [ROOMLINK_V1c] robust anchor: btn-room is absent in index.html
     _copyLinkBtn = document.createElement('button');
@@ -3898,11 +4472,8 @@
       try { await navigator.clipboard.writeText(url); showToast('Room link copied — anyone you send it to opens THIS room', 'success'); }
       catch (e) { showToast(url, 'info'); }
     });
-    const roomBtn = document.getElementById('btn-room');
-    const bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
-    if (roomBtn && roomBtn.parentNode) roomBtn.parentNode.insertBefore(_copyLinkBtn, roomBtn.nextSibling);
-    else if (bar) bar.appendChild(_copyLinkBtn);
-    else { _copyLinkBtn = null; return; }
+    // [ROOMLINK_DELETE_V1] Shareable-link button deleted — created element is discarded, never inserted.
+    _copyLinkBtn = null;
     refreshCopyLinkBtn();
   })();
 
@@ -3913,31 +4484,390 @@
   // storage: a room may link to many tasks and a task to many rooms. The chip shows
   // how many tasks THIS room is linked to, read from the in-memory lastTasks cache.
   let _rtTasks = [];
+  // >>> [ROOM_MEMORY_VIEWER_V1] [ROOM_MEMORY_EDIT_V1] Viewer + editor for this room's memory + instructions.
+  (function () {
+    var _rmOverlay = null, _rmData = null, _rmEntry = null, _rmBtn = null;
+    var _rmEditing = false, _rmDirty = false;
+    var _rmView = null, _rmEdit = null, _rmHeadName = null, _rmEditBtn = null, _rmSaveBtn = null, _rmCancelBtn = null, _rmLock = null;
+    function _rmEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _rmTryClose(); } }
+    function _rmConfirmDiscard() { return !_rmDirty || window.confirm('Discard unsaved changes?'); }
+    function _rmTryClose() { if (_rmConfirmDiscard()) _rmClose(); }
+    function _rmClose() {
+      if (_rmOverlay && _rmOverlay.parentNode) _rmOverlay.parentNode.removeChild(_rmOverlay);
+      _rmOverlay = null; _rmData = null; _rmEntry = null; _rmBtn = null; _rmEditing = false; _rmDirty = false;
+      document.removeEventListener('keydown', _rmEsc, true);
+    }
+    function _rmFmtBytes(n) {
+      n = Number(n) || 0;
+      if (n < 1024) return n + ' B';
+      if (n < 1048576) return (Math.round(n / 102.4) / 10) + ' KB';
+      return (Math.round(n / 104857.6) / 10) + ' MB';
+    }
+    function _rmLabel(e) { return (e && (e.label || e.name)) || '(sin nombre)'; }
+    function _rmStripAudit(s) { return String(s || '').replace(/^<!--\s*\[ROOM_MEMORY_EDIT\][^\n]*-->\n?/, ''); }
+
+    function _rmSetEditing(on) {
+      _rmEditing = !!on;
+      if (_rmView) _rmView.style.display = _rmEditing ? 'none' : 'block';
+      if (_rmEdit) _rmEdit.style.display = _rmEditing ? 'block' : 'none';
+      if (_rmSaveBtn) _rmSaveBtn.style.display = _rmEditing ? 'inline-block' : 'none';
+      if (_rmCancelBtn) _rmCancelBtn.style.display = _rmEditing ? 'inline-block' : 'none';
+      if (_rmEditBtn) _rmEditBtn.style.display = (!_rmEditing && _rmEntry && _rmEntry.editable) ? 'inline-block' : 'none';
+      if (_rmLock) _rmLock.style.display = (!_rmEditing && _rmEntry && !_rmEntry.editable) ? 'inline-block' : 'none';
+    }
+
+    function _rmShow(entry, btn, buttons) {
+      if (!_rmConfirmDiscard()) return;
+      _rmEntry = entry; _rmBtn = btn; _rmDirty = false;
+      for (var k = 0; k < buttons.length; k++) buttons[k].style.background = 'transparent';
+      if (btn) btn.style.background = 'rgba(127,127,127,.25)';
+      if (_rmHeadName) _rmHeadName.textContent = _rmLabel(entry);
+      var meta = '';
+      if (entry.omitted) meta = '\n\n[⚠ Omitted (size limit) — ' + _rmFmtBytes(entry.originalBytes) + ' on disk]';
+      else if (entry.truncated) meta = '\n\n[⚠ Truncated — showing part of ' + _rmFmtBytes(entry.originalBytes) + ']';
+      if (_rmView) { _rmView.textContent = (entry.content || '') + meta; _rmView.scrollTop = 0; }
+      if (_rmEdit) _rmEdit.value = _rmStripAudit(entry.content || '');
+      _rmSetEditing(false);
+    }
+
+    function _rmDoSave() {
+      if (!_rmEntry || !_rmEntry.editable) return;
+      var rid = (typeof currentRoomId !== 'undefined' && currentRoomId) ? currentRoomId : null;
+      if (!rid) { if (typeof showToast === 'function') showToast('Open a room first', 'warning'); return; }
+      var payload = { roomId: rid, fileType: _rmEntry.fileType, fileName: _rmEntry.postName || _rmEntry.name, content: _rmEdit.value, create: !!_rmEntry._create };
+      if (_rmSaveBtn) { _rmSaveBtn.disabled = true; _rmSaveBtn.textContent = 'Saving…'; }
+      fetch(API_BASE + '/room-memory', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }, body: JSON.stringify(payload) })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; }, function () { return { ok: r.ok, status: r.status, j: {} }; }); })
+        .then(function (res) {
+          if (_rmSaveBtn) { _rmSaveBtn.disabled = false; _rmSaveBtn.textContent = 'Save'; }
+          if (!res.ok) { if (typeof showToast === 'function') showToast((res.j && res.j.error) ? res.j.error : ('Could not save (' + res.status + ')'), 'error'); return; }
+          _rmDirty = false; _rmEditing = false;
+          var keepName = payload.fileName, keepType = payload.fileType;
+          if (typeof showToast === 'function') showToast('Saved ✓', 'success');
+          _rmReload(function () { _rmSelectByNameType(keepName, keepType); });
+        })
+        .catch(function () { if (_rmSaveBtn) { _rmSaveBtn.disabled = false; _rmSaveBtn.textContent = 'Save'; } if (typeof showToast === 'function') showToast('Could not save', 'error'); });
+    }
+
+    var _rmSelectByNameType = function () {};
+    var _rmReload = function () {};
+
+    function _rmOpen(data) {
+      _rmClose();
+      _rmData = data;
+      var wrap = document.createElement('div');
+      _rmOverlay = wrap;
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:24px';
+      wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) _rmTryClose(); });
+      var panel = document.createElement('div');
+      panel.style.cssText = 'background:#1e1e22;color:#eaeaea;width:min(1100px,96vw);height:min(86vh,900px);border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.12)';
+      var head = document.createElement('div');
+      head.style.cssText = 'display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.12);flex:0 0 auto';
+      var title = document.createElement('div');
+      title.textContent = '📄 Room memory and instructions';
+      title.style.cssText = 'font-weight:600;font-size:14px;flex:1 1 auto';
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = '✕';
+      closeBtn.title = 'Close (Esc)';
+      closeBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;color:inherit;font-size:16px;opacity:.8;padding:2px 6px';
+      closeBtn.addEventListener('click', _rmTryClose);
+      head.appendChild(title); head.appendChild(closeBtn);
+      var body = document.createElement('div');
+      body.style.cssText = 'display:flex;flex:1 1 auto;min-height:0';
+      var list = document.createElement('div');
+      list.style.cssText = 'flex:0 0 300px;overflow:auto;border-right:1px solid rgba(255,255,255,.12);padding:8px';
+      var right = document.createElement('div');
+      right.style.cssText = 'flex:1 1 auto;display:flex;flex-direction:column;min-width:0;min-height:0';
+      var rhead = document.createElement('div');
+      rhead.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid rgba(255,255,255,.08);flex:0 0 auto';
+      _rmHeadName = document.createElement('div');
+      _rmHeadName.style.cssText = 'flex:1 1 auto;font-size:12px;opacity:.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      _rmLock = document.createElement('span'); _rmLock.textContent = '🔒'; _rmLock.title = 'Read only'; _rmLock.style.cssText = 'font-size:12px;opacity:.6;display:none';
+      _rmEditBtn = document.createElement('button'); _rmEditBtn.textContent = 'Edit';
+      _rmEditBtn.style.cssText = 'cursor:pointer;background:#2d6cdf;border:0;color:#fff;font-size:12px;border-radius:6px;padding:4px 10px;display:none';
+      _rmEditBtn.addEventListener('click', function () { _rmSetEditing(true); if (_rmEdit) _rmEdit.focus(); });
+      _rmSaveBtn = document.createElement('button'); _rmSaveBtn.textContent = 'Save';
+      _rmSaveBtn.style.cssText = 'cursor:pointer;background:#1e9e5a;border:0;color:#fff;font-size:12px;border-radius:6px;padding:4px 10px;display:none';
+      _rmSaveBtn.addEventListener('click', _rmDoSave);
+      _rmCancelBtn = document.createElement('button'); _rmCancelBtn.textContent = 'Cancel';
+      _rmCancelBtn.style.cssText = 'cursor:pointer;background:transparent;border:1px solid rgba(255,255,255,.25);color:inherit;font-size:12px;border-radius:6px;padding:4px 10px;display:none';
+      _rmCancelBtn.addEventListener('click', function () { if (!_rmConfirmDiscard()) return; _rmDirty = false; if (_rmEntry && _rmEntry._create) { _rmReload(); } else { _rmSetEditing(false); if (_rmEdit && _rmEntry) _rmEdit.value = _rmStripAudit(_rmEntry.content || ''); } });
+      rhead.appendChild(_rmHeadName); rhead.appendChild(_rmLock); rhead.appendChild(_rmEditBtn); rhead.appendChild(_rmSaveBtn); rhead.appendChild(_rmCancelBtn);
+      _rmView = document.createElement('pre');
+      _rmView.style.cssText = 'flex:1 1 auto;overflow:auto;margin:0;padding:14px 16px;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;display:block';
+      _rmEdit = document.createElement('textarea');
+      _rmEdit.spellcheck = false;
+      _rmEdit.style.cssText = 'flex:1 1 auto;width:100%;box-sizing:border-box;resize:none;overflow:auto;margin:0;padding:14px 16px;border:0;outline:none;background:#141417;color:#eaeaea;white-space:pre;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;display:none';
+      _rmEdit.addEventListener('input', function () { _rmDirty = true; });
+      right.appendChild(rhead); right.appendChild(_rmView); right.appendChild(_rmEdit);
+      body.appendChild(list); body.appendChild(right);
+      panel.appendChild(head); panel.appendChild(body);
+      wrap.appendChild(panel);
+      document.body.appendChild(wrap);
+      document.addEventListener('keydown', _rmEsc, true);
+
+      function build() {
+        list.innerHTML = '';
+        var entries = [];
+        var idx = (_rmData && _rmData.memoryIndex) || null;
+        if (idx) entries.push({ e: idx, sec: 'Memory' });
+        var mf = (_rmData && _rmData.memoryFiles) || [];
+        for (var i = 0; i < mf.length; i++) entries.push({ e: mf[i], sec: 'Memory' });
+        var ins = (_rmData && _rmData.instructions) || [];
+        for (var j = 0; j < ins.length; j++) entries.push({ e: ins[j], sec: 'Instructions' });
+
+        var buttons = [];
+        var lastSec = null, first = null;
+        for (var m = 0; m < entries.length; m++) {
+          (function (rec) {
+            if (rec.sec !== lastSec) {
+              lastSec = rec.sec;
+              var h = document.createElement('div');
+              h.textContent = rec.sec;
+              h.style.cssText = 'font-size:10px;text-transform:uppercase;letter-spacing:.05em;opacity:.55;margin:10px 4px 4px';
+              list.appendChild(h);
+            }
+            var bb = document.createElement('div');
+            bb.style.cssText = 'cursor:pointer;padding:6px 8px;border-radius:6px;font-size:12px;display:flex;gap:6px;align-items:baseline;background:transparent';
+            var nm = document.createElement('span');
+            nm.textContent = _rmLabel(rec.e);
+            nm.style.cssText = 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+            var tag = document.createElement('span');
+            tag.style.cssText = 'font-size:10px;opacity:.5;flex:0 0 auto';
+            tag.textContent = rec.e.omitted ? '⚠' : (rec.e.truncated ? '✂' : (rec.e.editable ? '✎' : _rmFmtBytes(rec.e.originalBytes)));
+            bb.appendChild(nm); bb.appendChild(tag);
+            bb.addEventListener('click', function () { _rmShow(rec.e, bb, buttons); });
+            buttons.push(bb);
+            list.appendChild(bb);
+            if (!first) first = { e: rec.e, b: bb };
+          })(entries[m]);
+        }
+
+        // Create affordances (server says the room is editable / no room CLAUDE.md yet).
+        if (_rmData && _rmData.editable) {
+          var ch = document.createElement('div');
+          ch.textContent = 'Create'; ch.style.cssText = 'font-size:10px;text-transform:uppercase;letter-spacing:.05em;opacity:.55;margin:14px 4px 4px';
+          list.appendChild(ch);
+          if (!_rmData.roomClaudePresent) {
+            var cCla = document.createElement('div');
+            cCla.textContent = '+ Room instruction (CLAUDE.md)';
+            cCla.style.cssText = 'cursor:pointer;padding:6px 8px;border-radius:6px;font-size:12px;color:#7fbcff;background:transparent';
+            cCla.addEventListener('click', function () { _rmStartCreate('instruction', 'CLAUDE.md', 'Room CLAUDE.md', buttons); });
+            list.appendChild(cCla);
+          }
+          var cTopic = document.createElement('div');
+          cTopic.textContent = '+ New topic…';
+          cTopic.style.cssText = 'cursor:pointer;padding:6px 8px;border-radius:6px;font-size:12px;color:#7fbcff;background:transparent';
+          cTopic.addEventListener('click', function () {
+            if (!_rmConfirmDiscard()) return;
+            var name = window.prompt('File name (.md):', 'notas.md');
+            if (!name) return;
+            if (!/^[A-Za-z0-9._-]+\.md$/i.test(name) || name === 'MEMORY.md' || name.charAt(0) === '.') { if (typeof showToast === 'function') showToast('Invalid name (use name.md)', 'error'); return; }
+            _rmStartCreate('memory', name, name, buttons);
+          });
+          list.appendChild(cTopic);
+        }
+
+        return { buttons: buttons, first: first };
+      }
+
+      function _rmStartCreate(fileType, postName, label, buttons) {
+        if (!_rmConfirmDiscard()) return;
+        for (var k = 0; k < buttons.length; k++) buttons[k].style.background = 'transparent';
+        _rmEntry = { editable: true, fileType: fileType, postName: postName, name: postName, label: label, content: '', _create: true };
+        _rmBtn = null; _rmDirty = false;
+        if (_rmHeadName) _rmHeadName.textContent = label + ' (new)';
+        if (_rmView) _rmView.textContent = '';
+        if (_rmEdit) _rmEdit.value = '';
+        _rmSetEditing(true);
+        if (_rmEdit) _rmEdit.focus();
+      }
+
+      var built = build();
+      _rmSelectByNameType = function (name, type) {
+        var b2 = build();
+        var target = null;
+        var all = [];
+        var d = _rmData || {};
+        if (d.memoryIndex) all.push(d.memoryIndex);
+        (d.memoryFiles || []).forEach(function (e) { all.push(e); });
+        (d.instructions || []).forEach(function (e) { all.push(e); });
+        for (var i = 0; i < all.length; i++) {
+          var e = all[i];
+          if (e && ((e.postName || e.name) === name) && (type ? e.fileType === type : true)) { target = e; break; }
+        }
+        // find its button by label
+        var idxBtn = -1, seen = [];
+        // rebuild returns buttons in list order matching entries order (index/memory/instructions)
+        var order = [];
+        if (d.memoryIndex) order.push(d.memoryIndex);
+        (d.memoryFiles || []).forEach(function (e) { order.push(e); });
+        (d.instructions || []).forEach(function (e) { order.push(e); });
+        for (var j = 0; j < order.length; j++) { if (order[j] === target) { idxBtn = j; break; } }
+        if (target && idxBtn >= 0 && b2.buttons[idxBtn]) _rmShow(target, b2.buttons[idxBtn], b2.buttons);
+        else if (b2.first) _rmShow(b2.first.e, b2.first.b, b2.buttons);
+      };
+      _rmReload = function (cb) {
+        var rid = (typeof currentRoomId !== 'undefined' && currentRoomId) ? currentRoomId : null;
+        if (!rid) return;
+        fetch(API_BASE + '/room-memory?roomId=' + encodeURIComponent(rid), { headers: { 'Accept': 'application/json' } })
+          .then(function (r) { return r.json(); })
+          .then(function (j) { _rmData = j; var b3 = build(); if (cb) cb(); else if (b3.first) _rmShow(b3.first.e, b3.first.b, b3.buttons); })
+          .catch(function () {});
+      };
+
+      if (built.first) _rmShow(built.first.e, built.first.b, built.buttons);
+      else { if (_rmView) _rmView.textContent = 'No memory or instructions for this room.'; _rmSetEditing(false); }
+    }
+
+    function _rmFetch() {
+      var rid = (typeof currentRoomId !== 'undefined' && currentRoomId) ? currentRoomId : null;
+      if (!rid) { if (typeof showToast === 'function') showToast('Open a room first', 'warning'); return; }
+      fetch(API_BASE + '/room-memory?roomId=' + encodeURIComponent(rid), { headers: { 'Accept': 'application/json' } })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; }, function () { return { ok: r.ok, status: r.status, j: {} }; }); })
+        .then(function (res) {
+          if (!res.ok) {
+            var msg = (res.status === 404) ? 'Unknown room'
+              : (res.status === 409) ? 'Could not determine this room’s account'
+              : ('Could not load memory (' + res.status + ')');
+            if (typeof showToast === 'function') showToast(msg, 'error');
+            return;
+          }
+          _rmOpen(res.j);
+        })
+        .catch(function () { if (typeof showToast === 'function') showToast('Could not load memory', 'error'); });
+    }
+    var btn = document.createElement('button');
+    btn.id = 'btn-room-memory';
+    btn.type = 'button';
+    btn.title = 'View and edit this room’s memory and instructions';
+    btn.textContent = '📄';
+    btn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;line-height:0;font-size:14px';
+    btn.addEventListener('click', _rmFetch);
+    var roomBtn = document.getElementById('btn-room');
+    var bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
+    if (roomBtn && roomBtn.parentNode) roomBtn.parentNode.insertBefore(btn, roomBtn.nextSibling);
+    else if (bar) bar.appendChild(btn);
+  })();
+  // <<< [ROOM_MEMORY_VIEWER_V1]
+
+  // >>> [ROOM_DOCS_V1] Titlebar "Documents" folder: lists documents generated into this
+  // room's documents folder and offers a download link for each. Read-only (list + download).
+  (function () {
+    function _rdFmtBytes(n) {
+      n = Number(n) || 0;
+      if (n < 1024) return n + ' B';
+      if (n < 1048576) return (Math.round(n / 102.4) / 10) + ' KB';
+      return (Math.round(n / 104857.6) / 10) + ' MB';
+    }
+    function _rdEscapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]; }); }
+    function _rdClose() { var m = document.getElementById('roomdocs-modal'); if (m) m.remove(); document.removeEventListener('keydown', _rdEsc, true); }
+    function _rdEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _rdClose(); } }
+    function _rdDownloadUrl(name) {
+      return API_BASE + '/room-documents/download?roomId=' + encodeURIComponent(currentRoomId) + '&name=' + encodeURIComponent(name);
+    }
+    function _rdRender(docs) {
+      var p = document.getElementById('roomdocs-panel'); if (!p) return;
+      var html = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">' +
+        '<div style="font-size:15px;font-weight:600;flex:1 1 auto">\uD83D\uDCC1 Documents in this room</div>' +
+        '<button id="rd-close" style="cursor:pointer;background:transparent;border:0;color:inherit;font-size:16px;opacity:.8;padding:2px 6px">\u2715</button></div>';
+      if (!docs.length) {
+        html += '<div style="opacity:.65;font-size:13px;padding:8px 0">No documents yet. Documents I generate for you in this room will appear here to download.</div>';
+      } else {
+        html += '<div style="display:flex;flex-direction:column;gap:6px">';
+        docs.forEach(function (d) {
+          var when = '';
+          try { when = new Date(d.mtime).toLocaleString(); } catch (e) {}
+          html += '<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#0b1220">' +
+            '<div style="flex:1 1 auto;min-width:0"><div style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + _rdEscapeHtml(d.name) + '</div>' +
+            '<div style="font-size:11px;opacity:.6">' + _rdFmtBytes(d.size) + (when ? ' \u00b7 ' + _rdEscapeHtml(when) : '') + '</div></div>' +
+            '<a href="' + _rdEscapeHtml(_rdDownloadUrl(d.name)) + '" download style="flex:0 0 auto;text-decoration:none;cursor:pointer;padding:5px 12px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5;font-size:12px">\u2193 Download</a></div>';
+        });
+        html += '</div>';
+      }
+      p.innerHTML = html;
+      var c = document.getElementById('rd-close'); if (c) c.onclick = _rdClose;
+    }
+    function _rdOpen() {
+      var rid = (typeof currentRoomId !== 'undefined' && currentRoomId) ? currentRoomId : null;
+      if (!rid || String(rid).startsWith('draft-')) { if (typeof showToast === 'function') showToast('Send a message first, then documents for this room appear here', 'info'); return; }
+      _rdClose();
+      var wrap = document.createElement('div');
+      wrap.id = 'roomdocs-modal';
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+      wrap.innerHTML = '<div id="roomdocs-panel" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:18px">Loading\u2026</div>';
+      wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) _rdClose(); });
+      document.body.appendChild(wrap);
+      document.addEventListener('keydown', _rdEsc, true);
+      fetch(API_BASE + '/room-documents?roomId=' + encodeURIComponent(rid), { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, status: r.status, j: j }; }, function () { return { ok: r.ok, status: r.status, j: {} }; }); })
+        .then(function (res) {
+          if (!res.ok) { var p = document.getElementById('roomdocs-panel'); if (p) p.textContent = (res.j && res.j.error) ? res.j.error : ('Could not load documents (' + res.status + ')'); return; }
+          _rdRender((res.j && Array.isArray(res.j.documents)) ? res.j.documents : []);
+        })
+        .catch(function () { var p = document.getElementById('roomdocs-panel'); if (p) p.textContent = 'Could not load documents'; });
+    }
+    var btn = document.createElement('button');
+    btn.id = 'btn-room-docs';
+    btn.type = 'button';
+    btn.title = 'Documents created in this room (download)';
+    btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" style="display:block"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+    btn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;line-height:0';
+    btn.addEventListener('click', _rdOpen);
+    var roomBtn = document.getElementById('btn-room');
+    var bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
+    if (roomBtn && roomBtn.parentNode) roomBtn.parentNode.insertBefore(btn, roomBtn.nextSibling);
+    else if (bar) bar.appendChild(btn);
+  })();
+  // <<< [ROOM_DOCS_V1]
+
   function roomTaskEnabled() { return !!(roomServerConfirmed && currentRoomId && !String(currentRoomId).startsWith('draft-')); }
-  function _rtLinkedTasks() {
-    const rid = String(currentRoomId || '');
+  function _rtLinkedTasksFor(rid) {   // [ROOM_TASK_INHERIT_V1] parameterized variant of _rtLinkedTasks
+    rid = String(rid || '');
     if (!rid || typeof lastTasks === 'undefined' || !Array.isArray(lastTasks)) return [];
     return lastTasks.filter(t => t && Array.isArray(t.rooms) && t.rooms.some(rm => String(rm.room_key) === rid));
+  }
+  function _rtLinkedTasks() { return _rtLinkedTasksFor(currentRoomId); }
+  // [ROOM_TASK_INHERIT_V1] cross-tab hand-off. The "New room in a new tab" pop-out is a fresh
+  // page load in a separate JS context, so the in-memory _inheritedParentTask cannot survive it.
+  // Persist the parent room’s task(s) keyed by the new draft rid (mirrors seedAppearanceFrom),
+  // then hydrate + consume it when the start modal renders in the new tab.
+  function _seedInheritTaskFrom(srcId, newId) {
+    try {
+      if (!srcId || !newId || srcId === newId) return;
+      var ts = _rtLinkedTasksFor(srcId).map(function (t) { return { id: t.id, file: t.file, title: t.title }; });
+      if (ts.length) localStorage.setItem('ccb-inherit-task::' + newId, JSON.stringify(ts));
+    } catch (e) {}
+  }
+  function _readInheritTaskSeed(rid) {
+    try {
+      if (!rid) return [];
+      var raw = localStorage.getItem('ccb-inherit-task::' + rid);
+      if (!raw) return [];
+      var arr = JSON.parse(raw);
+      return Array.isArray(arr) ? arr.filter(function (t) { return t && (t.file || t.id); }) : [];
+    } catch (e) { return []; }
+  }
+  function _consumeInheritTaskSeed(rid) {
+    try { if (rid) localStorage.removeItem('ccb-inherit-task::' + rid); } catch (e) {}
   }
   function refreshRoomTaskChip() {
     if (!_linkTaskBtn) return;
     const on = roomTaskEnabled();
     _linkTaskBtn.disabled = !on;
     _linkTaskBtn.style.opacity = on ? '0.85' : '0.35';
-    _linkTaskBtn.title = on ? 'Link this room to a task' : 'Send a message first, then you can link this room to a task';
-    if (!_roomTaskChip) return;
+    // [ROOMTASK_CONSOLIDATE_V1] One control: tag alone when unlinked; tag + task number when linked.
     const linked = on ? _rtLinkedTasks() : [];
-    if (linked.length === 1) {
-      _roomTaskChip.textContent = '🗂 task-' + (linked[0].id || '');
-      _roomTaskChip.title = linked[0].title || '';
-      _roomTaskChip.style.display = '';
-    } else if (linked.length > 1) {
-      _roomTaskChip.textContent = '🗂 ' + linked.length + ' tasks';
-      _roomTaskChip.title = linked.map(t => 'task-' + (t.id || '') + ' ' + (t.title || '')).join('\n');
-      _roomTaskChip.style.display = '';
-    } else {
-      _roomTaskChip.style.display = 'none';
-    }
+    let label = '';
+    if (linked.length === 1) label = String(linked[0].id || '');   // [ROOMTASK_NUMONLY_V1] bare number, no "task-"
+    else if (linked.length > 1) label = linked.length + ' tasks';
+    const lbl = _linkTaskBtn.querySelector('.rt-lbl');
+    if (lbl) { lbl.textContent = label; lbl.style.display = label ? '' : 'none'; }
+    if (!on) _linkTaskBtn.title = 'Send a message first, then you can link this room to a task';
+    else if (linked.length === 1) _linkTaskBtn.title = linked[0].title || label;
+    else if (linked.length > 1) _linkTaskBtn.title = linked.map(t => 'task-' + (t.id || '') + ' ' + (t.title || '')).join('\n');
+    else _linkTaskBtn.title = 'Link this room to a task';
+    try { highlightCurrentRoomTask(); } catch (e) {}   // [ROOM_CURRENT_HL_ROW_V2]
   }
   function _rtSyncChip() {
     try { Promise.resolve(typeof loadTasks === 'function' ? loadTasks() : null).then(() => refreshRoomTaskChip()).catch(() => refreshRoomTaskChip()); }
@@ -3996,7 +4926,7 @@
       '<div id="rt-list" style="max-height:40vh;overflow:auto;display:flex;flex-direction:column;gap:4px"></div>' +
       '<div style="margin-top:12px;display:flex;justify-content:space-between;gap:8px">' +
         '<button id="rt-new" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5">➕ Create task & link</button>' +
-        '<button id="rt-close" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cerrar</button>' +
+        '<button id="rt-close" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Close</button>' +
       '</div>';
     const lw = p.querySelector('#rt-linked');
     if (linked.length) {
@@ -4017,7 +4947,7 @@
     if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">No matches.</div>'; }
     else rows.slice(0, 200).forEach(t => {
       const b = document.createElement('button'); b.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
-      b.textContent = 'task-' + (t.id || '?') + ' · ' + (t.title || '(sin título)');
+      b.textContent = 'task-' + (t.id || '?') + ' · ' + (t.title || '(untitled)');
       b.onclick = () => { b.disabled = true; _rtPost(t.file, rid).then(async ok => { if (ok) { showToast('Room linked to task-' + (t.id || ''), 'success');
         // [TASKROOM_TITLE_V1] existing task -> always ask; close first (confirm z-index 200 < modal 9999)
         _rtClose();
@@ -4059,6 +4989,7 @@
     let _rtSeedTasks = []; try { _rtSeedTasks = lastTasks || []; } catch (e) { _rtSeedTasks = []; }
     areaField.populate(_confDistinctValues(_rtSeedTasks, 'area'));
     projField.populate(_confDistinctValues(_rtSeedTasks, 'project'));
+    _applyCachedTaskDefaults(areaField, projField);   // [TASK_DEFAULTS_INSTANT_V1] present at first paint, before any fetch
     _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
@@ -4078,7 +5009,7 @@
     }
     cb.onclick = () => {
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
-      if (title.length < 3) { errEl.textContent = 'El título debe tener al menos 3 caracteres.'; return; }
+      if (title.length < 3) { errEl.textContent = 'The title must be at least 3 characters.'; return; }
       cb.disabled = true; cb.textContent = 'Creating…';
       const _area = areaField.getValue(), _project = projField.getValue();   // [TASK_DEFAULTS_PREFILL_V1]
       fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
@@ -4094,20 +5025,386 @@
   (function wireLinkTaskBtn() {
     _linkTaskBtn = document.createElement('button');
     _linkTaskBtn.id = 'btn-link-task'; _linkTaskBtn.type = 'button'; _linkTaskBtn.className = 'st-link-task';
-    _linkTaskBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" style="display:block"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
-    _linkTaskBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;line-height:0';
+    // [ROOMTASK_CONSOLIDATE_V1] Tag glyph + inline label span (shows the task number when linked).
+    _linkTaskBtn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" style="display:block;flex:0 0 auto"><path d="M4 4h7l9 9-7 7-9-9V4z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><circle cx="7.5" cy="7.5" r="1.4" fill="currentColor"/></svg><span class="rt-lbl" style="display:none;font-size:12px;line-height:1;white-space:nowrap"></span>';
+    _linkTaskBtn.style.cssText = 'cursor:pointer;background:transparent;border:0;padding:0 4px;opacity:.85;color:#fff;display:inline-flex;align-items:center;gap:0';
     _linkTaskBtn.addEventListener('click', () => { if (!_linkTaskBtn.disabled) openRoomTaskModal(); });
-    _roomTaskChip = document.createElement('span');
-    _roomTaskChip.id = 'roomtask-chip';
-    _roomTaskChip.style.cssText = 'display:none;cursor:pointer;padding:1px 7px;border-radius:10px;background:#374151;border:1px solid #4b5563;font-size:12px;margin-left:2px;white-space:nowrap';
-    _roomTaskChip.addEventListener('click', () => openRoomTaskModal());
+    _roomTaskChip = null;   // [ROOMTASK_CONSOLIDATE_V1] chip merged into the button
     const host = _copyLinkBtn || document.getElementById('btn-copy-room-link');
     const bar = document.getElementById('session-titlebar') || document.getElementById('header-controls');
-    if (host && host.parentNode) { host.parentNode.insertBefore(_linkTaskBtn, host.nextSibling); _linkTaskBtn.parentNode.insertBefore(_roomTaskChip, _linkTaskBtn.nextSibling); }
-    else if (bar) { bar.appendChild(_linkTaskBtn); bar.appendChild(_roomTaskChip); }
+    if (host && host.parentNode) { host.parentNode.insertBefore(_linkTaskBtn, host.nextSibling); }
+    else if (bar) { bar.appendChild(_linkTaskBtn); }
     else { _linkTaskBtn = null; _roomTaskChip = null; return; }
     refreshRoomTaskChip();
   })();
+
+  // ── [ROOM_TASK_ASSOC_V1] First-message task-association workflow for NORMAL rooms ──────
+  // Parity with the conference first-message modal. Reuses the canonical task_rooms M:N link
+  // (_rtPost + _trApply, same store the 🗂 button writes). For a brand-new draft room the link
+  // is deferred until the draft is promoted to a confirmed session id (handled in the
+  // 'session_id' case above); for an already-confirmed reopened-empty room it links inline
+  // before the message is dispatched. The captured message is dispatched EXACTLY once.
+  const _RS_BTN_ROW = 'text-align:left;cursor:pointer;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb';
+  const _RS_BTN_GREY = 'cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb';
+  const _RS_BTN_GREEN = 'cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #065f46;background:#047857;color:#ecfdf5';
+  const _RS_INPUT = 'width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;color:#e5e7eb';
+
+  // Already associated? Opened-from-task (pendingTaskLink) or any existing task_rooms link.
+  function roomAlreadyLinked() {
+    if (pendingTaskLink) return true;
+    try { return _rtLinkedTasks().length > 0; } catch (e) { return false; }
+  }
+
+  // Dispatch a captured normal-room message snapshot exactly once. Mirrors the non-conference
+  // path of sendMessage without ever re-reading mutable composer state. Returns the row mid.
+  function _sendNormalNow(snap) {
+    if (!snap) return null;
+    if (ws?.readyState !== WebSocket.OPEN) { showToast('No connection — retry', 'warning'); return null; }
+    const text = snap.text, echo = snap.echo, attachments = snap.attachments || [];
+    appendMsg('user', echo);
+    const _sentRow = storedMsgData.length ? storedMsgData[storedMsgData.length - 1] : null;
+    const _rowTs   = (_sentRow && Number.isFinite(_sentRow.ts)) ? _sentRow.ts : Date.now();
+    const _rowMid  = (_sentRow && _sentRow.mid) || null;
+    clearLastQuestion();
+    ws.send(JSON.stringify({ type: 'chat', text, attachments, engineMode: 'global', displayedEngine, roomId: currentRoomId, rowTs: _rowTs, rowMid: _rowMid }));
+    setCurrentTask(text.replace(/\s+/g, ' ').trim().slice(0, 140));
+    if (text && inputHistory[inputHistory.length - 1] !== text) { inputHistory.push(text); if (inputHistory.length > 50) inputHistory.shift(); }
+    historyIdx = -1;
+    inputEl.value = ''; userResizedInput = false; autoGrowInput(); clearAttachments();
+    return _rowMid;
+  }
+
+  // ── Deferred-link error banner with a concrete Retry action (drafts) ─────────
+  let _roomLinkErrBanner = null;
+  function _hideRoomLinkError() { if (_roomLinkErrBanner) { _roomLinkErrBanner.remove(); _roomLinkErrBanner = null; } }
+  function _showRoomLinkError(rec) {
+    _hideRoomLinkError();
+    const b = document.createElement('div');
+    b.className = 'ctx-warning';
+    const span = document.createElement('span');
+    span.textContent = '🗂 Could not link this room to task-' + (rec.taskId || '') + '. ';
+    const retry = document.createElement('button');
+    retry.className = 'ctx-btn-dismiss'; retry.textContent = 'Retry'; retry.style.cssText = 'margin-left:6px';
+    retry.onclick = function () { retry.disabled = true; applyRoomTaskLink(rec); };
+    const x = document.createElement('button');
+    x.className = 'ctx-btn-dismiss'; x.textContent = '✕'; x.onclick = _hideRoomLinkError;
+    b.appendChild(span); b.appendChild(retry); b.appendChild(x);
+    if (messagesEl && messagesEl.parentNode) messagesEl.parentNode.insertBefore(b, messagesEl);
+    _roomLinkErrBanner = b;
+  }
+
+  // The ONLY writer of a deferred (draft-promoted) task_rooms link. Idempotent server-side
+  // (insertOrIgnore on task_id+room_key), so repeated Retry is safe. Clears pendingRoomTaskLink
+  // ONLY after _rtPost succeeds; _trApply/chip-refresh are best-effort and never re-link.
+  function applyRoomTaskLink(rec) {
+    if (!rec || !rec.file || !rec.confirmedRoomId) return;
+    if (_applyingRoomLink) return;
+    _applyingRoomLink = true;
+    _rtPost(rec.file, rec.confirmedRoomId).then(function (ok) {
+      if (!ok) throw new Error('link');
+      _hideRoomLinkError();
+      return _trApply({ taskId: rec.taskId, taskTitle: rec.taskTitle, roomKey: rec.confirmedRoomId, sessionId: rec.confirmedRoomId, existingTask: !!rec.existingTask, parentInherit: !!rec.parentInherit, parentSubtitle: !!rec.parentSubtitle, subtitle: rec.subtitle, prefix: rec.prefix, useOriginal: !!rec.useOriginal /* TASKROOM_PARENT_PREFIX_V2 */ })
+        .catch(function () { return false; })
+        .then(function () { try { _rtSyncChip(); } catch (e) {} showToast('Room linked to task-' + (rec.taskId || ''), 'success'); });
+    }).then(function () {
+      if (pendingRoomTaskLink && pendingRoomTaskLink.file === rec.file && pendingRoomTaskLink.confirmedRoomId === rec.confirmedRoomId) pendingRoomTaskLink = null;
+    }).catch(function () {
+      _showRoomLinkError(rec);   // keep pendingRoomTaskLink for a Retry
+    }).then(function () { _applyingRoomLink = false; });
+  }
+
+  // ── Modal shell ──────────────────────────────────────────────────────────────
+  function _rsPanel() { return document.getElementById('roomstart-task-panel'); }
+  function _closeRoomStartUI() {
+    _ttInvalidate();
+    const m = document.getElementById('roomstart-task-modal'); if (m) m.remove();
+    document.removeEventListener('keydown', _rsEsc, true);
+  }
+  function _rsCancel() { _closeRoomStartUI(); _roomStartGuard = false; _roomStartPending = null; }
+  function _rsEsc(e) { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _rsCancel(); } }
+  function _rsError(msg) { const p = _rsPanel(); if (!p) return; const e = p.querySelector('#rs-err'); if (e) e.textContent = msg || ''; }
+  function openRoomStartTaskModal(payload) {
+    _closeRoomStartUI();
+    _roomStartPending = { text: payload.text, echo: payload.echo, attachments: (payload.attachments || []) };
+    _roomStartGuard = true;
+    const wrap = document.createElement('div');
+    wrap.id = 'roomstart-task-modal';
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px';
+    wrap.innerHTML = '<div id="roomstart-task-panel" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:12px;max-width:560px;width:100%;max-height:80vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.5);padding:18px"></div>';
+    wrap.addEventListener('mousedown', function (e) { if (e.target === wrap) _rsCancel(); });
+    document.body.appendChild(wrap);
+    document.addEventListener('keydown', _rsEsc, true);
+    _rsRootView();
+  }
+  function _rsRootView() {
+    const p = _rsPanel(); if (!p) return;
+    if (!(_inheritedParentTask && _inheritedParentTask.length)) {   // [ROOM_TASK_INHERIT_V1] new-tab pop-out path: hydrate from the persisted seed
+      _inheritedParentTask = _readInheritTaskSeed(currentRoomId);
+    }
+    var inheritHtml = (_inheritedParentTask || []).map(function (t, i) {   // [ROOM_TASK_INHERIT_V1]
+      return '<button id="rs-inherit-' + i + '" style="' + _RS_BTN_ROW + '"></button>';
+    }).join('');
+    p.innerHTML =
+      '<div style="font-size:15px;font-weight:600;margin-bottom:4px">🗂 Associate this room with a task?</div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:14px">Choose an option to continue. Your message is sent after your choice.</div>' +
+      '<div style="display:flex;flex-direction:column;gap:8px">' +
+      inheritHtml +
+      '<button id="rs-find" style="' + _RS_BTN_ROW + '">🔍 Find an existing task</button>' +
+      '<button id="rs-new" style="' + _RS_BTN_ROW + '">➕ Create a new task</button>' +
+      '<button id="rs-none" style="' + _RS_BTN_ROW + '">— Continue without a task</button>' +
+      '</div>' +
+      '<div style="margin-top:14px;text-align:right"><button id="rs-cancel" style="' + _RS_BTN_GREY + '">Cancel</button></div>' +
+      '<div id="rs-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
+    (_inheritedParentTask || []).forEach(function (t, i) {   // [ROOM_TASK_INHERIT_V1] TASKROOM_PARENT_PREFIX_V2: one button -> generate -> naming step
+      var b = p.querySelector('#rs-inherit-' + i);
+      if (!b) return;
+      b.textContent = '↳ Continue with parent\'s task';
+      b.onclick = function () { _rsInheritStart(t); };   // [RS_NONE_TITLE_PARALLEL_V1]
+    });
+    p.querySelector('#rs-find').onclick = _rsFindView;
+    p.querySelector('#rs-new').onclick = _rsCreateGeneratingView;
+    p.querySelector('#rs-none').onclick = _rsNoneStart;   // [RS_NONE_TITLE_PARALLEL_V1]
+    p.querySelector('#rs-cancel').onclick = _rsCancel;
+  }
+  function _rsFindView() {
+    const p = _rsPanel(); if (!p) return;
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rs-back" style="' + _RS_BTN_GREY + '">←</button><div style="font-size:15px;font-weight:600">Find a task</div></div>' +
+      '<input id="rs-search" placeholder="Filter by title or number…" style="' + _RS_INPUT + ';margin-bottom:10px">' +
+      '<div id="rs-list" style="max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:4px">Loading…</div>';
+    p.querySelector('#rs-back').onclick = _rsRootView;
+    const searchEl = p.querySelector('#rs-search');
+    let all = [];
+    const draw = function () {
+      const listEl = p.querySelector('#rs-list'); if (!listEl) return;
+      const q = (searchEl.value || '').toLowerCase().trim();
+      const rows = all.filter(function (t) { return !q || (String(t.title || '').toLowerCase().indexOf(q) >= 0 || String(t.id || '').indexOf(q) >= 0); });
+      if (!rows.length) { listEl.innerHTML = '<div style="opacity:.6;padding:8px">No matches.</div>'; return; }
+      listEl.innerHTML = '';
+      rows.slice(0, 200).forEach(function (t) {
+        const row = document.createElement('button');
+        row.style.cssText = 'text-align:left;cursor:pointer;padding:8px 10px;border-radius:8px;border:1px solid #374151;background:#1f2937;color:#e5e7eb';
+        row.textContent = 'task-' + (t.id || '?') + ' · ' + (t.title || '(untitled)');
+        row.onclick = function () { submitRoomStart('linked', String(t.file || ''), { taskId: String(t.id || ''), taskTitle: String(t.title || ''), existingTask: true }); };
+        listEl.appendChild(row);
+      });
+    };
+    searchEl.oninput = draw;
+    fetch(API_BASE + '/tasks', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) {
+        all = (d && Array.isArray(d.tasks)) ? d.tasks.filter(function (t) { return t && t.status !== 'done'; }) : [];
+        all.sort(function (a, b) {
+          const na = parseInt(String((a && a.id) || ''), 10), nb = parseInt(String((b && b.id) || ''), 10);
+          if (isNaN(na) && isNaN(nb)) return 0; if (isNaN(na)) return 1; if (isNaN(nb)) return -1; return nb - na;
+        });
+        draw(); setTimeout(function () { try { searchEl.focus(); } catch (e) {} }, 0);
+      })
+      .catch(function () { const listEl = p.querySelector('#rs-list'); if (listEl) { listEl.innerHTML = '<div style="opacity:.85;padding:8px">Could not load the list. <button id="rs-retry" style="' + _RS_BTN_GREY + ';margin-left:6px">Retry</button></div>'; const rb = listEl.querySelector('#rs-retry'); if (rb) rb.onclick = _rsFindView; } });
+  }
+  function _rsCreateGeneratingView() {
+    _ttInvalidate();
+    const myGen = _ttGen;
+    const p = _rsPanel(); if (!p) return;
+    const srcText = (_roomStartPending && _roomStartPending.text) ? String(_roomStartPending.text) : '';
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rs-g-back" style="' + _RS_BTN_GREY + '">←</button><div style="font-size:15px;font-weight:600">Create a new task</div></div>' +
+      _ttGenBody('Summarising your objective in a few words.') +
+      '<div style="text-align:right"><button id="rs-g-cancel" style="' + _RS_BTN_GREY + '">Cancel</button></div>';
+    p.querySelector('#rs-g-back').onclick = function () { _ttInvalidate(); _rsRootView(); };
+    p.querySelector('#rs-g-cancel').onclick = _rsCancel;
+    _ttFetch({ text: srcText, roomId: String(currentRoomId || '') }).then(function (d) {
+      if (myGen !== _ttGen) return;
+      if (!_rsPanel()) return;
+      _rsCreateView({ title: (d.title || d.fallback || (d && d.authFailed ? '' : _ttFallback(srcText))), description: (d.source || srcText) });
+    });
+  }
+  // >>> RS_NONE_TITLE_V1 — offer a Haiku room title on the "Continue without a task" path.
+  // In-modal step: generate a title, then let the user accept or skip before the message sends.
+  function _rsApplyRoomName(name) {
+    name = String(name == null ? '' : name).replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (!name) return;
+    const rid = String(currentRoomId || '');
+    const confirmedNow = !!(roomServerConfirmed && rid && !rid.startsWith('draft-'));
+    if (confirmedNow) {
+      sessionNameById[rid] = name;
+      try { _trExpectName(rid, name); } catch (e) {}
+      fetch(API_BASE + '/sessions/' + encodeURIComponent(rid) + '/name', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name })
+      }).then(function () { if (typeof loadSessions === 'function') loadSessions(); }).catch(function () {});
+      if (currentSessionId === rid) updateTitlebar();
+    } else {
+      try { localStorage.setItem('bridge_pending_name::' + rid, name); } catch (e) {}
+      pendingRoomName = name; updateTitlebar();
+    }
+  }
+  // <<< RS_NONE_TITLE_V1
+  // >>> RS_NONE_TITLE_PARALLEL_V1 — non-blocking title generation.
+  // The old *GeneratingView/*NameView steps blocked the first message on a Haiku
+  // round-trip (up to 25s). These starters dispatch the message immediately and name
+  // the room in the background when Haiku returns — the name is cosmetic and never
+  // gates turn processing. The old blocking *GeneratingView/*NameView functions were removed.
+  function _rsNoneStart() {
+    const srcText = (_roomStartPending && _roomStartPending.text) ? String(_roomStartPending.text) : '';
+    const startRid = String(currentRoomId || '');
+    submitRoomStart('none', null, null);   // sends the message + closes the modal NOW
+    _ttFetch({ text: srcText, roomId: startRid }).then(function (d) {
+      const nm = (d && (d.title || d.fallback)) || _ttFallback(srcText);
+      if (!nm) return;
+      // A fresh draft promotes in place (draft id -> session id), so an exact-match
+      // check would miss the promoted room; allow that, but bail if the user has
+      // navigated to a DIFFERENT existing session meanwhile.
+      const now = String(currentRoomId || '');
+      if (!startRid.startsWith('draft-') && now !== startRid) return;
+      _rsApplyRoomName(nm);
+    });
+  }
+  function _rsInheritStart(t) {
+    const srcText = (_roomStartPending && _roomStartPending.text) ? String(_roomStartPending.text) : '';
+    const startRid = String(currentRoomId || '');
+    // Link + dispatch immediately using the parent's own title (no Haiku wait)...
+    submitRoomStart('linked', String(t.file || ''), { taskId: String(t.id || ''), taskTitle: String(t.title || ''), existingTask: true, parentInherit: true, parentSubtitle: true, subtitle: String(t.title || ''), prefix: '', useOriginal: true });
+    // ...then refine the room name to a short Haiku subtitle in the background so
+    // sibling rooms off the same parent task stay distinguishable.
+    _ttFetch({ text: srcText, roomId: startRid }).then(function (d) {
+      const sub = (d && (d.title || d.fallback)) || _ttFallback(srcText);
+      if (!sub) return;
+      _rsRefineInheritName(startRid, t, sub);
+    });
+  }
+  function _rsRefineInheritName(startRid, t, sub) {
+    // Mirror the name _trApply(parentInherit) builds, minus the prefix: '<id> - <sub>'
+    // behind the parent-subtitle indent marker. Applied directly (no confirm dialog).
+    const _psfx = '\u2800\u2800\u2800- ';
+    const _id = String((t && t.id) == null ? '' : t.id).trim();
+    let combo = _id + ' - ' + String(sub || '').trim();
+    if (combo.length > 60) combo = combo.slice(0, 59) + '\u2026';   // TR_MAX = 60
+    const name = _psfx + combo;
+    const rid = String(currentRoomId || '');
+    if (!startRid.startsWith('draft-') && rid !== startRid) return;   // navigated away
+    if (rid && !rid.startsWith('draft-')) {
+      sessionNameById[rid] = name;
+      try { _trExpectName(rid, name); } catch (e) {}
+      fetch(API_BASE + '/sessions/' + encodeURIComponent(rid) + '/name', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) })
+        .then(function () { if (typeof loadSessions === 'function') loadSessions(); }).catch(function () {});
+      if (currentSessionId === rid || currentRoomId === rid) updateTitlebar();
+    } else {
+      try { localStorage.setItem('bridge_pending_name::' + rid, name); } catch (e) {}
+      pendingRoomName = name; updateTitlebar();
+    }
+  }
+  // <<< RS_NONE_TITLE_PARALLEL_V1
+  function _rsCreateView(seed) {
+    const p = _rsPanel(); if (!p) return;
+    seed = _ttSeed(seed);
+    const prefill = String((seed && seed.title) || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const prefillDesc = String((seed && seed.description) || '');
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rs-c-back" style="' + _RS_BTN_GREY + '">←</button><div style="font-size:15px;font-weight:600">Create a new task</div></div>' +
+      '<label style="font-size:12px;opacity:.7">Title</label>' +
+      '<input id="rs-c-title" style="' + _RS_INPUT + ';margin:4px 0 10px">' +
+      '<label style="font-size:12px;opacity:.7">Description (optional)</label>' +
+      '<textarea id="rs-c-desc" rows="4" style="' + _RS_INPUT + ';margin:4px 0 10px;resize:vertical"></textarea>' +
+      '<div id="rs-c-fields" style="display:flex;flex-wrap:wrap;gap:10px;margin:0 0 12px"></div>' +
+      '<div style="text-align:right;display:flex;gap:8px;justify-content:flex-end"><button id="rs-c-cancel" style="' + _RS_BTN_GREY + '">Cancel</button><button id="rs-c-create" style="' + _RS_BTN_GREEN + '">Create &amp; send</button></div>' +
+      '<div id="rs-err" style="color:#fca5a5;font-size:12px;margin-top:8px"></div>';
+    const titleEl = p.querySelector('#rs-c-title'); titleEl.value = prefill;
+    const descEl = p.querySelector('#rs-c-desc'); descEl.value = prefillDesc;
+    const areaField = _confPickerField('Area', 'rs-c-area', '— No area —');
+    const projField = _confPickerField('Project', 'rs-c-project', '— No project —');
+    const fieldsEl = p.querySelector('#rs-c-fields');
+    if (fieldsEl) { fieldsEl.appendChild(areaField.el); fieldsEl.appendChild(projField.el); }
+    let _seed = []; try { _seed = lastTasks || []; } catch (e) { _seed = []; }
+    areaField.populate(_confDistinctValues(_seed, 'area'));
+    projField.populate(_confDistinctValues(_seed, 'project'));
+    try { _applyCachedTaskDefaults(areaField, projField); } catch (e) {}
+    _applyTaskDefaults(areaField, projField, fieldsEl);
+    fetch(API_BASE + '/tasks', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) {
+        if (!fieldsEl || !fieldsEl.isConnected) return;
+        const allT = (d && Array.isArray(d.tasks)) ? d.tasks : [];
+        areaField.populate(_confDistinctValues(allT, 'area'));
+        projField.populate(_confDistinctValues(allT, 'project'));
+        _applyTaskDefaults(areaField, projField, fieldsEl);
+      })
+      .catch(function () {});
+    p.querySelector('#rs-c-back').onclick = _rsRootView;
+    p.querySelector('#rs-c-cancel').onclick = _rsCancel;
+    const createBtn = p.querySelector('#rs-c-create');
+    createBtn.onclick = function () {
+      const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
+      const errEl = p.querySelector('#rs-err');
+      if (title.length < 3) { if (errEl) errEl.textContent = 'The title must be at least 3 characters.'; return; }
+      createBtn.disabled = true; createBtn.textContent = 'Creating…';
+      const _area = areaField.getValue(), _project = projField.getValue();
+      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
+        .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (res) {
+          if (!res.ok || !res.j || !res.j.file) throw new Error((res.j && res.j.error) || 'error');
+          _noteTaskDefaults(_area, _project);
+          // Task created; the association + send is a SEPARATE step that never re-creates.
+          submitRoomStart('created', String(res.j.file || ''), { taskId: String(res.j.id || ''), taskTitle: String(res.j.title || title), existingTask: false });
+        })
+        .catch(function () { createBtn.disabled = false; createBtn.textContent = 'Create & send'; if (errEl) errEl.textContent = 'Could not create the task. Try again.'; });
+    };
+    setTimeout(function () { try { titleEl.focus(); titleEl.setSelectionRange(titleEl.value.length, titleEl.value.length); } catch (e) {} }, 0);
+  }
+  // Confirmed-room link step (before dispatch) with an in-panel Retry that never re-creates.
+  function _rsFinalizeView(decision, file, meta) {
+    const p = _rsPanel(); if (!p) return;
+    p.innerHTML =
+      '<div style="font-size:15px;font-weight:600;margin-bottom:10px">🗂 Linking room to task-' + (meta.taskId || '') + '…</div>' +
+      '<div id="rs-fin-msg" style="font-size:13px;opacity:.85">Working…</div>' +
+      '<div id="rs-fin-act" style="margin-top:14px;display:none;gap:8px;justify-content:flex-end">' +
+        '<button id="rs-fin-cancel" style="' + _RS_BTN_GREY + '">Cancel</button>' +
+        '<button id="rs-fin-retry" style="' + _RS_BTN_GREEN + '">Retry</button>' +
+      '</div>';
+  }
+  function _rsFinalizeError(decision, file, meta, msg) {
+    const p = _rsPanel(); if (!p) return;
+    const m = p.querySelector('#rs-fin-msg'); if (m) { m.textContent = msg; m.style.color = '#fca5a5'; }
+    const act = p.querySelector('#rs-fin-act'); if (act) act.style.display = 'flex';
+    const c = p.querySelector('#rs-fin-cancel'); if (c) c.onclick = _rsCancel;
+    const r = p.querySelector('#rs-fin-retry'); if (r) r.onclick = function () { r.disabled = true; submitRoomStart(decision, file, meta); };
+  }
+  // Single dispatch/association authority for a chosen outcome. Dispatches the snapshot once.
+  function submitRoomStart(decision, file, meta) {
+    meta = meta || {};
+    try { _consumeInheritTaskSeed(String(currentRoomId || '')); } catch (e) {}   // [ROOM_TASK_INHERIT_V1] spend the seed once a start decision is made
+    const snap = _roomStartPending;
+    if (!snap) { _rsCancel(); return; }
+    if (ws?.readyState !== WebSocket.OPEN) { _rsError('No connection — retry'); return; }
+    if (decision === 'none' || !file) {
+      _roomStartPending = null; _closeRoomStartUI(); _roomStartGuard = false;
+      _sendNormalNow(snap);
+      return;
+    }
+    const rid = String(currentRoomId || '');
+    const confirmedNow = !!(roomServerConfirmed && rid && !rid.startsWith('draft-'));
+    if (!confirmedNow) {
+      // Draft room: bind identity BEFORE dispatch, defer the link to promotion, then send.
+      _roomStartPending = null; _closeRoomStartUI(); _roomStartGuard = false;
+      pendingRoomTaskLink = { draftRoomId: rid, rowMid: null, file: file, taskId: meta.taskId, taskTitle: meta.taskTitle, existingTask: !!meta.existingTask, parentInherit: !!meta.parentInherit, parentSubtitle: !!meta.parentSubtitle, subtitle: meta.subtitle, prefix: meta.prefix, useOriginal: !!meta.useOriginal /* TASKROOM_PARENT_PREFIX_V2 */ };
+      const mid = _sendNormalNow(snap);
+      if (pendingRoomTaskLink && pendingRoomTaskLink.draftRoomId === rid) pendingRoomTaskLink.rowMid = mid || null;
+      return;
+    }
+    // Confirmed (reopened-empty) room: link BEFORE dispatch. On failure keep the modal +
+    // snapshot and offer Retry (idempotent) — never send under a false linked outcome.
+    _rsFinalizeView(decision, file, meta);
+    _rtPost(file, rid).then(function (ok) {
+      if (!ok) throw new Error('link');
+      return _trApply({ taskId: meta.taskId, taskTitle: meta.taskTitle, roomKey: rid, sessionId: rid, existingTask: !!meta.existingTask, parentInherit: !!meta.parentInherit, parentSubtitle: !!meta.parentSubtitle, subtitle: meta.subtitle, prefix: meta.prefix, useOriginal: !!meta.useOriginal /* TASKROOM_PARENT_PREFIX_V2 */ }).catch(function () { return false; });
+    }).then(function () {
+      try { _rtSyncChip(); } catch (e) {}
+      showToast('Room linked to task-' + (meta.taskId || ''), 'success');
+      _roomStartPending = null; _closeRoomStartUI(); _roomStartGuard = false;
+      _sendNormalNow(snap);
+    }).catch(function () {
+      _rsFinalizeError(decision, file, meta, 'Could not link the room to task-' + (meta.taskId || '') + '.');
+    });
+  }
 
   function hideRoomUnresolved() { if (_roomUnresolvedBanner) { _roomUnresolvedBanner.remove(); _roomUnresolvedBanner = null; } }
   function showRoomUnresolved(roomId, kind) {
@@ -4152,7 +5449,7 @@
     if (q && abox && !abox.childElementCount && _makeRow) {
       for (const s of _archivedRoomsData) abox.appendChild(_makeRow(s));
     }
-    let taskHits = 0, archHits = 0;
+    let taskHits = 0, archHits = 0, normalHits = 0;
     for (const r of _sessRows) {
       if (!r || !r.dataset) continue;
       const label = r.dataset.label || '';
@@ -4164,9 +5461,15 @@
       r.style.display = hit ? '' : 'none';
       if (hit && r.dataset.task === '1') taskHits++;
       if (hit && r.dataset.archived === '1') archHits++;
+      if (hit && r.dataset.task !== '1' && r.dataset.archived !== '1') normalHits++;   // [ROOMSEARCH_MAINFLOOR_V1] primary/open matches
     }
     if (box) box.style.display = q ? (taskHits ? 'block' : 'none') : (taskRoomsExpanded ? 'block' : 'none');
     if (abox) abox.style.display = q ? (archHits ? 'block' : 'none') : (archivedRoomsExpanded ? 'block' : 'none');
+    // [ROOMSEARCH_MAINFLOOR_V1] Reserve a min-height for #session-list ONLY while a search has
+    // >=1 primary/open match, so the non-shrinking Task/Archived footer can't squeeze the active
+    // rooms out of view. Gated on a real match so compact and Task/Archived-only layouts are
+    // untouched; cleared automatically when q is empty or no primary rows match.
+    sessionDropdown.classList.toggle('dd-has-main-results', !!q && normalHits > 0);
     _reorderRoomSections(!!q);   // [ROOMSEARCH_TITLEFIRST_V1] title-first within each section
   }
   // [ROOMSEARCH_TITLEFIRST_V1] Float title-matched rows above conversation-only matches
@@ -4351,6 +5654,7 @@
     const freshNewTabHref = () => {
       const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
       try { seedAppearanceFrom(currentRoomId, rid); } catch (e) {}   // [ROOM_LAYOUT_INHERIT_V1] new tab inherits this room's look
+      try { _seedInheritTaskFrom(currentRoomId, rid); } catch (e) {}   // [ROOM_TASK_INHERIT_V1] new tab inherits this room task
       const u = new URL(location.href); u.searchParams.set('room', rid);
       newWinBtn.href = u.href;
     };
@@ -4443,8 +5747,9 @@
         edit.title = 'Rename room';
         edit.onclick = async (e) => {
           e.stopPropagation();
-          const name = prompt('Room name:', s.name || '');
+          let name = prompt('Room name:', s.name || '');
           if (name === null) return;
+          name = normRoomName(name);
           try {
             await fetch(`${API_BASE}/sessions/${s.id}/name`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -4664,6 +5969,22 @@
     const n = parseInt(chatPanel.style.width, 10);
     if (Number.isFinite(n)) writeLayout({ cw: n });
   });
+
+  // [NEWTAB_TOPBAR_V1] "New room in a new tab" button in the header title bar.
+  // Mirrors the footer new-window button: on interaction, mint a fresh draft room id,
+  // inherit this room's look + task, and point the target=_blank link at ?room=<rid>.
+  const btnNewtabTop = document.getElementById('btn-newtab-top');
+  if (btnNewtabTop) {
+    const _freshTopHref = () => {
+      const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
+      try { seedAppearanceFrom(currentRoomId, rid); } catch (e) {}
+      try { _seedInheritTaskFrom(currentRoomId, rid); } catch (e) {}
+      const u = new URL(location.href); u.searchParams.set('room', rid);
+      btnNewtabTop.href = u.href;
+    };
+    btnNewtabTop.addEventListener('pointerdown', _freshTopHref);
+    btnNewtabTop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') _freshTopHref(); });
+  }
 
   // ── Tasks panel toggle ────────────────────────────────────────────────────
   const btnTasks     = $('btn-tasks');
@@ -4956,6 +6277,88 @@
       btnSettings && btnSettings.classList.remove('active');
       settingsPanel.classList.remove('hidden');
       if (settingsBody) renderInfraHealth(settingsBody);
+    });
+  }
+
+  // ── Settings > Loops (autonomy loop slots: last run + history) [LOOPS_METRICS_V1] ──
+  // task-355: "a loop" = a concurrent autonomy worker SLOT. Data from the canonical
+  // metrics-backed GET /autonomy/loops. One card per slot showing its true last-run
+  // time + last task, with an expandable bounded history of recent runs (time, task,
+  // success/failure from rc, cost). Read-only; opens on click + manual Refresh only.
+  async function renderLoops(host) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    host.innerHTML = '<p style="color:var(--text-dim);font-size:12px;">Loading loops…</p>';
+    let data = null;
+    try { data = await (await fetch(API_BASE + '/autonomy/loops', { cache: 'no-store' })).json(); } catch {}
+    if (!host.isConnected) return;
+    const head = '<div style="display:flex;align-items:center;gap:8px;margin:0 0 8px;">'
+      + '<h3 style="margin:0;font-size:14px;flex:1;">Loops</h3>'
+      + '<button id="loops-refresh" style="font-size:11px;padding:2px 8px;cursor:pointer;">Refresh</button></div>';
+    const wire = () => { const b = document.getElementById('loops-refresh'); if (b) b.addEventListener('click', () => renderLoops(host)); };
+    if (!data || !Array.isArray(data.loops)) {
+      host.innerHTML = head + '<p style="color:var(--text-dim);font-size:12px;">Loops are unavailable right now.</p>'; wire(); return;
+    }
+    const loops = data.loops;
+    if (!loops.length) {
+      host.innerHTML = head + '<p style="color:var(--text-dim);font-size:12px;">' + esc(data.note || 'No loop runs recorded yet.') + '</p>'; wire(); return;
+    }
+    const fmtAbs = (ts) => { const d = new Date(ts); return isNaN(d.getTime()) ? esc(String(ts)) : d.toLocaleString(); };
+    const fmtRel = (ts) => {
+      const t = Date.parse(ts); if (isNaN(t)) return '';
+      const s = Math.max(0, (Date.now() - t) / 1000);
+      if (s < 60) return 'just now';
+      const m = s / 60; if (m < 60) return Math.floor(m) + 'm ago';
+      const h = m / 60; if (h < 24) return Math.floor(h) + 'h ago';
+      return Math.floor(h / 24) + 'd ago';
+    };
+    const titleFor = (task) => {
+      const m = /^task-0*(\d+)-(.*)$/.exec(String(task || ''));
+      if (!m) return '';
+      let t = null;
+      try { t = (typeof lastTasks !== 'undefined' ? lastTasks : []).find(x => parseInt(x.id, 10) === parseInt(m[1], 10)); } catch {}
+      return (t && t.title) ? String(t.title) : m[2].replace(/-+/g, ' ').trim();
+    };
+    const rcBadge = (rc) => rc === 0
+      ? '<span style="color:#4ade80;">✓</span>'
+      : (typeof rc === 'number' ? '<span style="color:#f87171;">✗ ' + esc(String(rc)) + '</span>' : '<span style="color:var(--text-dim);">?</span>');
+    const cost = (c) => (typeof c === 'number') ? '$' + c.toFixed(2) : '';
+    const runRow = (r) => '<div style="display:flex;gap:8px;font-size:11px;color:var(--text-dim);padding:2px 0;border-top:1px solid var(--border,#2a2a2a);">'
+      + '<span style="white-space:nowrap;">' + esc(fmtAbs(r.ts)) + '</span>'
+      + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+      + '<span style="font-family:monospace;color:#60a5fa;">' + esc(String(r.task)) + '</span></span>'
+      + '<span>' + rcBadge(r.rc) + '</span>'
+      + '<span style="white-space:nowrap;">' + esc(cost(r.cost_usd)) + '</span></div>';
+    const card = (lp) => {
+      const runs = Array.isArray(lp.recentRuns) ? lp.recentRuns : [];
+      const title = titleFor(lp.lastTask);
+      return '<div style="margin:12px 0 0;padding:10px;border:1px solid var(--border,#2a2a2a);border-radius:6px;">'
+        + '<div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;">'
+        + '<span style="font-size:13px;font-weight:600;color:var(--text,#eee);">🔁 Slot ' + esc(String(lp.slot)) + '</span>'
+        + '<span style="font-size:11px;color:var(--text-dim);">last ran ' + esc(fmtRel(lp.lastRunTs)) + ' · ' + esc(fmtAbs(lp.lastRunTs)) + '</span></div>'
+        + '<div style="font-size:12px;margin:4px 0 2px;">'
+        + '<span style="font-family:monospace;color:#60a5fa;">' + esc(String(lp.lastTask)) + '</span>'
+        + (title ? ' <span style="color:var(--text-dim);">' + esc(title) + '</span>' : '')
+        + '</div>'
+        + '<details style="margin-top:4px;"><summary style="font-size:11px;color:var(--text-dim);cursor:pointer;">'
+        + esc(String(lp.windowRunCount)) + ' recent run' + (lp.windowRunCount === 1 ? '' : 's') + '</summary>'
+        + runs.map(runRow).join('') + '</details></div>';
+    };
+    host.innerHTML = head
+      + '<p style="font-size:11px;color:var(--text-dim);margin:0 0 4px;line-height:1.4;">'
+      + loops.length + ' loop slot' + (loops.length === 1 ? '' : 's')
+      + ' — each slot is a concurrent autonomy worker; showing its last run and recent task history.</p>'
+      + loops.map(card).join('');
+    wire();
+  }
+
+  // Loops menu item -> settings panel showing autonomy loops grouped by task.
+  const btnLoops = $('btn-loops');
+  if (btnLoops && settingsPanel) {
+    btnLoops.addEventListener('click', () => {
+      settingsDropdown && settingsDropdown.classList.add('hidden');
+      btnSettings && btnSettings.classList.remove('active');
+      settingsPanel.classList.remove('hidden');
+      if (settingsBody) renderLoops(settingsBody);
     });
   }
 
@@ -5403,7 +6806,10 @@
         const lab = document.createElement('span'); lab.className = 'acct-ubar-label'; lab.textContent = label;
         const track = document.createElement('span'); track.className = 'acct-ubar-track';
         const fill = document.createElement('span'); fill.className = 'acct-ubar-fill';
-        fill.style.width = p + '%'; fill.style.background = usageColor(p);
+        fill.style.width = p + '%';
+        fill.style.background = (label === '7d')                                     // [7D_PACE_COLOR_V1]
+          ? sevenDayColor(p, expired ? null : resetsAt)
+          : usageColor(p);
         track.appendChild(fill);
         const pc = document.createElement('span'); pc.className = 'acct-ubar-pct'; pc.textContent = p.toFixed(0) + '%';
         const t = document.createElement('span'); t.className = 'acct-ubar-time';
@@ -5425,7 +6831,7 @@
     let codexUsageTries = 0;
     async function render() {
       try {
-        const r = await fetch(`${API_BASE}/accounts`);
+        const r = await fetch(`${API_BASE}/accounts?roomId=${encodeURIComponent(currentRoomId||'')}`);
         const d = await r.json();
         applyEngineMeta(d);
         if (!d.ok) throw new Error(d.error || 'Could not load accounts.');
@@ -5444,7 +6850,9 @@
           const isCodex = a.type === 'codex';
           // [ENGINE_GLOBAL_ONLY_V1] Each engine keeps its OWN active account, whichever
           // engine happens to be running: mark the active row per family, not per engine.
-          const isActive = isCodex ? !!a.active : !!(a.email && d.active && a.email === d.active);
+          const _paneRT = d.paneRuntime || null;   // [ACCT_RUNTIME_IDENTITY_V1] credential-first pane account
+          const _selName = (d.engineAccounts && d.engineAccounts.claude && d.engineAccounts.claude.name) || null;   // [ACCT_SWITCHER_SELECTION_V1] switcher badge follows the pane SELECTION, not the running/credential account (status bar stays credential-first)
+          const isActive = isCodex ? !!a.active : (_selName ? a.name === _selName : (_paneRT && _paneRT.name ? a.name === _paneRT.name : !!(a.email && d.active && a.email === d.active)));
           if (isCodex && !listEl._codexHeaderDone) { listEl._codexHeaderDone = true; if (!claudeAddDone) { claudeAddDone = true; addClaudeAddRow(); } const _h = document.createElement('div'); _h.className = 'acct-group-label'; _h.textContent = 'Codex accounts'; listEl.appendChild(_h); }
           const b = document.createElement('button');
           b.className = 'acct-item' + (isActive ? ' acct-active' : '') + (isCodex ? ' acct-codex' : '');
@@ -5484,7 +6892,7 @@
             if (isCodex) codexPending = true;
           }
           if (isActive) b.classList.add('acct-current');   // not disabled, so ✎ stays clickable
-          b.addEventListener('click', () => { if (isActive) return; doSwitch(a.name, a.type); });
+          b.addEventListener('click', () => { if (isActive) return; doSwitch(a.name, a.type, a.email); });
           listEl.appendChild(b);
         });
         // Claude add-row sits at the end of the Claude group; if there were no Codex
@@ -5527,23 +6935,43 @@
       } catch (e) { setMsg(e.message, 'err'); }
       await render();
     }
-    async function doSwitch(name, type) {
+    async function doSwitch(name, type, targetEmail) {
       ++usageRequest;
       setMsg('Switching…', 'info');
       listEl.querySelectorAll('button').forEach(b => b.disabled = true);
+      // [TASK201_SWITCH_ROOM_GATE_V1] Reuse this room unless the selection genuinely cannot
+      // resume the live conversation. A transcript is account-scoped, so only the account the
+      // room is CURRENTLY using (engineAccts[family].email, the server's per-room selection)
+      // can resume it. Selecting an account for the engine that is NOT running, or switching a
+      // room that has nothing to resume, keeps the room; anything else forks a fresh room.
+      const family         = (type === 'codex') ? 'codex' : 'claude';
+      const roomOwner      = (engineAccts[family] || {}).email || '';
+      const hasLiveSession = !!currentSessionId && !String(currentSessionId).startsWith('draft-');
+      const affectsLive    = (family === globalEngine) && hasLiveSession;
+      const canResume      = (family === 'claude') ? true
+                             : (!affectsLive || (!!roomOwner && !!targetEmail && targetEmail === roomOwner));
+      const needNewRoom    = !canResume;   // conservative: unknown owner on a live affected session => fork
+      const _src = currentRoomId, _srcSession = currentSessionId;
+      if (needNewRoom) newSession();   // fresh room; currentRoomId updated synchronously so the POST binds the account to it
       try {
-        const r = await fetch(`${API_BASE}/accounts/switch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type }) });
+        const r = await fetch(`${API_BASE}/accounts/switch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, type, roomId: currentRoomId }) });
         const d = await r.json();
         if (r.ok && d.ok) {
           // [ENGINE_GLOBAL_ONLY_V1] Switching an account changes only THAT engine's account —
           // never which engine runs. Refresh the labels from the authoritative summary.
-          try { const _a = await (await fetch(`${API_BASE}/accounts`, { cache: 'no-store' })).json(); if (_a && _a.ok) applyEngineMeta(_a); } catch (e) {}
+          try { const _a = await (await fetch(`${API_BASE}/accounts?roomId=${encodeURIComponent(currentRoomId||'')}`, { cache: 'no-store' })).json(); if (_a && _a.ok) applyEngineMeta(_a); } catch (e) {}
           setMsg('✓ ' + (d.message || 'Switched.'), 'ok');
           setTimeout(() => { ov.remove(); if (typeof pollUsage === 'function') pollUsage();
             if (typeof updateTitlebar === 'function') updateTitlebar();
-            if (typeof showToast === 'function') showToast('Switched \u2014 your next message continues in this room.', 'success'); }, 1200);
-        } else { setMsg((d && (d.error || d.message)) || 'Switch failed.', 'err'); await render(); }
-      } catch (e) { setMsg(e.message, 'err'); await render(); }
+            if (typeof showToast === 'function') showToast(needNewRoom ? 'Switched \u2014 a fresh room was started for this account.' : 'Switched \u2014 your next message continues in this room.', 'success'); }, 1200);
+        } else {
+          if (needNewRoom) { try { enterRoom(_src, _srcSession); } catch (e) {} }   // [TASK201_SWITCH_ROOM_GATE_V1] failed switch: return to the source room
+          setMsg((d && (d.error || d.message)) || 'Switch failed.', 'err'); await render();
+        }
+      } catch (e) {
+        if (needNewRoom) { try { enterRoom(_src, _srcSession); } catch (e2) {} }   // [TASK201_SWITCH_ROOM_GATE_V1] failed switch: return to the source room
+        setMsg(e.message, 'err'); await render();
+      }
     }
     render();
   }
@@ -5569,7 +6997,7 @@
   const STATUS_RANK = { 'needs-clarification': 0, 'blocked': 1, 'planned': 2, 'new': 3,
     'objective-clear': 4, 'approved': 5, 'in-progress': 6, 'done': 9 };
   const rankOf = s => (STATUS_RANK[s] ?? 5);
-  const todayStr = () => new Date().toISOString().slice(0, 10);
+  const todayStr = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' }); // [TZ_BA_V1]
   const isFuture = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '') && d > todayStr();
   // Idea/Concept-type tasks are hidden from the default "pending" view (task 241).
   const isIdeaConcept = t => ['idea/concept', 'idea', 'concept'].includes(String(t || '').trim().toLowerCase());
@@ -5715,6 +7143,7 @@
       // (green-dot) question — i.e. shows pending tasks with a red or no dot. [PENDING_EXC]
       case 'pending-exc': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && !isIdeaConcept(t.type) && dotState(t) !== 'green'); break;
       case 'today':   list = list.filter(t => t.scheduled === today); break;
+      case 'scheduled': list = list.filter(t => t.status !== 'done' && isFuture(t.scheduled)); break;
       case 'past':    list = list.filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') && t.scheduled < today); break;
       case 'no-date': list = list.filter(t => !t.scheduled); break;
       /* 'all' => no date constraint */
@@ -5726,11 +7155,12 @@
     if (taskState.project.length) list = list.filter(t => taskState.project.includes(t.project || '__none__'));
     if (taskState.flags.length)   list = list.filter(t => { const tf = Array.isArray(t.flags) ? t.flags : []; return taskState.flags.some(f => f === '__none__' ? tf.length === 0 : tf.includes(f)); });
     const q = taskSearch.trim().toLowerCase();
-    if (q) list = list.filter(t => (t.title || '').toLowerCase().includes(q));
+    if (q) list = list.filter(t => (t.title || '').toLowerCase().includes(q) || String(t.id ?? '').includes(q));
     if (taskState.sort) {
       const col = taskState.sort, mul = taskState.dir === 'desc' ? -1 : 1;
-      const val = t => col === 'priority' ? (t.priority === '' || t.priority == null || Number.isNaN(parseInt(t.priority, 10)) ? 99 : parseInt(t.priority, 10))
+      const val = t => col === 'priority' ? (t.priority === '' || t.priority == null || Number.isNaN(parseInt(t.priority, 10)) ? -1 : parseInt(t.priority, 10))
                      : col === 'status'   ? rankOf(t.status)
+                     : col === 'id'       ? (Number.isNaN(parseInt(t.id, 10)) ? 0 : parseInt(t.id, 10))  // [TASK333] # column sorts task numbers numerically, not 1,10,2
                      : String(t[col] || '').toLowerCase();
       list.sort((a, b) => {
         const va = val(a), vb = val(b);
@@ -5981,6 +7411,40 @@
     document.body.appendChild(menu);
     setTimeout(() => document.addEventListener('click', onDoc, true), 0);
   }
+  function editPerson(t, anchor) {
+    document.querySelectorAll('.task-menu, .area-picker, .project-picker, .person-picker').forEach(m => m.remove());
+    const people = Array.from(new Set((lastTasks || []).map(x => x.person).filter(Boolean)))
+      .sort((a, b) => String(a).localeCompare(String(b)));
+    const menu = document.createElement('div');
+    menu.className = 'task-menu person-picker';
+    menu.style.cssText = 'z-index:10000';
+    const close = () => { menu.remove(); document.removeEventListener('click', onDoc, true); };
+    const onDoc = (e) => { if (!menu.contains(e.target)) close(); };
+    const item = (label, fn, cls) => {
+      const b = document.createElement('button');
+      b.className = 'task-menu-item' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); close(); fn(); });
+      menu.appendChild(b);
+    };
+    const head = document.createElement('div');
+    head.className = 'task-menu-sep';
+    head.textContent = 'Assign person';
+    head.style.cssText = 'padding:4px 12px;opacity:.55;font-size:11px';
+    menu.appendChild(head);
+    for (const p of people) {
+      item((p === t.person ? '\u25cf ' : '\u00a0\u00a0\u00a0') + p, () => updateTaskFields(t.file, { person: p }));
+    }
+    const sepEl = document.createElement('div'); sepEl.className = 'task-menu-sep'; menu.appendChild(sepEl);
+    item('\u270e New person\u2026', () => {
+      const v = prompt('Assign "' + t.title + '" to:', t.person || '');
+      if (v !== null) updateTaskFields(t.file, { person: v.trim() });
+    });
+    if (t.person) item('\u2717 Unassign', () => updateTaskFields(t.file, { person: '' }), 'danger');
+    document.body.appendChild(menu);
+    anchorMenuTo(menu, anchor);
+    setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+  }
   function editPriority(t) {
     const v = prompt('Priority 0–4 (blank to clear):', t.priority || '');
     if (v === null) return;
@@ -6074,11 +7538,12 @@
     item('✎ Rename…',       () => renameTask(t));
     item('⊞ Set area…',    () => editArea(t, anchor));
     item('🗂 Set project…', () => editProject(t));
+    item('👤 Assign person…', () => editPerson(t, anchor));
     item('🚩 Flag for meeting…', () => editFlags(t));
     item('⚑ Set priority…', () => editPriority(t));
     item(t.requires_desktop ? '🖥 Requires desktop ✓' : '🖥 Requires desktop', () => toggleRequiresDesktop(t));
-    item(isQueued(t) ? '🟢 Queued ✓' : '🟢 Mark queued', () => toggleQueued(t));
-    item(isQueuedAuto(t) ? '🔵 Queued Autonomous ✓' : '🔵 Mark queued autonomous', () => toggleQueuedAuto(t));
+    item(inGsdLoop(t) ? '🔄 GSD Loop ✓' : '🔄 GSD Loop', () => toggleGsd(t));  // [GSD_LOOP] replaces Queued / Queued Autonomous
+    /* [GSD_LOOP] Queued Autonomous menu item removed */
     sep();
     item('⏰ Schedule forward 1 day',  () => deferTask(t, 1));
     item('⏰ Schedule forward 3 days', () => deferTask(t, 3));
@@ -6102,32 +7567,293 @@
   //    progress,emails}. Single source of truth; no .md. [TASKDETAIL_UI_V1]
   // [TASK_ROOMS_UI_V1] Ordered, multi-valued conference-room links for a task.
   // A short display label for one room association.
-  function roomLinkLabel(rm) {
-    if (rm.label && String(rm.label).trim()) return String(rm.label).trim();
+  function roomLinkLabel(rm, t) {
+    // [TASKROOM_BTN_FOLLOW_TITLE_V1] Follow the room's OWN title (its live session
+    // name, the exact text the room header shows) so the chip always matches — and
+    // updates with — the room when it is renamed. Fall back to an explicit label,
+    // then the task-derived title, then a truncated key.
     const k = String(rm.room_key || '');
+    const nm = k ? (sessionNameById[k] || '') : '';
+    if (nm && String(nm).trim()) return String(nm).trim();
+    if (rm.label && String(rm.label).trim()) return String(rm.label).trim();
+    if (t) { const d = _trTitle(t.id, t.title); if (d) return d; }
     return k.length > 20 ? (k.slice(0, 8) + '\u2026' + k.slice(-6)) : k;
   }
   // Compact, read-only list rendered inline right after the Objective. Each entry
   // is a live ?room= deep-link opened in a new/adjacent tab (buildShareUrl). Full
   // add/remove management lives in the task-details overlay.
+  // [CONF_SPAWN_BTN_V1] Pop-out glyph (square with arrow leaving the top-right corner).
+  const _popoutSvg = '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true" style="vertical-align:-1px;margin-left:4px"><path d="M14 4h6v6M20 4l-9 9M19 13v6a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  // [ROOM_MONITOR_V1_CLIENT] Live per-room status indicator.
+  let _roomMonitorStatus = {};
+  let _liveTurnRoom = null;   // [GSD_ROOM_SPIN_V1] room_key of the live turn in this tab
+  const _roomDotColors = { completed: "#3b82f6", question: "#ef4444", stalled: "#f97316", idle: "#facc15", waiting: "#14b8a6" };
+  const _roomDotTitles = { working: "Working \u2014 a turn is live", completed: "Completed", question: "Question for you", stalled: "Stalled / needs a look", idle: "Idle \u2014 standing by", waiting: "Waiting \u2014 on you or an external event" };
+  function _ensureRoomDotStyle() {
+    if (document.getElementById("ccb-room-dot-style")) return;
+    const st = document.createElement("style"); st.id = "ccb-room-dot-style";
+    st.textContent = "@keyframes ccbspin{to{transform:rotate(360deg)}} .ccb-spin{animation:ccbspin .8s linear infinite} .ccb-qpulse{animation:ccbqpulse 1.6s ease-in-out infinite} @keyframes ccbqpulse{0%,100%{opacity:1}50%{opacity:.4}}";
+    document.head.appendChild(st);
+  }
+  function roomStatusDot(key) {
+    _ensureRoomDotStyle();
+    const st = (key && String(key) === String(_liveTurnRoom)) ? "working" : ((_roomMonitorStatus[key] || {}).status || "");   // [GSD_ROOM_SPIN_V1]
+    const d = document.createElement("span");
+    d.setAttribute("data-ccb-room-dot", key);
+    if (st === "working") {
+      d.className = "ccb-spin";
+      d.style.cssText = "display:inline-block;width:9px;height:9px;margin-right:5px;border-radius:50%;border:2px solid rgba(110,168,254,.35);border-top-color:#6ea8fe;flex:0 0 auto";
+      d.title = _roomDotTitles.working;
+    } else if (_roomDotColors[st]) {
+      d.className = "";
+      d.style.cssText = "display:inline-block;width:8px;height:8px;margin-right:5px;border-radius:50%;flex:0 0 auto;background:" + _roomDotColors[st];
+      d.title = _roomDotTitles[st] || st;
+    } else {
+      d.className = "";
+      d.style.cssText = "display:inline-block;width:8px;height:8px;margin-right:5px;border-radius:50%;flex:0 0 auto;background:transparent";
+      d.title = "";
+    }
+    return d;
+  }
+  function _updateRoomDots() {
+    try { document.querySelectorAll("[data-ccb-room-dot]").forEach(function (el) {
+      const fresh = roomStatusDot(el.getAttribute("data-ccb-room-dot"));
+      el.className = fresh.className; el.style.cssText = fresh.style.cssText; el.title = fresh.title;
+    }); } catch (e) {}
+    try { document.querySelectorAll("[data-ccb-agg]").forEach(_applyAggDot); } catch (e) {}   /* [AGG_LIVE_TURN_V1] re-render task dots instantly too */
+  }
+  async function refreshRoomMonitor() {
+    try { const r = await fetch(API_BASE + "/room-monitor", { cache: "no-store" }); const j = await r.json(); _roomMonitorStatus = (j && j.rooms) || {}; _updateRoomDots(); } catch (e) {}
+  }
+  function _startRoomMonitorPolling() {
+    if (window._ccbRoomMonitorStarted) return; window._ccbRoomMonitorStarted = true;
+    refreshRoomMonitor(); setInterval(refreshRoomMonitor, 15000);
+  }
+  // [ROOM_AGG_V1] Task-row roll-up dot summarising all of a task's associated rooms.
+  const _aggOrder = ["question", "stalled", "idle", "waiting", "completed", "working"]; /* [ROLL_RANK_V1] Q>stuck>idle>completed>working */
+  const _aggColors = { completed: "#3b82f6", question: "#ef4444", stalled: "#f97316", idle: "#facc15", waiting: "#14b8a6" };
+  const _aggTitles = { working: "Associated rooms: working", completed: "Associated rooms: all completed", question: "Associated rooms: a question awaits you", stalled: "Associated rooms: stalled / needs a look", idle: "Associated rooms: idle", waiting: "Associated rooms: waiting on you" };
+  function _aggStatusOf(t) {
+    if (t && (Number(t.oq) || 0) > 0) return "question";
+    const keys = (t && Array.isArray(t.rooms) ? t.rooms : []).map(function (r) { return String((r && r.room_key) || ""); }).filter(Boolean);
+    let best = null, bi = 99;
+    keys.forEach(function (k) { const st = (String(k) === String(_liveTurnRoom)) ? "working" : (_roomMonitorStatus[k] || {}).status; const i = _aggOrder.indexOf(st); if (i >= 0 && i < bi) { bi = i; best = st; } }); /* [AGG_LIVE_TURN_V1] */
+    return best;
+  }
+  function _applyAggDot(el) {
+    _ensureRoomDotStyle();
+    let t = null; try { t = JSON.parse(el.getAttribute("data-ccb-agg") || "null"); } catch (e) {}
+    const st = t ? _aggStatusOf(t) : null;
+    const base = "display:inline-block;flex:0 0 auto;vertical-align:middle;cursor:pointer;margin-right:5px;border-radius:50%;";
+    if (st === "working") {
+      el.className = "ccb-spin";
+      el.style.cssText = base + "width:13px;height:13px;border:2px solid rgba(110,168,254,.35);border-top-color:#6ea8fe;";
+      el.title = _aggTitles.working;
+    } else if (st === "question") {
+      el.className = "ccb-qpulse";
+      el.style.cssText = base + "width:13px;height:13px;background:" + _aggColors.question + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);";
+      el.title = _aggTitles.question;
+    } else if (_aggColors[st]) {
+      el.className = "";
+      el.style.cssText = base + "width:13px;height:13px;background:" + _aggColors[st] + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);";
+      el.title = _aggTitles[st] || st;
+    } else {
+      el.className = ""; el.style.cssText = "display:none"; el.title = "";
+    }
+  }
+  function _startAggRestyle() {
+    if (window._ccbAggRestyle) return; window._ccbAggRestyle = true;
+    setInterval(function () { try { document.querySelectorAll("[data-ccb-agg]").forEach(_applyAggDot); } catch (e) {} }, 5000);
+  }
+  /* [ROOM_DROPDOWN_V1] per-room breakdown popover */
+  function _roomStatusMeta(st) {
+    var colors = { completed: "#3b82f6", question: "#ef4444", stalled: "#f97316", idle: "#facc15", waiting: "#14b8a6", working: "#6ea8fe" };
+    var labels = { completed: "Completed", question: "Question", stalled: "Stuck", idle: "Idle", waiting: "Waiting", working: "Working" };
+    return { color: colors[st] || "#6b7280", label: labels[st] || (st || "idle") };
+  }
+  function _closeRoomPopover() {
+    var ex = document.getElementById("ccb-room-pop");
+    if (ex && ex.parentNode) ex.parentNode.removeChild(ex);
+    document.removeEventListener("mousedown", _roomPopOutside, true);
+  }
+  function _roomPopOutside(e) {
+    var p = document.getElementById("ccb-room-pop");
+    if (p && !p.contains(e.target)) _closeRoomPopover();
+  }
+  function _enterRoomFromMenu(k) {
+    _closeRoomPopover();
+    var sid = k.indexOf("draft-") === 0 ? null : k;
+    try { window.__ccbT0 = performance.now(); window.__ccbSrc = "dotmenu"; } catch (e0) {}
+    enterRoom(k, sid, { keepLayout: true });
+    if (window.innerWidth <= LAYOUT_MOBILE_BP) {
+      var tp = document.getElementById("tasks-panel");
+      if (tp) { tp.classList.remove("tasks-panel-visible"); tp.classList.add("tasks-panel-hidden"); }
+      var bt = document.getElementById("btn-tasks"); if (bt) bt.classList.remove("active");
+      try { writeLayout({ t: 0 }); } catch (err2) {}
+    }
+  }
+  function _showRoomPopover(t, anchor) {
+    _closeRoomPopover();
+    var rooms = Array.isArray(t.rooms) ? t.rooms : [];
+    var items = rooms.map(function (rm) { var k = String((rm && rm.room_key) || ""); return { k: k, st: (_roomMonitorStatus[k] || {}) }; }).filter(function (it) { return it.k; });
+    items.sort(function (a, b) { var ia = _aggOrder.indexOf(a.st.status); var ib = _aggOrder.indexOf(b.st.status); if (ia < 0) ia = 99; if (ib < 0) ib = 99; return ia - ib; });
+    var pop = document.createElement("div");
+    pop.id = "ccb-room-pop";
+    pop.style.cssText = "position:fixed;z-index:99999;background:#1b1d22;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:5px;box-shadow:0 8px 28px rgba(0,0,0,.55);min-width:210px;max-width:340px;font-size:12px;";
+    var hdr = document.createElement("div");
+    hdr.style.cssText = "padding:4px 8px 6px;opacity:.6;font-size:11px;text-transform:uppercase;letter-spacing:.04em;";
+    hdr.textContent = items.length + " associated rooms";
+    pop.appendChild(hdr);
+    items.forEach(function (it) {
+      var meta = _roomStatusMeta(it.st.status || "idle");
+      var row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;color:#e8e8ea;";
+      row.onmouseenter = function () { row.style.background = "rgba(255,255,255,.08)"; };
+      row.onmouseleave = function () { row.style.background = "transparent"; };
+      var dot = document.createElement("span");
+      if ((it.st.status || "") === "working") { dot.className = "ccb-spin"; dot.style.cssText = "display:inline-block;flex:0 0 auto;width:11px;height:11px;border-radius:50%;border:2px solid rgba(110,168,254,.35);border-top-color:#6ea8fe;"; }
+      else { dot.style.cssText = "display:inline-block;flex:0 0 auto;width:11px;height:11px;border-radius:50%;background:" + meta.color + ";box-shadow:0 0 0 1px rgba(0,0,0,.25);"; }
+      var txt = document.createElement("div"); txt.style.cssText = "flex:1 1 auto;min-width:0;";
+      var l1 = document.createElement("div"); l1.style.cssText = "font-weight:600;"; l1.textContent = meta.label;
+      txt.appendChild(l1);
+      if (it.st.detail) { var l2 = document.createElement("div"); l2.style.cssText = "opacity:.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"; l2.textContent = it.st.detail; txt.appendChild(l2); }
+      row.appendChild(dot); row.appendChild(txt);
+      row.addEventListener("click", function (e) { e.stopPropagation(); _enterRoomFromMenu(it.k); });
+      pop.appendChild(row);
+    });
+    document.body.appendChild(pop);
+    var r = anchor.getBoundingClientRect();
+    var pw = pop.offsetWidth, ph = pop.offsetHeight;
+    var x = r.left, y = r.bottom + 4;
+    if (x + pw > window.innerWidth - 8) x = window.innerWidth - pw - 8;
+    if (y + ph > window.innerHeight - 8) y = r.top - ph - 4;
+    if (x < 8) x = 8; if (y < 8) y = 8;
+    pop.style.left = x + "px"; pop.style.top = y + "px";
+    setTimeout(function () { document.addEventListener("mousedown", _roomPopOutside, true); }, 0);
+  }
+  function taskAggDot(t) {
+    try { _startRoomMonitorPolling(); } catch (e) {}
+    _startAggRestyle();
+    const el = document.createElement("span");
+    el.setAttribute("data-ccb-agg", JSON.stringify({ rooms: (Array.isArray(t.rooms) ? t.rooms.map(function (r) { return { room_key: r.room_key }; }) : []), oq: (Number(t.open_questions) || 0) }));
+    _applyAggDot(el);
+    el.setAttribute("data-ccb-agg-click", "1"); el.addEventListener("click", function (e) { e.stopPropagation(); try { var rooms = Array.isArray(t.rooms) ? t.rooms : []; if (rooms.length > 1) { _showRoomPopover(t, el); return; } /* [Q_CLICK_ANYDOT_V1] single room */ var order = ["question", "stalled", "working", "waiting", "idle", "completed"]; var pick = null; for (var oi = 0; oi < order.length && !pick; oi++) { rooms.forEach(function (r) { var k = String((r && r.room_key) || ""); if (!pick && k && (_roomMonitorStatus[k] || {}).status === order[oi]) pick = k; }); } if (!pick && rooms.length) pick = String((rooms[0] && rooms[0].room_key) || ""); if (pick) { var sid = pick.indexOf("draft-") === 0 ? null : pick; try { window.__ccbT0 = performance.now(); window.__ccbSrc = "dot"; } catch (e0) {} enterRoom(pick, sid, { keepLayout: true }); if (window.innerWidth <= LAYOUT_MOBILE_BP) { var tp = document.getElementById("tasks-panel"); if (tp) { tp.classList.remove("tasks-panel-visible"); tp.classList.add("tasks-panel-hidden"); } var bt = document.getElementById("btn-tasks"); if (bt) bt.classList.remove("active"); try { writeLayout({ t: 0 }); } catch (err2) {} } return; } openTaskDetails(t); } catch (err) { try { openTaskDetails(t); } catch (e2) {} } });
+    return el;
+  }
   function renderInlineRooms(detail, t) {
     const rooms = Array.isArray(t.rooms) ? t.rooms : [];
-    if (!rooms.length) return;
+    try { _startRoomMonitorPolling(); } catch (e) {}   // [ROOM_MONITOR_V1_CLIENT]
     const f = document.createElement('div'); f.className = 'tr-field tr-rooms';
     const l = document.createElement('span'); l.className = 'tr-field-label';
-    l.textContent = rooms.length > 1 ? 'Conference rooms' : 'Conference room';
+    l.textContent = rooms.length > 1 ? 'Associated rooms' : 'Associated room';
     const b = document.createElement('span'); b.className = 'tr-field-val';
-    b.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px';
+    b.style.cssText = 'display:flex;flex-direction:column;gap:6px;align-items:flex-start';
     rooms.forEach(rm => {
       const a = document.createElement('a');
-      a.textContent = '\uD83D\uDCAC ' + roomLinkLabel(rm);
       a.href = buildShareUrl(rm.room_key);
-      a.target = '_blank'; a.rel = 'noopener';
-      a.title = 'Open this conference room in a new tab';
-      a.style.cssText = 'font-size:12px;text-decoration:none;color:#ffffff;border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 6px';
-      a.addEventListener('click', e => e.stopPropagation());  // don't toggle the row
+      a.rel = 'noopener';
+      a.style.cssText = 'font-size:12px;text-decoration:none;color:#ffffff;border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 6px;display:inline-flex;align-items:center';
+      // [ROOM_CURRENT_HL_V1] highlight the button for the room currently open in this tab
+      try { if (String(rm.room_key) === String(currentRoomId)) { a.style.background = 'rgba(255,255,255,0.22)'; a.style.borderColor = 'rgba(255,255,255,0.5)'; } } catch (e) {}
+      try { a.appendChild(roomStatusDot(rm.room_key)); } catch (e) {}   // [ROOM_MONITOR_V1_CLIENT]
+      // [ROOM_INPLACE_OPEN_V1] Split click zones: the label text switches rooms IN THIS TAB
+      // (chat + live browser only — panes/tasks/sort untouched via keepLayout); the pop-out
+      // glyph still opens the room in a NEW tab. Modifier-click on the label forces a new tab.
+      const lbl = document.createElement('span');
+      lbl.appendChild(document.createTextNode(roomLinkLabel(rm, t)));
+      lbl.title = 'Open this room in the current tab';
+      lbl.style.cursor = 'pointer';
+      a.appendChild(lbl);
+      const ic = document.createElement('span'); ic.innerHTML = _popoutSvg;
+      ic.title = 'Open this room in a new tab';
+      ic.style.cursor = 'pointer';
+      a.appendChild(ic);
+      a.addEventListener('click', e => {
+        e.stopPropagation();   // never toggle the task row
+        if (e.metaKey || e.ctrlKey || e.shiftKey) return;   // let the browser force a new tab
+        e.preventDefault();
+        if (ic.contains(e.target)) { window.open(buildShareUrl(rm.room_key), '_blank', 'noopener'); return; }
+        const sid = String(rm.room_key || '').startsWith('draft-') ? null : rm.room_key;
+        try { window.__ccbT0 = performance.now(); window.__ccbSrc = 'link'; } catch (e0) {}
+        enterRoom(rm.room_key, sid, { keepLayout: true });
+        // [ROOM_INPLACE_OPEN_V3] On mobile the Tasks panel overlays the chat, so after opening the
+        // room in this tab, collapse it so the room is actually visible (mirrors the btn-tasks close).
+        if (window.innerWidth <= LAYOUT_MOBILE_BP) {
+          const tp = document.getElementById('tasks-panel');
+          if (tp) { tp.classList.remove('tasks-panel-visible'); tp.classList.add('tasks-panel-hidden'); }
+          const bt = document.getElementById('btn-tasks'); if (bt) bt.classList.remove('active');
+          try { writeLayout({ t: 0 }); } catch (err) {}
+        }
+      });
       b.appendChild(a);
     });
+    // [ROOM_INPLACE_OPEN_V2] "+ New Room": label click opens a fresh room for THIS task IN THIS
+    // TAB (chat + live browser only; panes/tasks/sort untouched via keepLayout); the pop-out
+    // glyph (or a modifier-click) opens it in a NEW tab. Lightweight draft-room path, no spawn.
+    const addR = document.createElement('button');
+    addR.type = 'button';
+    addR.appendChild(document.createTextNode('+ New Room'));
+    const addRIc = document.createElement('span'); addRIc.innerHTML = _popoutSvg; addR.appendChild(addRIc);
+    addRIc.title = 'Open the new room in a new tab';
+    addR.title = 'Create a new room for this task in the current tab (\u2197 opens a new tab)';
+    addR.style.cssText = 'font-size:12px;cursor:pointer;color:#6ea8fe;background:transparent;border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 8px;display:inline-flex;align-items:center';
+    addR.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const newTab = addRIc.contains(e.target) || e.metaKey || e.ctrlKey || e.shiftKey;
+      const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
+      try { seedAppearanceFrom(currentRoomId, rid); } catch (err) {}
+      try { localStorage.setItem('ccb-inherit-task::' + rid, JSON.stringify([{ id: t.id, file: t.file, title: t.title }])); } catch (err) {}
+      if (newTab) {
+        const u = new URL(location.href); u.searchParams.set('room', rid);
+        window.open(u.href, '_blank', 'noopener');
+      } else {
+        enterRoom(rid, null, { keepLayout: true });
+        if (window.innerWidth <= LAYOUT_MOBILE_BP) {   // [ROOM_INPLACE_OPEN_V3] collapse Tasks panel on mobile
+          const tp = document.getElementById('tasks-panel');
+          if (tp) { tp.classList.remove('tasks-panel-visible'); tp.classList.add('tasks-panel-hidden'); }
+          const bt = document.getElementById('btn-tasks'); if (bt) bt.classList.remove('active');
+          try { writeLayout({ t: 0 }); } catch (err) {}
+        }
+        _inheritedParentTask = [{ id: t.id, file: t.file, title: t.title }];   // enterRoom cleared it; re-offer this task on first message
+        try { if (typeof setMcpDot === 'function') setMcpDot('unknown'); } catch (err) {}
+        showToast('New room started for this task', 'info');
+      }
+    });
+    b.appendChild(addR);
+    // [ROOM_INPLACE_OPEN_V2] "+ New Conference Room": same split as "+ New Room" — label click opens
+    // a conference room for THIS task IN THIS TAB (panes/tasks/sort untouched); the pop-out glyph
+    // (or a modifier-click) opens it in a NEW tab. Conference mode rides confmode::<rid>.
+    const add = document.createElement('button');
+    add.type = 'button';
+    add.appendChild(document.createTextNode('+ New Conference Room'));
+    const addIc = document.createElement('span'); addIc.innerHTML = _popoutSvg; add.appendChild(addIc);
+    addIc.title = 'Open the new conference room in a new tab';
+    add.title = 'Create a new conference room for this task in the current tab (\u2197 opens a new tab)';
+    add.style.cssText = 'font-size:12px;cursor:pointer;color:#6ea8fe;background:transparent;border:1px solid rgba(110,168,254,.35);border-radius:4px;padding:1px 8px;display:inline-flex;align-items:center';
+    add.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const newTab = addIc.contains(e.target) || e.metaKey || e.ctrlKey || e.shiftKey;
+      const rid = (typeof newDraftRoomId === 'function') ? newDraftRoomId() : ('draft-' + Math.random().toString(36).slice(2, 10));
+      try { seedAppearanceFrom(currentRoomId, rid); } catch (err) {}
+      try { localStorage.setItem('ccb-inherit-task::' + rid, JSON.stringify([{ id: t.id, file: t.file, title: t.title }])); } catch (err) {}
+      try { if (typeof setConfMode === 'function') setConfMode(rid, true); } catch (err) {}
+      if (newTab) {
+        const u = new URL(location.href); u.searchParams.set('room', rid);
+        window.open(u.href, '_blank', 'noopener');
+      } else {
+        enterRoom(rid, null, { keepLayout: true });
+        if (window.innerWidth <= LAYOUT_MOBILE_BP) {   // [ROOM_INPLACE_OPEN_V3] collapse Tasks panel on mobile
+          const tp = document.getElementById('tasks-panel');
+          if (tp) { tp.classList.remove('tasks-panel-visible'); tp.classList.add('tasks-panel-hidden'); }
+          const bt = document.getElementById('btn-tasks'); if (bt) bt.classList.remove('active');
+          try { writeLayout({ t: 0 }); } catch (err) {}
+        }
+        _inheritedParentTask = [{ id: t.id, file: t.file, title: t.title }];   // enterRoom cleared it; re-offer this task on first message
+        try { if (typeof setMcpDot === 'function') setMcpDot('unknown'); } catch (err) {}
+        showToast('New conference room started for this task', 'info');
+      }
+    });
+    b.appendChild(add);
     f.appendChild(l); f.appendChild(b); detail.appendChild(f);
   }
 
@@ -6188,7 +7914,7 @@
       const st = j && j.state;
       if (st === 'queued' || st === 'already_queued') {
         showToast(st === 'queued' ? '\u2713 Answer saved \u2014 queued to run next' : '\u23f3 Already queued to run', 'info');
-        runNowPoll();
+        runNowPoll(base, t.file);
       } else if (st === 'blocked') {
         const why = { not_armed: 'the autonomy loop is not armed', bad_file: 'bad task file', task_file_missing: 'task file missing' }[j.reason] || j.reason || 'unknown';
         showToast('\u26a0 Not queued: ' + why, 'error');
@@ -6196,21 +7922,43 @@
         showToast('\u26a0 Could not queue the run', 'error');
       }
     }
-    async function runNowPoll(){
-      let sawRunning = false;
-      for (const d of [5000, 15000, 40000, 60000]) {
-        await new Promise(r => setTimeout(r, d));
-        let s = null;
-        try { s = await (await fetch(`${base}/run-now/status`, { cache: 'no-store' })).json(); } catch (e) { continue; }
-        if (!s || !s.found) continue;
-        if (s.state === 'running' && !sawRunning) {
-          sawRunning = true;
-          showToast('\u25b6 Running now on ' + ((s.entry && s.entry.account) || 'a spare account'), 'info');
-        } else if (s.state === 'succeeded') {
-          showToast('\u2713 Turn finished \u2014 open this task\u2019s live room to read it', 'info'); return;
-        } else if (s.state === 'failed' || s.state === 'expired') {
-          showToast('\u26a0 Run ' + s.state + ((s.result && s.result.reason) ? ': ' + s.result.reason : ''), 'error'); return;
+    // [SUBMITRUN_FIX] Page-scoped (survives the modal auto-close on the last
+    // question), deduped per task, two-phase timing: an ~8min cap while still only
+    // queued, then a claim-anchored 1800+300s ceiling once running.
+    async function runNowPoll(pollBase, taskFile){
+      const guard = window.__runNowPolling || (window.__runNowPolling = new Set());
+      if (guard.has(taskFile)) return;                 // a poller for this task already reports
+      guard.add(taskFile);
+      try {
+        const QUEUE_CAP = Date.now() + 8 * 60000;      // overall cap while still only queued
+        let runDeadline = null;                        // ceiling, anchored on first claimed/running
+        let sawRunning = false;
+        let wait = 3000;
+        for (;;) {
+          await new Promise(r => setTimeout(r, wait));
+          wait = Math.min(wait + 5000, 30000);
+          let s = null;
+          try { s = await (await fetch(`${pollBase}/run-now/status`, { cache: 'no-store' })).json(); } catch (e) {}
+          const nowMs = Date.now();
+          if (s && s.found) {
+            if ((s.state === 'claimed' || s.state === 'running') && runDeadline == null) runDeadline = nowMs + (1800 + 300) * 1000;
+            if (s.state === 'running' && !sawRunning) {
+              sawRunning = true;
+              showToast('\u25b6 Running now on ' + ((s.entry && s.entry.account) || 'a spare account'), 'info');
+            } else if (s.state === 'succeeded') {
+              showToast('\u2713 Turn finished \u2014 open this task\u2019s live room to read it', 'info'); return;
+            } else if (s.state === 'failed' || s.state === 'expired') {
+              showToast('\u26a0 Run ' + s.state + ((s.result && s.result.reason) ? ': ' + s.result.reason : ''), 'error'); return;
+            }
+          }
+          if (runDeadline != null) {
+            if (nowMs > runDeadline) { showToast('\u23f3 Still running \u2014 check this task\u2019s live room for the result', 'info'); return; }
+          } else if (nowMs > QUEUE_CAP) {
+            showToast('\u23f3 Still queued \u2014 will run when a Claude account frees; check the task\u2019s live room', 'info'); return;
+          }
         }
+      } finally {
+        guard.delete(taskFile);
       }
     }
 
@@ -6227,9 +7975,11 @@
       const submit = async (opts) => {
         opts = opts || {};
         const v = opts.approve ? 'APPROVE' : ta.value.trim();
-        if (!v) return;
+        if (!v) { showToast('Type an answer before submitting', 'error'); try { ta.focus(); } catch (e) {} return; }
         btn.disabled = btnRun.disabled = btnApprove.disabled = btnApproveRun.disabled = true;
-        if (!(await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }))) { btn.disabled = btnRun.disabled = btnApprove.disabled = btnApproveRun.disabled = false; return; }
+        let _saved = false;
+        try { _saved = await jsend(`${base}/questions/${q.id}`, 'PATCH', { answer: v }); } catch (e) {}
+        if (!_saved) { btn.disabled = btnRun.disabled = btnApprove.disabled = btnApproveRun.disabled = false; showToast('\u26a0 Could not save your answer \u2014 nothing was run. Try again.', 'error'); return; }
         // Reflect the answer on the row dot at once (don't wait for the list poll), then close.
         if (q.status !== 'answered') {
           const o = Math.max(0, (Number(t.open_questions) || 0) - 1);
@@ -6247,7 +7997,20 @@
         // [RUN_NOW_V1] kick an immediate autonomy turn on this task (server-side
         // no-op if no account has spare quota or the loop is not armed).
         if (opts.approve && t.status === 'planned') { try { await jsend(`${API_BASE}/tasks/${encodeURIComponent(t.file)}/status`, 'POST', { status: 'approved' }); } catch (e) {} }
-        if (opts.run) { await runNowKick(); }
+        // [GSD_ANSWER_RESUME_V1] Resume the room that asked this, immediately: inject the
+        // answer and start the turn now (spinner), instead of waiting on a 2-min cron.
+        const _rk = String(q.asked_by || '').replace(/^room:/, '').trim();
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(_rk)) {
+          try {
+            const _rr = await (await fetch(`${API_BASE}/room/answer-resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid: _rk, answer: v }) })).json();
+            if (_rr && _rr.ran) {
+              try { _roomMonitorStatus[_rk] = { status: 'working', task_file: (t && t.file) || '', idle_min: -1, detail: 'processing your answer' }; _updateRoomDots(); } catch (e) {}
+              showToast('\u25b6 Answer sent \u2014 the room is working on it now', 'info');
+            }
+            else if (_rr && _rr.busy) showToast('\u2713 Answer saved \u2014 the room is mid-turn; it will pick it up', 'info');
+            else showToast('\u2713 Answer saved', 'info');
+          } catch (e) { showToast('\u2713 Answer saved (could not auto-resume the room)', 'info'); }
+        }
         // Several questions can be pending at once — refresh the list in place and keep
         // the modal open until every one is answered; only auto-close on the last.
         await renderQuestions();
@@ -6331,7 +8094,7 @@
         list.forEach((rm, i) => {
           const row = el('div', 'display:flex;gap:8px;align-items:center;font-size:13px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04)');
           const num = el('div', 'flex:0 0 auto;font-size:11px;opacity:.5;width:16px', String(i + 1));
-          const a = el('a', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;color:#ffffff', '\uD83D\uDCAC ' + roomLinkLabel(rm));
+          const a = el('a', 'flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;color:#ffffff', roomLinkLabel(rm, t));
           a.href = buildShareUrl(rm.room_key); a.target = '_blank'; a.rel = 'noopener'; a.title = 'Open this room in a new tab';
           const del = el('button', 'flex:0 0 auto;background:none;border:none;color:inherit;opacity:.4;cursor:pointer;font-size:15px', '\u00d7');
           del.onclick = async () => { if (await jsend(`${base}/rooms/${rm.rid}`, 'DELETE')) { renderRooms(); loadTasks(); } };
@@ -6550,12 +8313,34 @@
   // Queued Autonomous = scoped AND cleared for the AI to start on its own.
   function isQueuedAuto(t) { return t.queued_autonomous === true || t.queued_autonomous === 'yes' || t.queued_autonomous === 'true' || t.queued_autonomous === '1'; }
   function toggleQueuedAuto(t) { updateTaskFields(t.file, { queued_autonomous: isQueuedAuto(t) ? '' : 'true' }); }
+  // [GSD_LOOP] Every task is in the GSD Loop by default; opt out via the single GSD Loop tick.
+  // Stored in frontmatter as gsd_loop: off (absence / anything else = in).
+  function inGsdLoop(t) { const v = String(t.gsd_loop == null ? '' : t.gsd_loop).toLowerCase(); return !(v === 'off' || v === 'false' || v === 'no' || v === '0'); }
+  function toggleGsd(t) { updateTaskFields(t.file, { gsd_loop: inGsdLoop(t) ? 'off' : '' }); }
   // ── One task row ──
+  // [ROOM_CURRENT_HL_ROW_V2] Paint the subtle grey on whichever task row owns the room
+  // currently open in THIS tab. Runs at the same cadence as the room-task chip so it
+  // tracks draft->session promotion. Matches both the room id and the session id.
+  function highlightCurrentRoomTask() {
+    try {
+      const cur = String(currentRoomId || '');
+      const sid = String(currentSessionId || '');
+      const rows = document.querySelectorAll('.task-row[data-room-keys]');
+      rows.forEach(function (row) {
+        let keys = [];
+        try { keys = JSON.parse(row.dataset.roomKeys || '[]'); } catch (e) { keys = []; }
+        const on = (cur && keys.indexOf(cur) !== -1) || (sid && keys.indexOf(sid) !== -1);
+        row.style.background = on ? 'rgba(255,255,255,0.09)' : '';
+      });
+    } catch (e) {}
+  }
   function renderTaskRow(t) {
     const row = document.createElement('div');
     row.className = 'task-row ' + statusClass(t.status);
     if (isQueued(t)) row.classList.add('queued');
+    if (t.person) row.classList.add('delegated');
     if (openTasks.has(t.file)) row.classList.add('open');
+    try { row.dataset.roomKeys = JSON.stringify((Array.isArray(t.rooms) ? t.rooms : []).map(function(rm){ return String(rm && rm.room_key || ''); })); } catch (e) {}   // [ROOM_CURRENT_HL_ROW_V2] keys stashed; highlight applied by highlightCurrentRoomTask()
 
     const line = document.createElement('div');
     line.className = 'task-line';
@@ -6585,16 +8370,10 @@
     if (_tf.length) { const fc = document.createElement('span'); fc.className = 'task-flags'; _tf.forEach(f => { const chip = document.createElement('span'); chip.className = 'task-flag'; chip.textContent = '🚩 ' + f; chip.title = 'Flagged for ' + f; fc.appendChild(chip); }); title.appendChild(fc); }
 
     const badge = document.createElement('span');
-    if (String(t.type || '').trim()) {
-      badge.className = 'task-badge ' + typeClass(t.type);
-      badge.textContent = shortType(t.type);
-      badge.title = String(t.type).trim() + ' — status: ' + prettyStatus(t.status);
-    } else {
-      // No Organiser type set: keep a subtle status chip so the row still reads.
-      badge.className = 'task-badge task-badge-untyped ' + statusClass(t.status);
-      badge.textContent = shortStatus(t.status);
-      badge.title = prettyStatus(t.status);
-    }
+    // [TASK338] Task type removed from list rows (#247 dropped); always show a status chip.
+    badge.className = 'task-badge task-badge-untyped ' + statusClass(t.status);
+    badge.textContent = shortStatus(t.status);
+    badge.title = prettyStatus(t.status);
 
     // Status cell = optional question dot + the (now-smaller) status/type chip.
     // Red dot = a question awaits your answer; green = your question was answered.
@@ -6620,7 +8399,7 @@
     }
     const nOpenQ = Number(t.open_questions) || 0;
     const nAnsQ = Number(t.answered_questions) || 0;
-    if (nOpenQ > 0 || nAnsQ > 0) {
+    if (!pdraft && (nOpenQ > 0 || nAnsQ > 0)) {
       const dot = document.createElement('span');
       dot.className = 'task-status-dot ' + (nOpenQ > 0 ? 'q-pending' : 'q-answered');
       dot.title = nOpenQ > 0
@@ -6628,9 +8407,10 @@
         : 'Your question has been answered';
       dot.dataset.qfile = t.file;
       dot.addEventListener('click', (e) => { e.stopPropagation(); openTaskDetails(t); });
-      statusCell.appendChild(dot);
+      /* [HIDE_QDOT_V1] superseded by roll-up dot */ // statusCell.appendChild(dot);
     }
-    statusCell.appendChild(badge);
+    try { statusCell.appendChild(taskAggDot(t)); } catch (e) {}   // [ROOM_AGG_V1][ROOM_AGG_V2]
+    /* [HIDE_STATUS_CHIP_V1] status/type chip hidden on row per request */ // statusCell.appendChild(badge);
 
     const more = document.createElement('button');
     more.className = 'task-more'; more.textContent = '⋮'; more.title = 'Task actions';
@@ -6727,7 +8507,7 @@
     const label = sel.length === 1 ? labelFn(sel[0]) : base + ' (' + sel.length + ')';
     btn.textContent = label + ' \u25be';
   }
-  const DATE_OPTS = [['pending-exc','Pending, exc. 🟢'],['pending','Pending'],['today','Today'],['past','Past'],['no-date','No Date'],['all','All']];
+  const DATE_OPTS = [['pending-exc','Pending, exc. 🟢'],['pending','Pending'],['today','Today'],['scheduled','Scheduled'],['past','Past'],['no-date','No Date'],['all','All']];
   function buildDateMenu() {
     const menu = $('tf-date-menu');
     if (menu) {
@@ -6916,16 +8696,21 @@
   // ── Render task list ──
   function renderTasks(tasks) {
     if (!tasksListEl) return;
-    const pendingCount = tasks.filter(t => t.status !== 'done' && !isFuture(t.scheduled)).length;
-    if (tasksCountEl) tasksCountEl.textContent = pendingCount || '';
     buildFilterMenus(tasks);
     refreshPresetUI();
     updateSortHeader();
-    if (!tasks.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks yet.</div>'; return; }
+    if (!tasks.length) {
+      if (tasksCountEl) tasksCountEl.textContent = '(0)';
+      tasksListEl.innerHTML = '<div class="tasks-empty">No tasks yet.</div>';
+      return;
+    }
     const list = applyTaskView(tasks);
+    // Show the count of rows matching the CURRENT filter (single source of truth: applyTaskView).
+    if (tasksCountEl) tasksCountEl.textContent = '(' + list.length + ')';
     if (!list.length) { tasksListEl.innerHTML = '<div class="tasks-empty">No tasks match the current filters.</div>'; return; }
     tasksListEl.innerHTML = '';
     for (const t of list) tasksListEl.appendChild(renderTaskRow(t));
+    highlightCurrentRoomTask();   // [ROOM_CURRENT_HL_ROW_V2]
   }
 
   async function loadTasks() {
@@ -7054,6 +8839,8 @@
         statusStack.style.width = w + 'px';
         statusStack.style.left  = left + 'px';
         statusStack.style.right = 'auto';
+        // [TASK221_STATUS_STACK_SCROLL_V1] precise cap from the dropdown's real top to viewport bottom so it scrolls internally instead of overflowing off-screen
+        statusStack.style.maxHeight = Math.max(140, window.innerHeight - top - 10) + 'px';
       }
     });
     document.addEventListener('click', (e) => {
