@@ -45,14 +45,20 @@ const api = new Function(...names, block + '\n' + canon +
 /* spawn is a parameter, so re-bind via deps injection instead */
 function withSpawn(f) { return { spawn: f }; }
 
-console.log('\n[1] looksLikeTaskTitle');
-ok('rejects 4 words', !api.looksLikeTaskTitle('Fix The Popup Bug'));
+console.log('\n[1] looksLikeTaskTitle  [TT_CANON_V1: 2-8 word policy]');
+ok('accepts 2 words', api.looksLikeTaskTitle('Fix Bug'));
+ok('accepts 4 words', api.looksLikeTaskTitle('Fix The Popup Bug'));
 ok('accepts 5 words', api.looksLikeTaskTitle('Fix Conference Task Popup Duplication'));
 ok('accepts 6 words', api.looksLikeTaskTitle('Fix The Conference Task Popup Duplication'));
 ok('accepts 7 words', api.looksLikeTaskTitle('Fix The Conference Room Task Popup Duplication'));
-ok('rejects 8 words', !api.looksLikeTaskTitle('Fix The Conference Room Task Association Popup Duplication'));
+ok('accepts 8 words', api.looksLikeTaskTitle('Fix The Conference Room Task Association Popup Duplication'));
+ok('accepts an internal colon', api.looksLikeTaskTitle('Fix Login: Auth Flow'));
+ok('accepts a hyphen', api.looksLikeTaskTitle('Fix Login Auth-Flow Bug'));
+ok('rejects 1 word', !api.looksLikeTaskTitle('Fix'));
+ok('rejects 9 words', !api.looksLikeTaskTitle('Fix The Conference Room Task Association Popup Duplication Bug'));
 ok('rejects sentence punctuation', !api.looksLikeTaskTitle('Fix the conference task popup.'));
 ok('rejects a refusal', !api.looksLikeTaskTitle('Sorry I cannot summarise that request'));
+ok('rejects bare preamble prose', !api.looksLikeTaskTitle('Here is a title for your task'));
 ok('rejects empty', !api.looksLikeTaskTitle(''));
 
 console.log('\n[2] firstUserFullText');

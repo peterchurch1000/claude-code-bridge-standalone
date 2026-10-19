@@ -38,6 +38,9 @@ function el(tag) {
       this._value = this._children.some(o => o.value === String(v)) ? String(v) : '';
     },
     appendChild(c) { this._children.push(c); return c; },
+    insertBefore(c, ref) { const i = this._children.indexOf(ref); if (i < 0) this._children.push(c); else this._children.splice(i, 0, c); return c; },   // [TASK_DEFAULTS_INSTANT_V1]
+    get options() { return this._children; },
+    get lastChild() { return this._children.length ? this._children[this._children.length - 1] : null; },
     addEventListener(ev, f) { (this['_on' + ev] = this['_on' + ev] || []).push(f); },
     fire(ev) { (this['_on' + ev] || []).forEach(f => f()); },
     focus() {}, setSelectionRange() {},
@@ -165,12 +168,12 @@ console.log('\n[4] D4 — a field the user already changed is never overwritten'
   eq('untouched field still prefilled', sel('rt-project-sel').value, 'Organiser');
 }
 
-console.log('\n[5] D5 — a remembered value that no longer exists leaves the field blank');
+console.log('\n[5] D5 — [TASK_DEFAULTS_INSTANT_V1] a remembered value not in the current list is inserted + selected (the last-used pair is always available), not blanked');
 {
   const a = reset({ defaults: { area: 'Ghost area', project: 'Organiser' } });
   a._rtCreateView(seed);
   await tick();
-  eq('unknown area -> blank', sel('rt-area-sel').value, '');
+  eq('remembered area inserted + selected', sel('rt-area-sel').value, 'Ghost area');
   eq('known project still prefilled', sel('rt-project-sel').value, 'Organiser');
 }
 

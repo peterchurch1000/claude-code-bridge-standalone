@@ -110,14 +110,47 @@ console.log('\n[4] _parseTitleSummary');
   eq('multiline SUMMARY collapses to one line', p.summary, 'A wrapped summary that the model split across three lines.');
 }
 {
+  // [TT_CANON_V1] a 2-word label is now VALID (was rejected under the old 5-7 floor);
+  // the stub summary is still rejected on its own.
   const p = api._parseTitleSummary('TITLE: Too Short\nSUMMARY: nope');
-  eq('4-word title rejected', p.title, '');
+  eq('short 2-word title now accepted', p.title, 'Too Short');
   eq('stub summary rejected', p.summary, '');
 }
 {
   const p = api._parseTitleSummary('Sorry, I cannot help with that.');
   eq('refusal -> no title', p.title, '');
   eq('refusal -> no summary', p.summary, '');
+}
+/* [TT_CANON_V1] canonical extraction — label-first, Markdown/preamble tolerant */
+{
+  const p = api._parseTitleSummary('**TITLE:** Fix Login Auth Flow\n**SUMMARY:** The popup must fill both fields from the latest comment.');
+  eq('markdown-wrapped TITLE extracted clean', p.title, 'Fix Login Auth Flow');
+  ok('markdown-wrapped SUMMARY prose only, no label/markup',
+    /both fields/.test(p.summary) && !/summary/i.test(p.summary) && p.summary.indexOf('*') === -1);
+}
+{
+  const p = api._parseTitleSummary('Title: Fix Login Auth Flow');   // lowercase label variant
+  eq('case-insensitive label extracted', p.title, 'Fix Login Auth Flow');
+}
+{
+  const p = api._parseTitleSummary('Here is the title: Fix Login Auth Flow');
+  eq('inline preamble stripped to the title', p.title, 'Fix Login Auth Flow');
+}
+{
+  const p = api._parseTitleSummary('Here is a title for you:\nTITLE: Fix Login Auth Flow');
+  eq('a labeled line wins over a preceding preamble', p.title, 'Fix Login Auth Flow');
+}
+{
+  const p = api._parseTitleSummary('Fix Login Auth Flow');   // unlabeled single line
+  eq('unlabeled line accepted as the title', p.title, 'Fix Login Auth Flow');
+}
+{
+  const p = api._parseTitleSummary('TITLE: Fix Login Auth Flow For The Broken Popup Modal Today');   // 10 words
+  eq('overlong title truncated to eight words', p.title, 'Fix Login Auth Flow For The Broken Popup');
+}
+{
+  const p = api._parseTitleSummary('Here is a title for your task');   // bare prose, no label
+  eq('bare preamble prose -> no title', p.title, '');
 }
 {
   const p = api._parseTitleSummary('TITLE: Fix Room Task Title Generation');
