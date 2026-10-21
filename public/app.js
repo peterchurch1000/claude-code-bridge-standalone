@@ -1318,6 +1318,7 @@
       '<div style="text-align:right"><button id="conf-t-gcancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
     p.querySelector('#conf-t-gback').onclick = function () { _ttInvalidate(); _confModalRootView(); };
     p.querySelector('#conf-t-gcancel').onclick = function () { closeConfTaskModal(true); };
+    _startClassify({ text: srcText, roomId: String(currentRoomId || '') });   // [TASK_CLASSIFY_OPUS_V1] parallel Opus Area/Project
     // [LAST3_TITLE_V1] Pass roomId so the server anchors the title on the last three input
     // bubbles (this typed objective + the two prior USER turns), not just this one.
     _ttFetch({ text: srcText, roomId: String(currentRoomId || '') }).then(function (d) {
@@ -1342,6 +1343,7 @@
       '<div style="text-align:right"><button id="rt-gcancel" style="cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb">Cancel</button></div>';
     p.querySelector('#rt-gback').onclick = function () { _ttInvalidate(); _rtPaint(''); };
     p.querySelector('#rt-gcancel').onclick = _rtClose;
+    _startClassify({ roomId: String(currentRoomId || '') });   // [TASK_CLASSIFY_OPUS_V1] parallel Opus Area/Project
     _ttFetch({ roomId: String(currentRoomId || ''), describe: true }).then(function (d) {
       if (myGen !== _ttGen) return;
       if (!_rtPanelEl()) return;
@@ -1427,6 +1429,58 @@
     });
   }
   // <<< CONF_TITLE_PARALLEL_V1
+
+  function _confInheritGenerate(t) {   // TASKROOM_PARENT_PREFIX_V2: generate subtitle, then show the naming step
+    var _t = { id: String(t.id || ''), file: String(t.file || ''), title: String(t.title || '') };
+    var openingText = (typeof pendingConfStart !== 'undefined' && pendingConfStart && pendingConfStart.text) ? String(pendingConfStart.text) : '';
+    var p = _confPanel();
+    if (p) {
+      p.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:18px 4px 22px">' +
+        '<div style="font-size:20px">✨</div>' +
+        '<div><div style="font-size:14px;font-weight:600">Generating subtitle…</div>' +
+        '<div style="font-size:12px;opacity:.65;margin-top:2px">Summarising this investigation in a few words.</div></div></div>';
+    }
+    _ttFetch({ text: openingText }).then(function (d) {
+      var sub = (d && (d.title || d.fallback)) || _ttFallback(openingText) || _t.title;
+      _confInheritNameView(_t, sub);
+    });
+  }
+  function _confInheritNameView(_t, sub) {   // TASKROOM_PARENT_PREFIX_V2: prefix picker + body choice, mirrors _rsInheritNameView
+    var p = _confPanel(); if (!p) return;
+    var prefix = '';   // '' | 'Build' | 'Res'
+    var CHIP_ON = 'cursor:pointer;padding:6px 12px;border-radius:999px;border:1px solid #2563eb;background:#2563eb;color:#fff;font-weight:600';
+    var CHIP_OFF = 'cursor:pointer;padding:6px 12px;border-radius:999px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb';
+    var GREY = 'cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #4b5563;background:#374151;color:#e5e7eb';
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="conf-i-back" style="' + GREY + '">←</button><div style="font-size:15px;font-weight:600">Name this conference?</div></div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:8px">A subtitle was generated for this room. Pick a prefix, then choose the title body.</div>' +
+      '<div id="conf-i-sub" style="font-size:15px;font-weight:600;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;margin-bottom:12px;word-break:break-word"></div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:6px">Prefix</div>' +
+      '<div style="display:flex;gap:8px;margin-bottom:14px">' +
+        '<button id="conf-i-pfx-none"></button><button id="conf-i-pfx-build"></button><button id="conf-i-pfx-res"></button>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+        '<button id="conf-i-haiku" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #2563eb;background:#2563eb;color:#fff;font-weight:600">Use Haiku title</button>' +
+        '<button id="conf-i-orig" style="' + GREY + '">Use original title</button>' +
+      '</div>';
+    p.querySelector('#conf-i-sub').textContent = sub;   // subtitle as TEXT, never HTML
+    var chips = { '': p.querySelector('#conf-i-pfx-none'), 'Build': p.querySelector('#conf-i-pfx-build'), 'Res': p.querySelector('#conf-i-pfx-res') };
+    chips[''].textContent = 'None'; chips['Build'].textContent = 'Build'; chips['Res'].textContent = 'Res';
+    function paintChips() { Object.keys(chips).forEach(function (k) { chips[k].style.cssText = (k === prefix) ? CHIP_ON : CHIP_OFF; }); }
+    chips[''].onclick = function () { prefix = ''; paintChips(); };
+    chips['Build'].onclick = function () { prefix = 'Build'; paintChips(); };
+    chips['Res'].onclick = function () { prefix = 'Res'; paintChips(); };
+    paintChips();
+    function commit(useOriginal) {
+      closeConfTaskModalUI();
+      _trApply({ taskId: _t.id, taskTitle: _t.title, roomKey: currentRoomId, sessionId: currentSessionId || null, existingTask: true, parentInherit: true, parentSubtitle: true, subtitle: sub, prefix: prefix, useOriginal: useOriginal })
+        .catch(function () { return false; })
+        .then(function () { try { submitConfStart('linked', _t); } catch (e) {} });
+    }
+    p.querySelector('#conf-i-back').onclick = function () { _confModalRootView(); };
+    p.querySelector('#conf-i-haiku').onclick = function () { commit(false); };
+    p.querySelector('#conf-i-orig').onclick = function () { commit(true); };
+  }
   function _confModalRootView() {
     const p = _confPanel(); if (!p) return;
     if (!(_inheritedParentTask && _inheritedParentTask.length)) {   // [ROOM_TASK_INHERIT_V1] pop-out new-tab path: hydrate from the persisted seed
@@ -1449,7 +1503,7 @@
       var b = p.querySelector('#conf-inherit-' + i);
       if (!b) return;
       b.textContent = '↳ Continue with parent\'s task';
-      b.onclick = function () { _confInheritStart(t); };   // [CONF_TITLE_PARALLEL_V1]
+      b.onclick = function () { _confInheritGenerate(t); };   // TASKROOM_PARENT_PREFIX_V2 restored
     });
     p.querySelector('#conf-t-find').onclick = _confModalFindView;
     p.querySelector('#conf-t-new').onclick = _confCreateDeferred;   // [RS_CREATE_DEFER_V1]
@@ -1583,6 +1637,19 @@
       getValue: function () {
         const v = (sel.value === NEW) ? inp.value : sel.value;
         return String(v || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+      },
+      // [TASK_CLASSIFY_OPUS_V1] Apply an Opus suggestion. Unlike setDefault (prefill only),
+      // this OVERRIDES a remembered default — but never a choice the user has already made.
+      // Inserts the value as an option if the known list does not hold it yet.
+      suggest: function (v) {
+        if (touched) return;
+        const want = String(v == null ? '' : v).replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!want || want === NEW) return;
+        if (!Array.prototype.some.call(sel.options, function (o) { return o.value === want; })) {
+          sel.insertBefore(new Option(want, want), sel.lastChild);
+        }
+        sel.value = want;
+        inp.style.display = 'none';
       }
     };
   }
@@ -1645,6 +1712,45 @@
       projField.setDefault(d.project);
     }).catch(function () {});
   }
+  // ── [TASK_CLASSIFY_OPUS_V1] Opus-suggested Area + Project, auto-selected ──
+  // A generating view kicks off _classifyFetch (parallel with the Haiku title call) and
+  // stashes the promise here; the create view consumes it once and auto-selects both
+  // pickers when Opus returns. Single modal at a time, so one shared slot is enough.
+  let _classifyPromise = null;
+  function _classifyFetch(body) {
+    const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    if (ctl) timer = setTimeout(function () { try { ctl.abort(); } catch (e) {} }, 42000);
+    const done = function (v) { if (timer) { clearTimeout(timer); timer = null; } return v; };
+    return fetch(API_BASE + '/task-classify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined
+    })
+      .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
+      .then(function (d) { return done(d || {}); })
+      .catch(function () { return done({}); });
+  }
+  // The real Area/Project vocabulary the modal knows about, so Opus picks from it.
+  function _classifyLists() {
+    let tasks = []; try { tasks = lastTasks || []; } catch (e) { tasks = []; }
+    return { areas: _confDistinctValues(tasks, 'area'), projects: _confDistinctValues(tasks, 'project') };
+  }
+  // Begin a classification for the current modal. Pass the same {text?, roomId} shape the
+  // title call uses; the known lists are merged in so Opus stays within the vocabulary.
+  function _startClassify(body) {
+    try { _classifyPromise = _classifyFetch(Object.assign({}, body || {}, _classifyLists())); }
+    catch (e) { _classifyPromise = null; }
+  }
+  // Consume the pending suggestion (once) and auto-select both pickers when it resolves.
+  function _applyClassify(areaField, projField, guardEl) {
+    const pend = _classifyPromise; _classifyPromise = null;
+    if (!pend || !pend.then) return;
+    pend.then(function (d) {
+      if (guardEl && !guardEl.isConnected) return;   // modal closed before Opus answered
+      if (d && d.area) areaField.suggest(d.area);
+      if (d && d.project) projField.suggest(d.project);
+    }).catch(function () {});
+  }
   // ── [TASKROOM_TITLE_V1] Room title derived from the task just associated ────
   // "<task id> - <task title>". The confirmed title is reused EXACTLY: the create
   // forms already collapse whitespace before POST /tasks and an existing task's
@@ -1701,12 +1807,7 @@
       const sid = o.sessionId ? String(o.sessionId) : '';
       const roomKey = String(o.roomKey || '');
       const cur = sid ? (sessionNameById[sid] || '') : _trDraftName(roomKey);
-      if (cur || o.existingTask) {
-        const q = cur
-          ? ('Rename this room from \u201C' + cur + '\u201D to \u201C' + name + '\u201D?')
-          : ('Name this room \u201C' + name + '\u201D?');
-        if (!await confirmDialog(q, 'Rename')) return false;
-      }
+      /* RENAME_CONFIRM_REMOVED_V1: title is applied silently in every workflow — no confirm modal. */
       if (sid) {
         const r = await fetch(API_BASE + '/sessions/' + encodeURIComponent(sid) + '/name', {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
@@ -1754,6 +1855,7 @@
     projField.populate(_confDistinctValues(_seed, 'project'));
     _applyCachedTaskDefaults(areaField, projField);   // [TASK_DEFAULTS_INSTANT_V1] present at first paint, before any fetch
     _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
+    _applyClassify(areaField, projField, fieldsEl);   // [TASK_CLASSIFY_OPUS_V1] auto-select when Opus returns
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) {
@@ -1937,18 +2039,29 @@
   }
   async function fetchAndRestoreHistory(sessionId) {
     const epoch = roomEpoch;   // room may change while we await the fetch
+    // [HISTCACHE_V1] Tail-first: paint the most recent slice instantly (cheap server-side
+    // tail read / in-memory rows), then fetch the full reconciled history in the background
+    // so older turns + tool cards fill in without a big room blocking the first paint.
+    const apply = (data) => {
+      if (roomEpoch !== epoch) return false;   // user switched rooms mid-fetch — never repaint stale history
+      if (!(data && data.messages && data.messages.length > 0)) return false;
+      if (Array.isArray(data.hiddenMids)) setHiddenMids(data.hiddenMids);
+      renderStoredDisplay(data.messages);
+      roomServerConfirmed = true;   // [ROOMLINK_V1] server has real history for this room
+      if (pendingLinkRoomId && (sessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
+      hideRoomUnresolved();
+      if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
+      return true;
+    };
     try {
+      try {
+        const rt = await fetch(`${API_BASE}/history/${sessionId}?tail=60`, { cache: 'no-store' });
+        if (rt.ok) { const td = await rt.json(); if (roomEpoch !== epoch) return; apply(td); }
+      } catch {}
       const res = await fetch(`${API_BASE}/history/${sessionId}`, { cache: 'no-store' });
       const data = await res.json();
-      if (roomEpoch !== epoch) return;   // user opened/switched another room mid-fetch — do not repaint stale history
-      if (data.messages && data.messages.length > 0) {
-        if (Array.isArray(data.hiddenMids)) setHiddenMids(data.hiddenMids);
-        renderStoredDisplay(data.messages);
-        roomServerConfirmed = true;   // [ROOMLINK_V1] server has real history for this room
-        if (pendingLinkRoomId && (sessionId === pendingLinkRoomId || currentRoomId === pendingLinkRoomId)) pendingLinkRoomId = null;
-        hideRoomUnresolved();
-        if (typeof refreshCopyLinkBtn === 'function') refreshCopyLinkBtn();
-      }
+      if (roomEpoch !== epoch) return;
+      apply(data);
     } catch {}
   }
 
@@ -5019,6 +5132,7 @@
     projField.populate(_confDistinctValues(_rtSeedTasks, 'project'));
     _applyCachedTaskDefaults(areaField, projField);   // [TASK_DEFAULTS_INSTANT_V1] present at first paint, before any fetch
     _applyTaskDefaults(areaField, projField, fieldsEl);   // [TASK_DEFAULTS_PREFILL_V1]
+    _applyClassify(areaField, projField, fieldsEl);   // [TASK_CLASSIFY_OPUS_V1] auto-select when Opus returns
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) {
@@ -5038,15 +5152,26 @@
     cb.onclick = () => {
       const title = (titleEl.value || '').replace(/\s+/g, ' ').trim();
       if (title.length < 3) { errEl.textContent = 'The title must be at least 3 characters.'; return; }
-      cb.disabled = true; cb.textContent = 'Creating…';
       const _area = areaField.getValue(), _project = projField.getValue();   // [TASK_DEFAULTS_PREFILL_V1]
-      fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: (descEl.value || '').trim(), area: _area, project: _project, rememberDefaults: true }) })
-        .then(r => r.json().then(j => ({ ok: r.ok, j })))
-        .then(res => { if (!res.ok || !res.j || !res.j.file) throw new Error('create'); _noteTaskDefaults(_area, _project); return _rtPost(res.j.file, rid).then(async ok => { if (!ok) throw new Error('link'); showToast('Task created and room linked', 'success'); _rtClose();
-          // [TASKROOM_TITLE_V1] after the link, and after the modal is gone so the confirm is not buried under it
-          try { await _trApply({ taskId: String(res.j.id || ''), taskTitle: String(res.j.title || title), roomKey: rid, sessionId: rid, existingTask: false }); } catch (e) {}
-          _rtSyncChip(); }); })
-        .catch(() => { cb.disabled = false; cb.textContent = 'Create & link'; errEl.textContent = 'Could not create/link. Try again.'; });
+      const _desc = (descEl.value || '').trim();
+      // [ROOMTASK_BG_CREATE_V1] dismiss the modal instantly; create + link + title-apply all run in the background
+      _rtClose();
+      showToast('Creating task…', 'info');
+      (async () => {
+        try {
+          const r = await fetch(API_BASE + '/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title, description: _desc, area: _area, project: _project, rememberDefaults: true }) });
+          const j = await r.json().catch(() => null);
+          if (!r.ok || !j || !j.file) throw new Error('create');
+          _noteTaskDefaults(_area, _project);
+          const ok = await _rtPost(j.file, rid);
+          if (!ok) throw new Error('link');
+          try { await _trApply({ taskId: String(j.id || ''), taskTitle: String(j.title || title), roomKey: rid, sessionId: rid, existingTask: false }); } catch (e) {}
+          _rtSyncChip();
+          showToast('Task created and room linked', 'success');
+        } catch (e) {
+          showToast('Could not create/link the task. Try again.', 'error');
+        }
+      })();
     };
     setTimeout(() => { try { titleEl.focus(); } catch (e) {} }, 0);
   }
@@ -5248,7 +5373,7 @@
       var b = p.querySelector('#rs-inherit-' + i);
       if (!b) return;
       b.textContent = '↳ Continue with parent\'s task';
-      b.onclick = function () { _rsInheritStart(t); };   // [RS_NONE_TITLE_PARALLEL_V1]
+      b.onclick = function () { _rsInheritGenerate(t); };   // TASKROOM_PARENT_PREFIX_V2 restored
     });
     p.querySelector('#rs-find').onclick = _rsFindView;
     p.querySelector('#rs-new').onclick = _rsCreateDeferred;   // [RS_CREATE_DEFER_V1]
@@ -5302,6 +5427,7 @@
       '<div style="text-align:right"><button id="rs-g-cancel" style="' + _RS_BTN_GREY + '">Cancel</button></div>';
     p.querySelector('#rs-g-back').onclick = function () { _ttInvalidate(); _rsRootView(); };
     p.querySelector('#rs-g-cancel').onclick = _rsCancel;
+    _startClassify({ text: srcText, roomId: String(currentRoomId || '') });   // [TASK_CLASSIFY_OPUS_V1] parallel Opus Area/Project
     _ttFetch({ text: srcText, roomId: String(currentRoomId || '') }).then(function (d) {
       if (myGen !== _ttGen) return;
       if (!_rsPanel()) return;
@@ -5383,6 +5509,54 @@
     }
   }
   // <<< RS_NONE_TITLE_PARALLEL_V1
+
+  function _rsInheritGenerate(t) {   // TASKROOM_PARENT_PREFIX_V2: generate subtitle, then show the naming step
+    var openingText = (_roomStartPending && _roomStartPending.text) ? String(_roomStartPending.text) : '';
+    var p = _rsPanel();
+    if (p) {
+      p.innerHTML = '<div style="display:flex;align-items:center;gap:10px;padding:18px 4px 22px">' +
+        '<div style="font-size:20px">✨</div>' +
+        '<div><div style="font-size:14px;font-weight:600">Generating subtitle…</div>' +
+        '<div style="font-size:12px;opacity:.65;margin-top:2px">Summarising this investigation in a few words.</div></div></div>';
+    }
+    _ttFetch({ text: openingText }).then(function (d) {
+      if (!_roomStartPending) return;   // cancelled meanwhile
+      var sub = (d && (d.title || d.fallback)) || _ttFallback(openingText) || String(t.title || '');
+      _rsInheritNameView(t, sub);
+    });
+  }
+  function _rsInheritNameView(t, sub) {   // TASKROOM_PARENT_PREFIX_V2: prefix picker + body choice, modelled on _rsNoneNameView
+    var p = _rsPanel(); if (!p) return;
+    var prefix = '';   // '' | 'Build' | 'Res'
+    var CHIP_ON = 'cursor:pointer;padding:6px 12px;border-radius:999px;border:1px solid #2563eb;background:#2563eb;color:#fff;font-weight:600';
+    var CHIP_OFF = 'cursor:pointer;padding:6px 12px;border-radius:999px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb';
+    p.innerHTML =
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><button id="rs-i-back" style="' + _RS_BTN_GREY + '">←</button><div style="font-size:15px;font-weight:600">Name this room?</div></div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:8px">A subtitle was generated for this room. Pick a prefix, then choose the title body. Your message sends either way.</div>' +
+      '<div id="rs-i-sub" style="font-size:15px;font-weight:600;padding:10px 12px;border-radius:8px;border:1px solid #4b5563;background:#0b1220;margin-bottom:12px;word-break:break-word"></div>' +
+      '<div style="font-size:12px;opacity:.7;margin-bottom:6px">Prefix</div>' +
+      '<div style="display:flex;gap:8px;margin-bottom:14px">' +
+        '<button id="rs-i-pfx-none"></button><button id="rs-i-pfx-build"></button><button id="rs-i-pfx-res"></button>' +
+      '</div>' +
+      '<div style="display:flex;gap:8px;justify-content:flex-end">' +
+        '<button id="rs-i-haiku" style="cursor:pointer;padding:6px 14px;border-radius:6px;border:1px solid #2563eb;background:#2563eb;color:#fff;font-weight:600">Use Haiku title</button>' +
+        '<button id="rs-i-orig" style="' + _RS_BTN_GREY + '">Use original title</button>' +
+      '</div>';
+    p.querySelector('#rs-i-sub').textContent = sub;   // subtitle as TEXT, never HTML
+    var chips = { '': p.querySelector('#rs-i-pfx-none'), 'Build': p.querySelector('#rs-i-pfx-build'), 'Res': p.querySelector('#rs-i-pfx-res') };
+    chips[''].textContent = 'None'; chips['Build'].textContent = 'Build'; chips['Res'].textContent = 'Res';
+    function paintChips() { Object.keys(chips).forEach(function (k) { chips[k].style.cssText = (k === prefix) ? CHIP_ON : CHIP_OFF; }); }
+    chips[''].onclick = function () { prefix = ''; paintChips(); };
+    chips['Build'].onclick = function () { prefix = 'Build'; paintChips(); };
+    chips['Res'].onclick = function () { prefix = 'Res'; paintChips(); };
+    paintChips();
+    function commit(useOriginal) {
+      submitRoomStart('linked', String(t.file || ''), { taskId: String(t.id || ''), taskTitle: String(t.title || ''), existingTask: true, parentInherit: true, parentSubtitle: true, subtitle: sub, prefix: prefix, useOriginal: useOriginal });
+    }
+    p.querySelector('#rs-i-back').onclick = function () { _rsRootView(); };
+    p.querySelector('#rs-i-haiku').onclick = function () { commit(false); };
+    p.querySelector('#rs-i-orig').onclick = function () { commit(true); };
+  }
   function _rsCreateView(seed) {
     const p = _rsPanel(); if (!p) return;
     seed = _ttSeed(seed);
@@ -5408,6 +5582,7 @@
     projField.populate(_confDistinctValues(_seed, 'project'));
     try { _applyCachedTaskDefaults(areaField, projField); } catch (e) {}
     _applyTaskDefaults(areaField, projField, fieldsEl);
+    _applyClassify(areaField, projField, fieldsEl);   // [TASK_CLASSIFY_OPUS_V1] auto-select when Opus returns
     fetch(API_BASE + '/tasks', { cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error('http'); return r.json(); })
       .then(function (d) {
@@ -7071,6 +7246,7 @@
   const btnTasksRefresh = $('btn-tasks-refresh');
   const openTasks       = new Set();
   function collapseAllTasks() {   // [TASK_CONCERTINA_V1] fold every expanded task row shut on room open
+    if (window.innerWidth > LAYOUT_MOBILE_BP) return;   // [TASK_CONCERTINA_MOBILE_V1] mobile layout only
     try {
       openTasks.clear();
       document.querySelectorAll('.task-row.open').forEach(function (r) { r.classList.remove('open'); });
@@ -7233,10 +7409,10 @@
     let list = tasks.slice();
     const today = todayStr();
     switch (taskState.date) {
-      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && !isIdeaConcept(t.type)); break;
+      case 'pending': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled)); break;
       // Like 'pending' but hides tasks whose only outstanding flag is an already-answered
       // (green-dot) question — i.e. shows pending tasks with a red or no dot. [PENDING_EXC]
-      case 'pending-exc': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && !isIdeaConcept(t.type) && dotState(t) !== 'green'); break;
+      case 'pending-exc': list = list.filter(t => t.status !== 'done' && !isFuture(t.scheduled) && dotState(t) !== 'green'); break;
       case 'today':   list = list.filter(t => t.scheduled === today); break;
       case 'scheduled': list = list.filter(t => t.status !== 'done' && isFuture(t.scheduled)); break;
       case 'past':    list = list.filter(t => /^\d{4}-\d{2}-\d{2}$/.test(t.scheduled || '') && t.scheduled < today); break;
@@ -7679,6 +7855,9 @@
   // add/remove management lives in the task-details overlay.
   // [CONF_SPAWN_BTN_V1] Pop-out glyph (square with arrow leaving the top-right corner).
   const _popoutSvg = '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true" style="vertical-align:-1px;margin-left:4px"><path d="M14 4h6v6M20 4l-9 9M19 13v6a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  // [ROOM_HIDE_V1] Eye (show hidden) + eye-off (hide this) glyphs for the per-room view filter.
+  const _eyeSvg = '<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true" style="vertical-align:-2px"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>';
+  const _eyeOffSvg = '<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true" style="vertical-align:-2px"><path d="M3 3l18 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c7 0 11 7 11 7a18.5 18.5 0 0 1-3 3.6M6.2 6.2A18.5 18.5 0 0 0 1 12s4 7 11 7a10.9 10.9 0 0 0 4-.7" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>';
   // [ROOM_MONITOR_V1_CLIENT] Live per-room status indicator.
   let _roomMonitorStatus = {};
   let _liveTurnRoom = null;   // [GSD_ROOM_SPIN_V1] room_key of the live turn in this tab
@@ -7859,12 +8038,41 @@
   function renderInlineRooms(detail, t) {
     const rooms = Array.isArray(t.rooms) ? t.rooms : [];
     try { _startRoomMonitorPolling(); } catch (e) {}   // [ROOM_MONITOR_V1_CLIENT]
+    // [ROOM_HIDE_V1] Per-browser "hide from this list" view filter. Hidden room ids live in
+    // localStorage keyed by task; purely a display convenience — no server/DB state. A room is
+    // keyed by its stable rid (fallback room_key). A room stays fully functional elsewhere; this
+    // only removes it from THIS inline list. The eye toggle next to the label reveals/unhides them.
+    const HKEY = 'ccb-hidden-rooms::' + (t.file || t.id || '');
+    const roomId = rm => String(rm.rid || rm.room_key || '');
+    const getHidden = () => { try { return new Set(JSON.parse(localStorage.getItem(HKEY) || '[]')); } catch (e) { return new Set(); } };
+    const saveHidden = (s) => { try { localStorage.setItem(HKEY, JSON.stringify(Array.from(s))); } catch (e) {} };
+
     const f = document.createElement('div'); f.className = 'tr-field tr-rooms';
     const l = document.createElement('span'); l.className = 'tr-field-label';
-    l.textContent = rooms.length > 1 ? 'Associated rooms' : 'Associated room';
+    l.style.cssText = 'position:relative;display:inline-flex;align-items:center;gap:6px';
+    const lt = document.createElement('span'); lt.textContent = 'Associated rooms'; l.appendChild(lt);
+
+    // [ROOM_HIDE_V1] Eye toggle + dropdown of hidden rooms; shown only when at least one is hidden.
+    const hideToggle = document.createElement('button');
+    hideToggle.type = 'button';
+    hideToggle.title = 'Show hidden rooms';
+    hideToggle.style.cssText = 'position:relative;cursor:pointer;background:transparent;border:1px solid rgba(110,168,254,.35);border-radius:4px;color:#6ea8fe;font-size:11px;line-height:1;padding:1px 5px;display:none;align-items:center;gap:3px';
+    const eyeSpan = document.createElement('span'); eyeSpan.innerHTML = _eyeSvg; hideToggle.appendChild(eyeSpan);
+    const cntSpan = document.createElement('span'); hideToggle.appendChild(cntSpan);
+    const dd = document.createElement('div');
+    dd.style.cssText = 'display:none;position:absolute;z-index:100001;top:100%;left:0;margin-top:4px;min-width:200px;max-height:240px;overflow:auto;background:#1b2130;border:1px solid rgba(110,168,254,.35);border-radius:6px;padding:4px;box-shadow:0 6px 20px rgba(0,0,0,.4);text-align:left';
+    dd.addEventListener('click', e => e.stopPropagation());
+    hideToggle.appendChild(dd);
+    hideToggle.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); dd.style.display = (dd.style.display === 'none' ? 'block' : 'none'); });
+    l.appendChild(hideToggle);
+
     const b = document.createElement('span'); b.className = 'tr-field-val';
     b.style.cssText = 'display:flex;flex-direction:column;gap:6px;align-items:flex-start';
-    rooms.forEach(rm => {
+
+    function paint() {
+      const hidden = getHidden();
+      b.textContent = '';
+      rooms.filter(rm => !hidden.has(roomId(rm))).forEach(rm => {
       const a = document.createElement('a');
       a.href = buildShareUrl(rm.room_key);
       a.rel = 'noopener';
@@ -7884,8 +8092,14 @@
       ic.title = 'Open this room in a new tab';
       ic.style.cursor = 'pointer';
       a.appendChild(ic);
+      // [ROOM_HIDE_V1] per-room hide control — removes this room from the list (this browser only)
+      const hideIc = document.createElement('span'); hideIc.innerHTML = _eyeOffSvg;
+      hideIc.title = 'Hide this room from the list';
+      hideIc.style.cssText = 'cursor:pointer;margin-left:6px;padding-left:6px;border-left:1px solid rgba(110,168,254,.35);display:inline-flex;align-items:center;color:#9fb6d6';
+      a.appendChild(hideIc);
       a.addEventListener('click', e => {
         e.stopPropagation();   // never toggle the task row
+        if (hideIc.contains(e.target)) { e.preventDefault(); const s = getHidden(); s.add(roomId(rm)); saveHidden(s); paint(); return; }
         if (e.metaKey || e.ctrlKey || e.shiftKey) return;   // let the browser force a new tab
         e.preventDefault();
         if (ic.contains(e.target)) { window.open(buildShareUrl(rm.room_key), '_blank', 'noopener'); return; }
@@ -7903,7 +8117,27 @@
         }
       });
       b.appendChild(a);
-    });
+      });
+      b.appendChild(addR);
+      b.appendChild(add);
+      // [ROOM_HIDE_V1] refresh the hidden-rooms toggle + dropdown
+      const hiddenRooms = rooms.filter(rm => hidden.has(roomId(rm)));
+      cntSpan.textContent = String(hiddenRooms.length);
+      hideToggle.style.display = hiddenRooms.length ? 'inline-flex' : 'none';
+      if (!hiddenRooms.length) dd.style.display = 'none';
+      dd.textContent = '';
+      hiddenRooms.forEach(rm => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 4px';
+        const nm = document.createElement('span');
+        nm.textContent = roomLinkLabel(rm, t);
+        nm.style.cssText = 'font-size:12px;color:#cfe0ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px';
+        const ub = document.createElement('button'); ub.type = 'button'; ub.textContent = 'Unhide';
+        ub.style.cssText = 'cursor:pointer;font-size:11px;background:transparent;border:1px solid rgba(110,168,254,.35);border-radius:4px;color:#6ea8fe;padding:1px 6px;flex:0 0 auto';
+        ub.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); const s = getHidden(); s.delete(roomId(rm)); saveHidden(s); paint(); });
+        row.appendChild(nm); row.appendChild(ub); dd.appendChild(row);
+      });
+    }
     // [ROOM_INPLACE_OPEN_V2] "+ New Room": label click opens a fresh room for THIS task IN THIS
     // TAB (chat + live browser only; panes/tasks/sort untouched via keepLayout); the pop-out
     // glyph (or a modifier-click) opens it in a NEW tab. Lightweight draft-room path, no spawn.
@@ -7936,7 +8170,6 @@
         showToast('New room started for this task', 'info');
       }
     });
-    b.appendChild(addR);
     // [ROOM_INPLACE_OPEN_V2] "+ New Conference Room": same split as "+ New Room" — label click opens
     // a conference room for THIS task IN THIS TAB (panes/tasks/sort untouched); the pop-out glyph
     // (or a modifier-click) opens it in a NEW tab. Conference mode rides confmode::<rid>.
@@ -7970,7 +8203,7 @@
         showToast('New conference room started for this task', 'info');
       }
     });
-    b.appendChild(add);
+    paint();   // [ROOM_HIDE_V1] initial render (also re-invoked on hide/unhide)
     f.appendChild(l); f.appendChild(b); detail.appendChild(f);
   }
 
