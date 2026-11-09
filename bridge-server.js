@@ -129,6 +129,52 @@ const fs = require('fs');
     return execFileSync(process.execPath, [CREDENTIAL_STEWARD, ...args],
       { encoding: 'utf8', timeout: 45000, env: { ...process.env, HOME: process.env.HOME || os.homedir() } }).trim();
   }
+  // [HELPER_CRED_FRESH_V1] Internal `claude -p` helpers (task-title, task-classify,
+  // autoname) historically ran against the shared ~/.claude/.credentials.json, which
+  // carries NO refresh token and goes stale for tens of minutes after every token
+  // rotation -> they 401 with no self-heal and silently produce blank titles. Mirror
+  // spawnProc / the usage probe: ask the steward for a fresh, access-only credential
+  // dir for the globally-active account and point CLAUDE_CONFIG_DIR at it. Any failure
+  // falls back to the inherited env (no worse than before). label keys a stable dir.
+  // [HELPER_ACCT_FALLBACK_V1] Local Claude accounts, active one first. Used to rotate
+  // the helper (title) subprocess onto a DIFFERENT account after an auth failure: the
+  // cross-server family-401 flap hits one account at a time, so a retry on another
+  // account rides straight through it.
+  function _helperClaudeAccounts() {
+    const H = process.env.HOME || os.homedir();
+    let active = '';
+    try { active = (stewardText(['active-claude']) || '').trim(); } catch (e) {}
+    let names = [];
+    try {
+      names = fs.readdirSync(path.join(H, '.claude', 'accounts'))
+        .filter(function (f) { return /\.credentials\.json$/.test(f) && !/\.dead-bak/.test(f); })
+        .map(function (f) { return f.replace(/\.credentials\.json$/, ''); });
+    } catch (e) {}
+    // Only accounts the steward currently reports HEALTHY are issuable here; a
+    // reauth_required/stale account would just 401 the retry and waste it.
+    function _healthy(n) {
+      try { return JSON.parse(fs.readFileSync(path.join(H, '.credential-steward', 'claude-' + n + '.json'), 'utf8')).status === 'healthy'; }
+      catch (e) { return false; }
+    }
+    const ordered = [];
+    if (active && _healthy(active)) ordered.push(active);
+    for (const n of names) if (n !== active && _healthy(n) && ordered.indexOf(n) === -1) ordered.push(n);
+    return ordered;
+  }
+  function helperClaudeEnv(label, acctOverride) {
+    const env = { ...process.env };
+    if (!CREDENTIAL_STEWARD_ENABLED) return env;
+    try {
+      const account = (String(acctOverride || '').trim()) || (stewardText(['active-claude']) || '').trim();
+      if (!account) return env;
+      const dir = roomClaudeConfigDir(account, '__helper__/' + String(label || 'claude-p'));
+      stewardText(['issue-claude', account, dir]);
+      env.CLAUDE_CONFIG_DIR = dir;
+    } catch (e) {
+      console.log('[helper-cred] issue-claude failed for ' + String(label || '') + ': ' + ((e && e.message) ? String(e.message).slice(0, 140) : e));
+    }
+    return env;
+  }
   // LLM engine for this tenant: 'claude' (default) or 'codex'. Unset => the bridge
   // behaves EXACTLY as before (Claude), so live panes are unaffected. Flip one pane
   // with the ENGINE env var or by writing 'codex' into ~/.claude/engine.
@@ -1793,6 +1839,108 @@ function confHealReconcile(key) {
   } catch (e) { console.log('[Bridge] [CONF_HEAL_V1] reconcile failed for ' + key + ': ' + (e && e.message)); }
 }
 
+// [HISTCACHE_V1] The reconciled room history, factored out of the GET handler so the
+// background warmer builds the EXACT same value the request path caches (identical code
+// => cache coherence; warming also primes room-recover's own byte-offset projection cache).
+async function buildRoomHistory(id) {
+  const data = chatData[id];
+  if (data && Array.isArray(data.messages) && data.messages.length) {
+    let healed = healEmptyAssistantText(id, data.messages);
+    healed = healEmptyUserText(id, healed);
+    if (ROOM_RECOVER) {
+      try { return await roomRecoverMerge(id, id, healed); } catch (e) { /* fall through to legacy behaviour */ }
+    }
+    const fromTranscript = transcriptToMessages(id);
+    return fromTranscript.length > healed.length ? fromTranscript : healed;
+  }
+  return transcriptToMessages(id);
+}
+
+// [HISTCACHE_V1] Last-N messages via a cheap backward read of the transcript tail — used
+// only when the in-memory row store is empty (e.g. after a container recreate). Mirrors
+// transcriptToMessages' projection exactly, but touches only the final ~1MB of the file.
+function transcriptTailMessages(id, n) {
+  const file = path.join(transcriptsDir(), id + '.jsonl');
+  const msgs = [];
+  try {
+    const CHUNK = 1048576;
+    const fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - CHUNK);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+    let tail = buf.toString('utf8');
+    if (start > 0) { const nl = tail.indexOf('\n'); if (nl !== -1) tail = tail.slice(nl + 1); }
+    for (const line of tail.split('\n')) {
+      if (!line.trim()) continue;
+      let ev; try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.isCompactSummary === true) continue;
+      if (ev.type === 'user' && ev.message && ev.message.role === 'user') {
+        const t = stripPlumbing(extractText(ev.message.content));
+        if (t) { const _ts = Date.parse(ev.timestamp); msgs.push(Number.isFinite(_ts) ? { type: 'user', text: t, ts: _ts } : { type: 'user', text: t }); }
+      } else if (ev.type === 'assistant' && ev.message && ev.message.content) {
+        const t = extractText(ev.message.content);
+        if (t.trim() && !t.includes('\u{1F5DC}')) { const _ts = Date.parse(ev.timestamp); msgs.push(Number.isFinite(_ts) ? { type: 'assistant', text: t, ts: _ts } : { type: 'assistant', text: t }); }
+      }
+    }
+  } catch (e) { return []; }
+  return n > 0 ? msgs.slice(-n) : msgs;
+}
+
+// [HISTCACHE_V1] Reconciled-history cache + key. Keyed on the transcript's mtime+size and
+// the stored row-count/updated_at, so any append (file grows) or client save (updated_at
+// bumps) invalidates it; otherwise an unchanged room serves straight from memory, shared
+// across every browser/tab on this pane.
+const _histCache = new Map();   // id -> { key, messages }
+function _histCacheKey(id) {
+  let mt = 0, sz = 0;
+  try { const st = fs.statSync(path.join(transcriptsDir(), id + '.jsonl')); mt = st.mtimeMs; sz = st.size; } catch (e) {}
+  const cd = chatData[id];
+  const u = cd ? (cd.updated_at || 0) : 0;
+  const n = (cd && Array.isArray(cd.messages)) ? cd.messages.length : 0;
+  if (!mt && !u && !n) return null;
+  return mt + ':' + sz + ':' + u + ':' + n;
+}
+function _histCacheSet(id, key, messages) {
+  if (!key) return;
+  _histCache.set(id, { key, messages });
+  if (_histCache.size > 500) { const k = _histCache.keys().next().value; _histCache.delete(k); }
+}
+
+// [HISTCACHE_V1] Background warmer: keep the reconciled-history cache hot for the rooms
+// most likely to be opened next — the N most-recently-active transcripts (exactly the set
+// a user hops between, pending-task rooms included) — so switching paints without a cold
+// full-parse. Runs off the hot path and yields between rooms so it never blocks a turn.
+let _warming = false;
+async function _warmHistoryCache() {
+  if (_warming) return; _warming = true;
+  try {
+    const dir = transcriptsDir();
+    let files = [];
+    try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch (e) { return; }
+    const scored = [];
+    for (const f of files) {
+      let mt = 0; try { mt = fs.statSync(path.join(dir, f)).mtimeMs; } catch (e) {}
+      scored.push({ id: f.slice(0, -6), mt });
+    }
+    scored.sort((a, b) => b.mt - a.mt);
+    for (const { id } of scored.slice(0, 30)) {
+      try {
+        const key = _histCacheKey(id);
+        const hit = _histCache.get(id);
+        if (key && (!hit || hit.key !== key)) {
+          const msgs = await buildRoomHistory(id);
+          _histCacheSet(id, _histCacheKey(id), msgs);
+        }
+      } catch (e) { /* skip this room */ }
+      await new Promise(r => setTimeout(r, 40));   // spread CPU so a live turn never stalls
+    }
+  } catch (e) { /* never let the warmer crash the bridge */ }
+  finally { _warming = false; }
+}
+try { setTimeout(function () { _warmHistoryCache(); }, 15000); setInterval(function () { _warmHistoryCache(); }, 180000); } catch (e) {}
+
 app.get('/history/:sessionId', async (req, res) => {
   const id = req.params.sessionId;
   const _hbList = roomHiddenMids(id);   // [HIDE_BUBBLE_V1] attach per-room hidden set to every messages response
@@ -1823,28 +1971,31 @@ app.get('/history/:sessionId', async (req, res) => {
       return res.json({ messages: (_healed && Array.isArray(_healed.messages) && _healed.messages.length) ? _healed.messages : _msgs });
     }
   } catch (e) { /* fall through to the normal record on any error */ }
-  const data = chatData[id];
-  const fromTranscript = transcriptToMessages(id);
-  if (data && Array.isArray(data.messages) && data.messages.length) {
-    let healed = healEmptyAssistantText(id, data.messages);
-    healed = healEmptyUserText(id, healed);
-    // [ROOMVIEW_STALL_V1] Insert-only merge of the stored UI copy with the authoritative
-    // transcript projection: restores a dropped mid-turn tail (trailing tool calls +
-    // closing summary) AND preserves tool cards. The old count compare below could not —
-    // transcriptToMessages is text-only, so a tool-card-inflated client copy always won.
-    if (ROOM_RECOVER) {
-      try { const merged = await roomRecoverMerge(id, id, healed); return res.json({ messages: merged }); }
-      catch (e) { /* fall through to legacy behaviour */ }
-    }
-    // The append-only transcript is the complete, unaltered record. If the stored
-    // UI copy is shorter, it was truncated (e.g. a post-compaction client POSTed a
-    // shrunken view) — serve the full transcript so no history ever disappears.
-    if (fromTranscript.length > healed.length) return res.json({ messages: fromTranscript });
-    return res.json({ messages: healed });
+  // [HISTCACHE_V1] Fast tail path: paint the recent slice instantly without the full
+  // reconcile. Served from the in-memory row store when present (near-zero cost), else
+  // from a cheap backward read of the transcript tail. Approximate by design — the client
+  // immediately follows with a full (reconciled) fetch that fills older turns + tool cards.
+  const _tailN = parseInt(req.query.tail, 10);
+  if (Number.isFinite(_tailN) && _tailN > 0 && !(chatData[id] && chatData[id].conf)) {
+    try {
+      const _cd = chatData[id];
+      if (_cd && Array.isArray(_cd.messages) && _cd.messages.length) {
+        const _tot = _cd.messages.length;
+        return res.json({ messages: _cd.messages.slice(-_tailN), tail: true, partial: _tot > _tailN });
+      }
+      const _tm = transcriptTailMessages(id, _tailN);
+      if (_tm.length) return res.json({ messages: _tm, tail: true, partial: _tm.length >= _tailN });
+    } catch (e) { /* fall through to the full reconciled path */ }
   }
-  // No saved UI history for this id (e.g. after a recreate) — rebuild the bubbles
-  // from the persisted transcript so the conversation still opens in full.
-  res.json({ messages: fromTranscript });
+
+  // [HISTCACHE_V1] Full reconciled path, cached by transcript mtime+size and the stored
+  // row-count/updated_at so an unchanged room is never re-parsed (transcripts are
+  // append-only and up to ~56MB — a cold reparse froze the pane for ~1s per open).
+  const _preKey = _histCacheKey(id);
+  if (_preKey) { const _hit = _histCache.get(id); if (_hit && _hit.key === _preKey) return res.json({ messages: _hit.messages }); }
+  const _msgs = await buildRoomHistory(id);
+  _histCacheSet(id, _histCacheKey(id), _msgs);
+  res.json({ messages: _msgs });
 });
 
 app.post('/history/:sessionId', (req, res) => {
@@ -2310,7 +2461,7 @@ function handleTaskTitle(req, res, deps) {
   const started = Date.now();
   const TT_MAX_ATTEMPTS = 4;        // attempts at ~0, +4s, +8s, +12s
   const TT_RETRY_DELAY_MS = 4000;
-  const TT_DEADLINE_MS = 24000;     // leave headroom under the client's 28s abort
+  const TT_DEADLINE_MS = 25000;     // [V3] leave headroom under the client's 28s abort
   function retryAfterAuthFailure() {
     if (killer) { clearTimeout(killer); killer = null; }
     if (child) { try { child.kill('SIGKILL'); } catch {} child = null; }
@@ -2340,20 +2491,133 @@ function handleTaskTitle(req, res, deps) {
     attempt++;
     out = ''; err = '';
     try {
+      const _ttAccts = _helperClaudeAccounts();
+      const _ttAcct = _ttAccts.length ? _ttAccts[(attempt - 1) % _ttAccts.length] : '';   // [HELPER_ACCT_FALLBACK_V1] attempt 1 = active, retries rotate
+      if (attempt > 1) console.log('[task-title] retry attempt ' + attempt + ' on account ' + (_ttAcct || '(active)'));
       child = _spawn('claude', ['-p', prompt, '--model', 'claude-haiku-4-5-20251001'],
-        { cwd: AUTONAME_SCRATCH, env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (e) { console.log('[task-title] fallback used: reason=spawn-error', e && e.message); settle('', ''); cleanup(); return; }
+        { cwd: AUTONAME_SCRATCH, env: helperClaudeEnv('task-title', _ttAcct), stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { console.log('[task-title] skipped: reason=spawn-error (no garbage fallback)', e && e.message); settleAuthSkip(); cleanup(); return; }
     try { child.stdout.on('data', c => { out += c.toString(); }); } catch {}
     try { child.stderr.on('data', c => { err += c.toString(); }); } catch {}
-    const _perAttempt = Math.max(4000, Math.min(12000, TT_DEADLINE_MS - (Date.now() - started)));   // [TASK_TITLE_AUTHRETRY_V2] bound each attempt so the retry sequence never overruns the client's 28s abort
-    killer = setTimeout(function () { console.log('[task-title] fallback used: reason=timeout'); cleanup(); settle('', ''); }, _perAttempt);
-    child.on('error', function (e) { console.log('[task-title] fallback used: reason=spawn-error', e && e.message); settle('', ''); cleanup(); });
+    const _perAttempt = Math.max(4000, Math.min(22000, TT_DEADLINE_MS - (Date.now() - started)));   // [TASK_TITLE_AUTHRETRY_V3] generous first-attempt budget (~22s) for slow-but-valid calls; later attempts auto-shrink to fit the 25s deadline
+    killer = setTimeout(function () { console.log('[task-title] skipped: reason=timeout (no garbage fallback)'); settleAuthSkip(); cleanup(); }, _perAttempt);
+    child.on('error', function (e) { console.log('[task-title] skipped: reason=spawn-error (no garbage fallback)', e && e.message); settleAuthSkip(); cleanup(); });
     child.on('close', onClose);
   }
   spawnAttempt();
 }
 app.post('/task-title', (req, res) => handleTaskTitle(req, res));
 // <<< TASK_TITLE_HAIKU_V1_END
+
+// >>> TASK_CLASSIFY_OPUS_V1 — Opus-suggested Area + Project for the create-task modals.
+// Separate from /task-title (which is Haiku) because the user asked for Opus here, and
+// because this runs in PARALLEL with the title call: the modal opens on the Haiku title,
+// then these two fields auto-fill when Opus returns. Area is constrained to the caller's
+// known list (controlled vocabulary); Project may be an existing value or a short new one.
+let _taskClassifyInFlight = 0;
+const TASK_CLASSIFY_MAX_INFLIGHT = 2;
+function _tcClean(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/^[\s"'`*_>-]+/, '')
+    .replace(/[\s"'`*_]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function _tcParse(out) {
+  const text = String(out || '');
+  const am = text.match(/AREA\s*:\s*(.*)/i);
+  const pm = text.match(/PROJECT\s*:\s*(.*)/i);
+  let area = am ? _tcClean(am[1]) : '';
+  let project = pm ? _tcClean(pm[1]) : '';
+  if (/^(blank|none|n\/a|null|-|—|\(none\))$/i.test(area)) area = '';
+  if (/^(blank|none|n\/a|null|-|—|\(none\))$/i.test(project)) project = '';
+  return { area: area.slice(0, 60), project: project.slice(0, 60) };
+}
+// Canonicalise against the known list (case-insensitive exact match). When allowNew is
+// false and nothing matches, return '' — never invent an area outside the vocabulary.
+function _tcCanon(val, list, allowNew) {
+  const want = _tcClean(val);
+  if (!want) return '';
+  const arr = Array.isArray(list) ? list.map(x => String(x || '')).filter(Boolean) : [];
+  const hit = arr.find(x => x.toLowerCase() === want.toLowerCase());
+  if (hit) return hit;
+  return allowNew ? want : '';
+}
+function handleTaskClassify(req, res, deps) {
+  deps = deps || {};
+  const _spawn = deps.spawn || spawn;
+  const body = (req && req.body) || {};
+  const areas = Array.isArray(body.areas) ? body.areas.map(x => String(x || '')).filter(Boolean).slice(0, 40) : [];
+  const projects = Array.isArray(body.projects) ? body.projects.map(x => String(x || '')).filter(Boolean).slice(0, 60) : [];
+  // Build the room context exactly as /task-title does, so Opus sees the same material.
+  const typed = String(body.text == null ? '' : body.text).replace(/\s+/g, ' ').trim();
+  let promptSource = '';
+  if (typed) {
+    promptSource = _renderRecentTurns([_ttClip(typed, TT_TURN_CHARS)]);
+  } else {
+    const rs = _roomSourceText(String(body.roomId || ''));
+    if (rs.hasContent) { promptSource = rs.source; }
+    else {
+      const sid = _resolveRoomSession(String(body.roomId || ''));
+      let src = '';
+      if (sid) { try { src = firstUserFullText(path.join(transcriptsDir(), sid + '.jsonl')); } catch { src = ''; } }
+      promptSource = _taskTitlePromptSource(src);
+    }
+  }
+  if (!promptSource) { res.json({ ok: true, area: '', project: '' }); return; }
+  if (_taskClassifyInFlight >= TASK_CLASSIFY_MAX_INFLIGHT) { console.log('[task-classify] skipped: inflight-cap'); res.json({ ok: true, area: '', project: '' }); return; }
+
+  const areaInstr = areas.length
+    ? ('AREA — choose the single best fit, copied VERBATIM from this list: ' + areas.join(' | ') + '. If none fit, leave it blank.')
+    : 'AREA — a short category label (1 to 3 words), or blank.';
+  const projInstr = projects.length
+    ? ('PROJECT — if one of these clearly fits, copy it VERBATIM: ' + projects.join(' | ') + '. Otherwise propose a short new project name (2 to 4 words), or leave blank if none applies.')
+    : 'PROJECT — a short project name (2 to 4 words), or blank if none applies.';
+  const prompt = 'You are filing a task created from a chat room into an Area and a Project. '
+    + 'Anchor on the MOST RECENT REQUEST; earlier context is background.\n'
+    + areaInstr + '\n' + projInstr + '\n\n'
+    + 'Reply with EXACTLY these two lines and NOTHING else:\n'
+    + 'AREA: <value or blank>\nPROJECT: <value or blank>\n\n'
+    + 'Conversation:\n' + promptSource;
+
+  let state = 'pending', cleaned = false, child = null, killer = null, out = '', err = '';
+  _taskClassifyInFlight++;
+  function cleanup() {
+    if (cleaned) return; cleaned = true;
+    if (killer) { clearTimeout(killer); killer = null; }
+    if (child) { try { child.kill('SIGKILL'); } catch {} }
+    try { purgeAutonameScratch(); } catch {}
+    _taskClassifyInFlight = Math.max(0, _taskClassifyInFlight - 1);
+  }
+  function settle(area, project) {
+    if (state !== 'pending') return;
+    if (res.destroyed || res.writableEnded) { state = 'cancelled'; return; }
+    state = 'responded';
+    res.json({ ok: true, area: area || '', project: project || '' });
+  }
+  res.on('close', function () { if (!res.writableEnded && state === 'pending') { state = 'cancelled'; cleanup(); } });
+
+  try {
+    child = _spawn('claude', ['-p', prompt, '--model', 'claude-opus-4-8'],
+      { cwd: AUTONAME_SCRATCH, env: helperClaudeEnv('task-classify'), stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { console.log('[task-classify] spawn-error', e && e.message); settle('', ''); cleanup(); return; }
+  try { child.stdout.on('data', c => { out += c.toString(); }); } catch {}
+  try { child.stderr.on('data', c => { err += c.toString(); }); } catch {}
+  killer = setTimeout(function () { console.log('[task-classify] fallback: timeout'); cleanup(); settle('', ''); }, 40000);
+  child.on('error', function (e) { console.log('[task-classify] spawn-error', e && e.message); settle('', ''); cleanup(); });
+  child.on('close', function () {
+    if (killer) { clearTimeout(killer); killer = null; }
+    if (_ttIsAuthFailure(out) || _ttIsAuthFailure(err)) { console.log('[task-classify] auth-failure — blank'); settle('', ''); cleanup(); return; }
+    const parsed = _tcParse(out);
+    const area = _tcCanon(parsed.area, areas, false);
+    const project = _tcCanon(parsed.project, projects, true);
+    console.log('[task-classify] area=' + JSON.stringify(area) + ' project=' + JSON.stringify(project));
+    settle(area, project); cleanup();
+  });
+}
+app.post('/task-classify', (req, res) => handleTaskClassify(req, res));
+// <<< TASK_CLASSIFY_OPUS_V1_END
 
 function autoNameRoom(S) {
   try {
@@ -2383,7 +2647,7 @@ function autoNameRoom(S) {
     const prompt = 'Give a 3 or 4 word Title Case label for this task. '
       + 'Output ONLY the label — no punctuation, quotes, or explanation. '
       + 'If the request is cut off, infer the topic from what is present.\n\nTask: ' + first;
-    const env = { ...process.env };
+    const env = helperClaudeEnv('autoname');
     let out = '', errout = '';
     let proc;
     try {
@@ -3799,7 +4063,7 @@ function scrapeRateLimits(line, S) {
   if ((m = line.match(/unified-5h-reset"?\s*:\s*"?([0-9]+)/)))        { acc.five_hour_resets_at = parseInt(m[1], 10); hit = true; }
   if ((m = line.match(/unified-7d-reset"?\s*:\s*"?([0-9]+)/)))        { acc.seven_day_resets_at = parseInt(m[1], 10); hit = true; }
   if (!hit) return;
-  if (acc.five_hour_pct != null && acc.seven_day_pct != null) {
+  if (acc.seven_day_pct != null) {   // [RL_5H_GONE_V1] Anthropic dropped the unified-5h-* headers; 7d arrives last in the burst so 5h (when present) is already captured. Gating on 7d un-freezes the capture.
     acc.updated_at = new Date().toISOString();
     const ident = (S && S.credentialClaudeAccount)
       ? accountIdentityByName(S.credentialClaudeAccount)
@@ -3878,6 +4142,26 @@ function codexUsageResponse(raw, roomId) {
 }
 
 // Claude token/cost usage — 5-hour block + weekly, parallel fetch
+// [CCUSAGE_CACHE_V1] ccusage re-parses every .jsonl transcript (~750MB for peter) and /usage is
+// polled every 30s by every open pane. Uncached, slow runs outlived their timeout and piled up until
+// the container hit its memory cap. Now: one run per subcommand at a time, result shared for 60s,
+// hard SIGKILL on timeout, and the last good output served if a run fails.
+const _ccusageCache = new Map();
+function ccusageCached(args, cb) {
+  const key = args.join(' ');
+  let e = _ccusageCache.get(key);
+  if (!e) _ccusageCache.set(key, e = { at: 0, stdout: '', waiters: null });
+  if (Date.now() - e.at < 60_000) return cb(null, e.stdout);
+  if (e.waiters) return e.waiters.push(cb);
+  e.waiters = [cb];
+  execFile('ccusage', args, { timeout: 20000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+    if (!err) { e.stdout = stdout; e.at = Date.now(); }
+    else e.at = Date.now() - 30_000;   // failed: retry in 30s, meanwhile serve the last good output
+    const ws = e.waiters; e.waiters = null;
+    ws.forEach(w => w(err && !e.stdout ? err : null, e.stdout));
+  });
+}
+
 app.get('/usage', (req, res) => {
   // [ENGINE_AUTHORITATIVE_V1] With a roomId, the SERVER decides the engine (single source of
   // truth) and the client renders whatever we return; the client's ?engine= is a fallback only.
@@ -3906,7 +4190,7 @@ app.get('/usage', (req, res) => {
   // that new account makes an API call. If the cache doesn't belong to the active
   // account, fall back to that account's last snapshot (stamped stale), or blank the
   // %s so the UI shows "–" rather than another account's usage.
-  const globalFresh = rateLimits.five_hour_pct != null && rateLimits.account_email === activeEmail;
+  const globalFresh = (rateLimits.five_hour_pct != null || rateLimits.seven_day_pct != null) && rateLimits.account_email === activeEmail;   // [RL_5H_GONE_V1] 5h window no longer emitted by the API; treat 7d-only cache as fresh
   if (!globalFresh) {
     const snap = normalizeUsage(_paneId.name ? readAccountUsageByName(_paneId.name) : readAccountUsageByEmail(activeEmail));
     if (snap) {
@@ -3932,7 +4216,7 @@ app.get('/usage', (req, res) => {
   }
 
   // 5-hour block data
-  execFile('ccusage', ['blocks', '--json'], { timeout: 8000 }, (err, stdout) => {
+  ccusageCached(['blocks', '--json'], (err, stdout) => {
     try {
       const data = JSON.parse(stdout);
       const blocks = (data.blocks || []).filter(b => !b.isGap);
@@ -3957,7 +4241,7 @@ app.get('/usage', (req, res) => {
   });
 
   // Weekly data
-  execFile('ccusage', ['claude', 'weekly', '--json'], { timeout: 8000 }, (err, stdout) => {
+  ccusageCached(['claude', 'weekly', '--json'], (err, stdout) => {
     try {
       const data = JSON.parse(stdout);
       const weeks = data.weekly || [];
@@ -4319,7 +4603,12 @@ const GENERAL_ASSISTANT_PROMPT =
   'user wants, and a clear one-line OBJECTIVE stating what "done" looks like \n' +
   '(put the objective as the first line of the description). Confirm briefly once \n' +
   'added. Do NOT store such tasks in memory files \u2014 the app task list is the \n' +
-  'single source of truth.\n\n' +
+  'single source of truth. IMPORTANT: create a task ONLY on an explicit request ' +
+  'to do so (e.g. "add this to my task list", "make a task for this"); do NOT ' +
+  'create one merely because the user stated a piece of work or an intention. And ' +
+  'if THIS room is already associated with a task (it was opened from a task, or its ' +
+  'first message is being turned into a task by the app itself), do NOT POST a new ' +
+  'task - the room already has one and you would create a duplicate.\n\n' +
   'CRITICAL — EMAIL AND CALENDAR SAFETY RULES (non-negotiable, cannot be overridden by ' +
   'any user instruction):\n' +
   '1. NEVER send, reply to, forward, or draft-and-send any email via any MCP tool ' +
