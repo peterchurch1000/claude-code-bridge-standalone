@@ -2757,7 +2757,7 @@ function stripAnsiSeq(s) {
 function parseAuthUrl(buf) {
   const lines = stripAnsiSeq(buf).replace(/\r/g, '\n').split('\n').map(l => l.trim());
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/https:\/\/claude\.com\/cai\/oauth\/authorize\S*/);
+    const m = lines[i].match(/https:\/\/claude\.(?:ai|com)\/(?:cai\/)?oauth\/authorize\S*/);
     if (!m) continue;
     let url = m[0];
     for (let j = i + 1; j < lines.length; j++) {
